@@ -424,6 +424,19 @@ HTML_PAGE = """<!DOCTYPE html>
     --app-top: 0px;
     --app-height: 100dvh;
     --kb-lift: 0px;
+
+    --outer-bg: #101511;
+    --surface-bg: #171e18;
+    --header-bg: #1f2920;
+    --dock-bg: #1b231c;
+    --card-bg: #202a21;
+    --card-alt-bg: #243026;
+    --input-bg: #101511;
+    --border-col: #2b382d;
+    --text-col: #f3f7f3;
+    --muted-col: #96a598;
+    --sec-btn-bg: #263228;
+    --sec-btn-text: #eef5ee;
     --accent: #9be15d;
     --accent-contrast: #101511;
     --accent-soft: rgba(155, 225, 93, 0.18);
@@ -432,8 +445,8 @@ HTML_PAGE = """<!DOCTYPE html>
   html, body {
     margin: 0;
     padding: 0;
-    background: #101511;
-    color: #f3f7f3;
+    background: var(--outer-bg);
+    color: var(--text-col);
     font-family: system-ui, -apple-system, sans-serif;
     width: 100%;
     height: 100%;
@@ -448,7 +461,7 @@ HTML_PAGE = """<!DOCTYPE html>
     height: var(--app-height);
     max-width: 480px;
     margin: 0 auto;
-    background: #171e18;
+    background: var(--surface-bg);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -460,8 +473,8 @@ HTML_PAGE = """<!DOCTYPE html>
     align-items: center;
     justify-content: space-between;
     padding: 10px 14px;
-    background: #1f2920;
-    border-bottom: 1px solid #2b382d;
+    background: var(--header-bg);
+    border-bottom: 1px solid var(--border-col);
     gap: 8px;
     flex-shrink: 0;
   }
@@ -471,7 +484,7 @@ HTML_PAGE = """<!DOCTYPE html>
     gap: 8px;
     flex-shrink: 0;
   }
-  .brand { font-size: 20px; font-weight: 800; }
+  .brand { font-size: 20px; font-weight: 800; color: var(--accent); }
   .pad {
     padding: 14px;
     flex: 1;
@@ -484,9 +497,9 @@ HTML_PAGE = """<!DOCTYPE html>
     width: 100%;
     padding: 10px 12px;
     border-radius: 12px;
-    border: 1px solid #2f3d31;
-    background: #101511;
-    color: #fff;
+    border: 1px solid var(--border-col);
+    background: var(--input-bg);
+    color: var(--text-col);
     font-size: 15px;
     font-family: inherit;
     outline: none;
@@ -508,16 +521,16 @@ HTML_PAGE = """<!DOCTYPE html>
     cursor: pointer;
     flex-shrink: 0;
   }
-  button.sec { background: #263228; color: #eef5ee; }
+  button.sec { background: var(--sec-btn-bg); color: var(--sec-btn-text); }
   button.del { background: #b93838; color: #fff; }
   button.warn { background: #c88a1e; color: #101511; }
-  button.blue-btn { background: #2da9ff; color: #ffffff; }
+  button.blue-btn { background: var(--accent); color: var(--accent-contrast); }
   button:disabled { opacity: 0.48; cursor: not-allowed; }
   .mt-8 { margin-top: 8px; }
   .mt-12 { margin-top: 12px; }
   .err { color: #ff7b7b; font-size: 13px; margin-top: 8px; min-height: 18px; }
   .ok { color: var(--accent); font-size: 13px; margin-top: 8px; }
-  .muted { color: #96a598; font-size: 13px; }
+  .muted { color: var(--muted-col); font-size: 13px; }
   .typing-line {
     font-size: 12px;
     color: var(--accent);
@@ -531,7 +544,7 @@ HTML_PAGE = """<!DOCTYPE html>
     margin-bottom: 10px;
     padding: 10px 12px;
     border-radius: 12px;
-    background: #223024;
+    background: var(--card-alt-bg);
     border: 1px solid var(--accent);
     display: flex;
     align-items: center;
@@ -545,7 +558,8 @@ HTML_PAGE = """<!DOCTYPE html>
     gap: 12px;
     padding: 11px;
     border-radius: 12px;
-    background: #202a21;
+    background: var(--card-bg);
+    border: 1px solid var(--border-col);
     margin-top: 8px;
     cursor: pointer;
   }
@@ -553,7 +567,8 @@ HTML_PAGE = """<!DOCTYPE html>
     width: 44px;
     height: 44px;
     border-radius: 50%;
-    background: #141a15;
+    background: var(--input-bg);
+    border: 1px solid var(--border-col);
     display: grid;
     place-items: center;
     font-size: 22px;
@@ -561,7 +576,7 @@ HTML_PAGE = """<!DOCTYPE html>
   }
   .chat-info { min-width: 0; flex: 1; }
   .chat-name { font-weight: 700; font-size: 15px; display: inline-flex; align-items: center; gap: 5px; }
-  .chat-last { color: #9aa89c; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
+  .chat-last { color: var(--muted-col); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
   .chat-last.typing-active { color: var(--accent); font-weight: 600; }
   .verified-badge {
     display: inline-flex;
@@ -570,8 +585,8 @@ HTML_PAGE = """<!DOCTYPE html>
     width: 17px;
     height: 17px;
     border-radius: 50%;
-    background: #2da9ff;
-    color: #ffffff;
+    background: var(--accent);
+    color: var(--accent-contrast);
     font-size: 11px;
     font-weight: 900;
     line-height: 1;
@@ -591,8 +606,8 @@ HTML_PAGE = """<!DOCTYPE html>
     width: 54px;
     height: 54px;
     border-radius: 50%;
-    background: #2da9ff;
-    color: #ffffff;
+    background: var(--accent);
+    color: var(--accent-contrast);
     font-size: 22px;
     display: grid;
     place-items: center;
@@ -612,10 +627,10 @@ HTML_PAGE = """<!DOCTYPE html>
     gap: 10px;
     padding: 10px 12px;
     border-radius: 12px;
-    background: #202a21;
+    background: var(--card-bg);
     margin-top: 8px;
     cursor: pointer;
-    border: 1px solid transparent;
+    border: 1px solid var(--border-col);
   }
   .member-pick.selected {
     border-color: var(--accent);
@@ -632,8 +647,8 @@ HTML_PAGE = """<!DOCTYPE html>
   .group-edit-card {
     padding: 14px;
     border-radius: 14px;
-    background: #202a21;
-    border: 1px solid #2d3b2f;
+    background: var(--card-bg);
+    border: 1px solid var(--border-col);
     margin-top: 14px;
   }
   .group-member-row {
@@ -643,15 +658,16 @@ HTML_PAGE = """<!DOCTYPE html>
     gap: 8px;
     padding: 10px 12px;
     border-radius: 12px;
-    background: #202a21;
+    background: var(--card-bg);
+    border: 1px solid var(--border-col);
     margin-top: 8px;
   }
   .role-badge-owner {
     display: inline-block;
     padding: 2px 8px;
     border-radius: 999px;
-    background: rgba(45, 169, 255, 0.16);
-    color: #5bc0ff;
+    background: var(--accent-soft);
+    color: var(--accent);
     font-size: 12px;
     font-weight: 700;
     margin-top: 3px;
@@ -660,8 +676,8 @@ HTML_PAGE = """<!DOCTYPE html>
     display: inline-block;
     padding: 2px 8px;
     border-radius: 999px;
-    background: #28342a;
-    color: #9aa89c;
+    background: var(--sec-btn-bg);
+    color: var(--muted-col);
     font-size: 12px;
     font-weight: 600;
     margin-top: 3px;
@@ -708,7 +724,7 @@ HTML_PAGE = """<!DOCTYPE html>
     border-radius: 10px;
   }
   .room-header-main.clickable-header:active {
-    background: #263228;
+    background: var(--sec-btn-bg);
   }
   .room-title-text {
     font-size: 15px;
@@ -731,8 +747,9 @@ HTML_PAGE = """<!DOCTYPE html>
   }
   .sys-msg {
     align-self: center;
-    background: rgba(255, 255, 255, 0.06);
-    color: #b5c3b7;
+    background: var(--card-bg);
+    border: 1px solid var(--border-col);
+    color: var(--muted-col);
     font-size: 12px;
     padding: 4px 12px;
     border-radius: 999px;
@@ -778,7 +795,7 @@ HTML_PAGE = """<!DOCTYPE html>
     -webkit-touch-callout: none;
   }
   .me { align-self: flex-end; background: var(--accent); color: var(--accent-contrast); font-weight: 500; }
-  .them { align-self: flex-start; background: #243026; color: #f3f7f3; }
+  .them { align-self: flex-start; background: var(--card-alt-bg); border: 1px solid var(--border-col); color: var(--text-col); }
   .msg-img {
     display: block;
     max-width: min(100%, var(--photo-max-size));
@@ -791,6 +808,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .msg-txt:first-child { margin-top: 0; }
   .emoji-only-bubble {
     background: transparent !important;
+    border-color: transparent !important;
     padding: 2px 4px !important;
     font-size: var(--emoji-size) !important;
     line-height: 1.15 !important;
@@ -814,21 +832,20 @@ HTML_PAGE = """<!DOCTYPE html>
     border-radius: 999px;
     font-size: 12px;
     font-weight: 700;
-    background: rgba(16, 21, 17, 0.35);
+    background: rgba(0, 0, 0, 0.25);
     color: inherit;
     border: 1px solid rgba(255, 255, 255, 0.16);
     cursor: pointer;
   }
   .reaction-chip.reacted-by-me {
-    background: rgba(45, 169, 255, 0.28);
-    border-color: #2da9ff;
-    color: #ffffff;
+    background: var(--accent-soft);
+    border-color: var(--accent);
   }
 
   .msg-menu-backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.55);
+    background: rgba(0, 0, 0, 0.6);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -838,16 +855,16 @@ HTML_PAGE = """<!DOCTYPE html>
   .msg-menu-card {
     width: 100%;
     max-width: 340px;
-    background: #1f2920;
-    border: 1px solid #324234;
+    background: var(--header-bg);
+    border: 1px solid var(--border-col);
     border-radius: 16px;
     padding: 14px;
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
   }
   .msg-menu-preview {
     font-size: 12px;
-    color: #a8b7aa;
-    background: #151c16;
+    color: var(--muted-col);
+    background: var(--input-bg);
     padding: 8px 10px;
     border-radius: 10px;
     margin-bottom: 12px;
@@ -862,8 +879,8 @@ HTML_PAGE = """<!DOCTYPE html>
     margin-top: 10px;
   }
   .reaction-pick-btn {
-    background: #28342a;
-    color: #fff;
+    background: var(--sec-btn-bg);
+    color: var(--text-col);
     padding: 7px 10px;
     font-size: 20px;
     line-height: 1;
@@ -876,7 +893,8 @@ HTML_PAGE = """<!DOCTYPE html>
     inset: 0;
     width: 100vw;
     height: 100dvh;
-    background: #0d120e;
+    background: var(--outer-bg);
+    color: var(--text-col);
     display: flex;
     flex-direction: column;
     justify-content: space-between;
@@ -896,8 +914,8 @@ HTML_PAGE = """<!DOCTYPE html>
     flex: 1;
     margin: 14px 0;
     border-radius: 20px;
-    background: #161e18;
-    border: 1px solid #2b3a2e;
+    background: var(--surface-bg);
+    border: 1px solid var(--border-col);
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -908,7 +926,7 @@ HTML_PAGE = """<!DOCTYPE html>
     width: 100%;
     height: 100%;
     object-fit: cover;
-    background: #111712;
+    background: var(--input-bg);
   }
   .call-avatar-fallback {
     position: absolute;
@@ -917,7 +935,7 @@ HTML_PAGE = """<!DOCTYPE html>
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    background: radial-gradient(circle at center, #202b22 0%, #111712 100%);
+    background: var(--card-bg);
     z-index: 1;
   }
   .call-avatar-fallback.hidden-cam {
@@ -932,7 +950,7 @@ HTML_PAGE = """<!DOCTYPE html>
     border-radius: 14px;
     overflow: hidden;
     border: 2px solid var(--accent);
-    background: #0f1410;
+    background: var(--input-bg);
     z-index: 2;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
   }
@@ -946,7 +964,7 @@ HTML_PAGE = """<!DOCTYPE html>
     display: inline-block;
     padding: 5px 13px;
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.09);
+    background: var(--accent-soft);
     color: var(--accent);
     font-weight: 800;
     font-size: 15px;
@@ -956,7 +974,8 @@ HTML_PAGE = """<!DOCTYPE html>
     width: 78px;
     height: 78px;
     border-radius: 50%;
-    background: #131914;
+    background: var(--input-bg);
+    border: 1px solid var(--border-col);
     display: grid;
     place-items: center;
     font-size: 40px;
@@ -969,7 +988,7 @@ HTML_PAGE = """<!DOCTYPE html>
   }
   .call-status-text {
     font-size: 13px;
-    color: #b7c6b9;
+    color: var(--muted-col);
     margin-top: 6px;
     min-height: 20px;
     text-align: center;
@@ -989,8 +1008,8 @@ HTML_PAGE = """<!DOCTYPE html>
     justify-content: space-between;
     gap: 8px;
     padding: 7px 12px;
-    background: #212c22;
-    border-top: 1px solid #2f3d31;
+    background: var(--card-bg);
+    border-top: 1px solid var(--border-col);
     font-size: 12px;
   }
   .reply-bar-info {
@@ -1004,7 +1023,7 @@ HTML_PAGE = """<!DOCTYPE html>
     color: var(--accent);
   }
   .reply-bar-text {
-    color: #c2d0c3;
+    color: var(--muted-col);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1012,8 +1031,8 @@ HTML_PAGE = """<!DOCTYPE html>
 
   .bottom-dock {
     flex-shrink: 0;
-    background: #1b231c;
-    border-top: 1px solid #28342a;
+    background: var(--dock-bg);
+    border-top: 1px solid var(--border-col);
     padding-bottom: env(safe-area-inset-bottom, 0px);
   }
   .muted-banner {
@@ -1029,12 +1048,12 @@ HTML_PAGE = """<!DOCTYPE html>
     align-items: center;
     gap: 6px;
     padding: 6px 12px;
-    background: #1b231c;
+    background: var(--dock-bg);
     overflow-x: auto;
   }
   .em-btn {
-    background: #263228;
-    color: #fff;
+    background: var(--sec-btn-bg);
+    color: var(--sec-btn-text);
     padding: 5px 9px;
     font-size: var(--emoji-size);
     line-height: 1.1;
@@ -1046,15 +1065,15 @@ HTML_PAGE = """<!DOCTYPE html>
     align-items: center;
     gap: 10px;
     padding: 8px 14px;
-    background: #1f2920;
-    border-top: 1px solid #2b382d;
+    background: var(--header-bg);
+    border-top: 1px solid var(--border-col);
   }
   .attach-preview img {
     width: 52px;
     height: 52px;
     object-fit: cover;
     border-radius: 8px;
-    border: 1px solid #394a3c;
+    border: 1px solid var(--border-col);
   }
   .attach-remove { padding: 6px 10px; font-size: 12px; border-radius: 8px; background: #b93838; color: #fff; margin-left: auto; }
   .composer {
@@ -1062,11 +1081,11 @@ HTML_PAGE = """<!DOCTYPE html>
     align-items: flex-end;
     gap: 6px;
     padding: 8px 12px 10px;
-    background: #1b231c;
+    background: var(--dock-bg);
   }
   .clip-btn {
-    background: #263228;
-    color: #eef5ee;
+    background: var(--sec-btn-bg);
+    color: var(--sec-btn-text);
     padding: 10px 11px;
     font-size: 17px;
     border-radius: 10px;
@@ -1086,8 +1105,8 @@ HTML_PAGE = """<!DOCTYPE html>
     margin-top: 22px;
     padding: 14px;
     border-radius: 14px;
-    background: #202a21;
-    border: 1px solid #2d3b2f;
+    background: var(--card-bg);
+    border: 1px solid var(--border-col);
   }
   .theme-swatches {
     display: grid;
@@ -1102,9 +1121,9 @@ HTML_PAGE = """<!DOCTYPE html>
     width: 100%;
     padding: 9px 11px;
     border-radius: 10px;
-    background: #161d17;
-    color: #eef5ee;
-    border: 1px solid #2e3d30;
+    background: var(--input-bg);
+    color: var(--text-col);
+    border: 1px solid var(--border-col);
     font-size: 13px;
     font-weight: 700;
   }
@@ -1318,7 +1337,13 @@ HTML_PAGE = """<!DOCTYPE html>
       <span style="width:52px;"></span>
     </div>
     <div class="pad">
-      <div style="font-weight:700;">Аватарка (только эмодзи)</div>
+      <div class="group-edit-card" style="margin-top:0;">
+        <div style="font-weight:700;">🔔 Уведомления браузера</div>
+        <div class="muted mt-8" id="notifPermStatusText">Проверка статуса уведомлений...</div>
+        <button type="button" class="blue-btn mt-12" style="width:100%;" id="btnAskNotifPerm" onclick="requestNotificationPermissionFromUser()">Включить уведомления браузера</button>
+      </div>
+
+      <div style="font-weight:700; margin-top:18px;">Аватарка (только эмодзи)</div>
       <div id="avaPicker" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;"></div>
 
       <div style="font-weight:700; margin-top:18px;">Изменить никнейм</div>
@@ -1403,10 +1428,74 @@ const REACTION_EMOJIS = [
 ];
 
 const SITE_THEMES = {
-  green:  { accent: "#9be15d", contrast: "#101511", soft: "rgba(155, 225, 93, 0.18)" },
-  red:    { accent: "#ff5c5c", contrast: "#ffffff", soft: "rgba(255, 92, 92, 0.18)" },
-  yellow: { accent: "#ffd43b", contrast: "#141208", soft: "rgba(255, 212, 59, 0.18)" },
-  blue:   { accent: "#38a9ff", contrast: "#091521", soft: "rgba(56, 169, 255, 0.18)" }
+  green: {
+    outerBg: "#0d140e",
+    surfaceBg: "#142116",
+    headerBg: "#1c2e1f",
+    dockBg: "#17261a",
+    cardBg: "#1d3021",
+    cardAltBg: "#233a27",
+    inputBg: "#0e1710",
+    borderCol: "#2d4a32",
+    textCol: "#f2fbf3",
+    mutedCol: "#9bc2a2",
+    secBtnBg: "#253d29",
+    secBtnText: "#eef9ef",
+    accent: "#9be15d",
+    contrast: "#0e1710",
+    soft: "rgba(155, 225, 93, 0.2)"
+  },
+  red: {
+    outerBg: "#170c0d",
+    surfaceBg: "#241214",
+    headerBg: "#33171b",
+    dockBg: "#291417",
+    cardBg: "#38191e",
+    cardAltBg: "#441e24",
+    inputBg: "#180c0e",
+    borderCol: "#59262e",
+    textCol: "#fff3f4",
+    mutedCol: "#d49ca3",
+    secBtnBg: "#471f26",
+    secBtnText: "#fff0f1",
+    accent: "#ff5c5c",
+    contrast: "#1c080a",
+    soft: "rgba(255, 92, 92, 0.22)"
+  },
+  yellow: {
+    outerBg: "#171409",
+    surfaceBg: "#241f0e",
+    headerBg: "#332b12",
+    dockBg: "#29230f",
+    cardBg: "#382f14",
+    cardAltBg: "#453917",
+    inputBg: "#181509",
+    borderCol: "#5c4d1e",
+    textCol: "#fffbef",
+    mutedCol: "#d6c58b",
+    secBtnBg: "#473b18",
+    secBtnText: "#fff9e6",
+    accent: "#ffd43b",
+    contrast: "#191404",
+    soft: "rgba(255, 212, 59, 0.22)"
+  },
+  blue: {
+    outerBg: "#0a121a",
+    surfaceBg: "#101d2b",
+    headerBg: "#16293d",
+    dockBg: "#122132",
+    cardBg: "#182e45",
+    cardAltBg: "#1d3752",
+    inputBg: "#0b141e",
+    borderCol: "#25476b",
+    textCol: "#f1f8ff",
+    mutedCol: "#96bddf",
+    secBtnBg: "#1f3a57",
+    secBtnText: "#eef7ff",
+    accent: "#38a9ff",
+    contrast: "#07131e",
+    soft: "rgba(56, 169, 255, 0.22)"
+  }
 };
 
 const DEFAULT_CUSTOM = {
@@ -1450,6 +1539,7 @@ let roomHistoryInitialized = false;
 let notifiedDirectMsgIds = new Set();
 let directNotifInitDone = false;
 let seenAlertIds = new Set();
+let autoPermPromptTried = false;
 
 let selectedGroupEmoji = "🦜";
 let selectedGroupMembers = new Set();
@@ -1474,6 +1564,8 @@ let sentCandidateKeys = new Set();
 let appliedCandidateKeys = new Set();
 let answerSent = false;
 let announcedIncomingCallId = "";
+let renegotiating = false;
+let needsRenegotiate = false;
 
 function loadMutedDirectPeers() {
   try {
@@ -1511,11 +1603,87 @@ function toggleDirectPeerMuted(peer) {
   return nowMuted;
 }
 
-function requestBrowserNotificationPermissionOnce() {
+function refreshNotificationUiStatus() {
+  const txt = document.getElementById("notifPermStatusText");
+  const btn = document.getElementById("btnAskNotifPerm");
+  if (!txt || !btn) return;
+  if (!("Notification" in window)) {
+    txt.textContent = "Этот браузер не поддерживает системные уведомления.";
+    btn.classList.add("hidden");
+    return;
+  }
+  const perm = Notification.permission;
+  if (perm === "granted") {
+    txt.textContent = "Уведомления разрешены: придут для личных сообщений, звонков и групп.";
+    btn.classList.add("hidden");
+  } else if (perm === "denied") {
+    txt.textContent = "Уведомления запрещены в настройках браузера для этого сайта. Разреши их в значке 🔒 в адресной строке.";
+    btn.classList.remove("hidden");
+  } else {
+    txt.textContent = "Нажми кнопку ниже, чтобы браузер спросил разрешение на уведомления.";
+    btn.classList.remove("hidden");
+  }
+}
+
+async function requestNotificationPermissionFromUser() {
+  if (!("Notification" in window)) {
+    alert("Браузер не поддерживает уведомления.");
+    return;
+  }
   try {
-    if (!("Notification" in window)) return;
-    if (Notification.permission === "default") {
-      Notification.requestPermission().catch(() => {});
+    const perm = await Notification.requestPermission();
+    refreshNotificationUiStatus();
+    if (perm === "granted") {
+      playSound("react");
+      showBrowserNativeNotification("🍐 Груша", "Уведомления включены!");
+    } else if (perm === "denied") {
+      showInAppAlert("Уведомления заблокированы", "Включи уведомления для сайта в настройках браузера (иконка замочка/настроек в адресной строке).");
+    }
+  } catch (e) {
+    refreshNotificationUiStatus();
+  }
+}
+
+function tryAutoRequestNotificationOnce() {
+  if (autoPermPromptTried) return;
+  autoPermPromptTried = true;
+  if (!("Notification" in window)) return;
+  if (Notification.permission === "default") {
+    try {
+      const p = Notification.requestPermission();
+      if (p && typeof p.then === "function") {
+        p.then(() => refreshNotificationUiStatus()).catch(() => {});
+      }
+    } catch (e) {}
+  }
+  refreshNotificationUiStatus();
+}
+
+function showBrowserNativeNotification(title, body) {
+  try {
+    if (!("Notification" in window) || Notification.permission !== "granted") {
+      return;
+    }
+    const opts = {
+      body: body || "",
+      icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><text y='50' font-size='52'>🍐</text></svg>",
+      tag: `grusha_${Date.now()}`,
+      renotify: true
+    };
+    if (navigator.serviceWorker && navigator.serviceWorker.getRegistration) {
+      navigator.serviceWorker.getRegistration().then(reg => {
+        if (reg && reg.showNotification) {
+          reg.showNotification(title, opts).catch(() => {
+            try { new Notification(title, opts); } catch (err) {}
+          });
+        } else {
+          try { new Notification(title, opts); } catch (err) {}
+        }
+      }).catch(() => {
+        try { new Notification(title, opts); } catch (err) {}
+      });
+    } else {
+      new Notification(title, opts);
     }
   } catch (e) {}
 }
@@ -1527,7 +1695,7 @@ function showInAppAlert(title, body) {
     <div class="inapp-toast-banner">
       <div style="min-width:0;">
         <div style="font-weight:800;">${esc(title)}</div>
-        <div class="muted" style="color:#dbe7dc;">${esc(body)}</div>
+        <div class="muted" style="color:var(--text-col);">${esc(body)}</div>
       </div>
       <button type="button" class="mini-btn sec" onclick="this.parentElement.remove()">✕</button>
     </div>
@@ -1541,12 +1709,7 @@ function triggerSystemNotification(title, body, { allowInApp = true, isDirectMes
   if (allowInApp) {
     showInAppAlert(title, body);
   }
-  try {
-    if (!("Notification" in window)) return;
-    if (Notification.permission === "granted") {
-      new Notification(title, { body });
-    }
-  } catch (e) {}
+  showBrowserNativeNotification(title, body);
 }
 
 function getAudioContext() {
@@ -1629,12 +1792,14 @@ function syncRemoteMediaElements() {
   if (!vid) return;
   vid.muted = false;
   vid.volume = 1.0;
+
   if (remoteStream && vid.srcObject !== remoteStream) {
     vid.srcObject = remoteStream;
   }
-  const hasLiveVideo = Boolean(
-    remoteStream && remoteStream.getVideoTracks().some(t => t.readyState === "live" && t.enabled)
-  );
+
+  const videoTracks = remoteStream ? remoteStream.getVideoTracks() : [];
+  const hasLiveVideo = videoTracks.some(t => t.readyState === "live" && t.enabled && !t.muted);
+
   if (fallback) {
     fallback.classList.toggle("hidden-cam", hasLiveVideo);
   }
@@ -1646,6 +1811,9 @@ function syncRemoteMediaElements() {
 
 document.addEventListener("pointerdown", () => {
   getAudioContext();
+  if ("Notification" in window && Notification.permission === "default" && me) {
+    tryAutoRequestNotificationOnce();
+  }
   if (remoteStream) {
     syncRemoteMediaElements();
   }
@@ -1790,6 +1958,8 @@ function cleanupLocalCallResources() {
 
   micMuted = false;
   cameraEnabled = false;
+  renegotiating = false;
+  needsRenegotiate = false;
   const micBtn = document.getElementById("btnToggleMic");
   if (micBtn) {
     micBtn.textContent = "🎤 Микрофон вкл";
@@ -1832,8 +2002,13 @@ async function ensureLocalAudioStream() {
   return localStream;
 }
 
-async function renegotiateOfferIfNeeded() {
-  if (!pc || !callState || !callState.isCaller) return;
+async function flushRenegotiateIfReady() {
+  if (!pc || !callState) return;
+  if (!needsRenegotiate || renegotiating) return;
+  if (pc.signalingState !== "stable") return;
+
+  renegotiating = true;
+  needsRenegotiate = false;
   try {
     const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
     await pc.setLocalDescription(offer);
@@ -1842,7 +2017,17 @@ async function renegotiateOfferIfNeeded() {
       from: me.username,
       offer: pc.localDescription
     });
-  } catch (e) {}
+  } catch (e) {} finally {
+    renegotiating = false;
+    if (needsRenegotiate) {
+      flushRenegotiateIfReady();
+    }
+  }
+}
+
+function scheduleRenegotiate() {
+  needsRenegotiate = true;
+  flushRenegotiateIfReady();
 }
 
 async function toggleCamera() {
@@ -1879,13 +2064,19 @@ async function toggleCamera() {
       }
 
       if (pc) {
-        const sender = pc.getSenders().find(s => s.track && s.track.kind === "video");
-        if (sender) {
-          await sender.replaceTrack(vTrack);
+        const videoTransceiver = pc.getTransceivers().find(tr => tr.receiver && tr.receiver.track && tr.receiver.track.kind === "video");
+        if (videoTransceiver && videoTransceiver.sender) {
+          videoTransceiver.direction = "sendrecv";
+          await videoTransceiver.sender.replaceTrack(vTrack);
         } else {
-          pc.addTrack(vTrack, localStream);
+          const sender = pc.getSenders().find(s => s.track && s.track.kind === "video");
+          if (sender) {
+            await sender.replaceTrack(vTrack);
+          } else {
+            pc.addTrack(vTrack, localStream);
+          }
         }
-        await renegotiateOfferIfNeeded();
+        scheduleRenegotiate();
       }
 
       cameraEnabled = true;
@@ -1908,7 +2099,7 @@ async function toggleCamera() {
       if (sender) {
         try { await sender.replaceTrack(null); } catch (e) {}
       }
-      await renegotiateOfferIfNeeded();
+      scheduleRenegotiate();
     }
 
     cameraEnabled = false;
@@ -1942,6 +2133,24 @@ async function enqueueOrAddRemoteCandidate(candObj) {
   }
 }
 
+function attachTrackToRemoteStream(track) {
+  if (!track) return;
+  if (!remoteStream) {
+    remoteStream = new MediaStream();
+  }
+  const existing = remoteStream.getTracks().find(t => t.id === track.id || t.kind === track.kind);
+  if (existing && existing.id !== track.id) {
+    remoteStream.removeTrack(existing);
+  }
+  if (!remoteStream.getTracks().some(t => t.id === track.id)) {
+    remoteStream.addTrack(track);
+  }
+  track.onunmute = () => syncRemoteMediaElements();
+  track.onmute = () => syncRemoteMediaElements();
+  track.onended = () => syncRemoteMediaElements();
+  syncRemoteMediaElements();
+}
+
 function createPeerConnectionForCall(cid) {
   const conn = new RTCPeerConnection(RTC_CONFIG);
   remoteStream = new MediaStream();
@@ -1952,28 +2161,28 @@ function createPeerConnectionForCall(cid) {
     vid.volume = 1.0;
   }
 
+  try {
+    conn.addTransceiver("audio", { direction: "sendrecv" });
+    conn.addTransceiver("video", { direction: "sendrecv" });
+  } catch (e) {}
+
   if (localStream) {
     localStream.getTracks().forEach(track => {
-      conn.addTrack(track, localStream);
+      const existingSender = conn.getSenders().find(s => s.track && s.track.kind === track.kind);
+      if (existingSender) {
+        existingSender.replaceTrack(track).catch(() => {});
+      } else {
+        conn.addTrack(track, localStream);
+      }
     });
   }
 
   conn.ontrack = (event) => {
+    if (event.track) {
+      attachTrackToRemoteStream(event.track);
+    }
     if (event.streams && event.streams[0]) {
-      event.streams[0].getTracks().forEach(track => {
-        if (!remoteStream.getTracks().some(rt => rt.id === track.id)) {
-          remoteStream.addTrack(track);
-        }
-        track.onunmute = () => syncRemoteMediaElements();
-        track.onmute = () => syncRemoteMediaElements();
-        track.onended = () => syncRemoteMediaElements();
-      });
-      const el = document.getElementById("remoteVideoEl");
-      if (el) {
-        el.srcObject = event.streams[0];
-      }
-    } else if (event.track) {
-      remoteStream.addTrack(event.track);
+      event.streams[0].getTracks().forEach(t => attachTrackToRemoteStream(t));
     }
     syncRemoteMediaElements();
   };
@@ -2043,13 +2252,16 @@ async function startDirectCall() {
     isCaller: true,
     status: "ringing",
     connectedAt: null,
-    iceNote: ""
+    iceNote: "",
+    lastAppliedOfferJson: "",
+    lastAppliedAnswerJson: ""
   };
   showCallModalUi();
 
   pc = createPeerConnectionForCall(cid);
   const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
   await pc.setLocalDescription(offer);
+  callState.lastAppliedOfferJson = JSON.stringify(pc.localDescription);
   await api("/api/call/offer", {
     callId: cid,
     from: me.username,
@@ -2075,13 +2287,15 @@ async function acceptIncomingCall() {
 
   if (pendingOfferToApply) {
     await pc.setRemoteDescription(new RTCSessionDescription(pendingOfferToApply));
+    callState.lastAppliedOfferJson = JSON.stringify(pendingOfferToApply);
     pendingOfferToApply = null;
     await flushPendingCandidates();
   }
 
-  if (!answerSent && pc.remoteDescription) {
+  if (pc.remoteDescription) {
     const answer = await pc.createAnswer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
     await pc.setLocalDescription(answer);
+    callState.lastAppliedAnswerJson = JSON.stringify(pc.localDescription);
     answerSent = true;
     await api("/api/call/answer", {
       callId: cid,
@@ -2157,7 +2371,9 @@ async function pollCallStatus() {
         isCaller: false,
         status: "ringing",
         connectedAt: null,
-        iceNote: ""
+        iceNote: "",
+        lastAppliedOfferJson: "",
+        lastAppliedAnswerJson: ""
       };
       if (c.offer) {
         pendingOfferToApply = c.offer;
@@ -2181,32 +2397,45 @@ async function pollCallStatus() {
     pc = createPeerConnectionForCall(c.callId);
   }
 
-  if (!callState.isCaller && c.offer && pc && pc.signalingState === "stable") {
-    try {
-      await pc.setRemoteDescription(new RTCSessionDescription(c.offer));
-      await flushPendingCandidates();
-      const ans = await pc.createAnswer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
-      await pc.setLocalDescription(ans);
-      await api("/api/call/answer", {
-        callId: c.callId,
-        from: me.username,
-        answer: pc.localDescription
-      });
-    } catch (e) {}
-  } else if (!callState.isCaller && c.offer && !pendingOfferToApply && (!pc || !pc.remoteDescription)) {
-    pendingOfferToApply = c.offer;
+  /* Обработка новых офферов (включая ренегациацию при включении/выключении камеры) */
+  if (c.offer) {
+    const offerJson = JSON.stringify(c.offer);
+    const isNewOfferFromPeer = c.offerBy && c.offerBy !== me.username && offerJson !== callState.lastAppliedOfferJson;
+    if (isNewOfferFromPeer) {
+      if (pc && pc.signalingState === "stable") {
+        try {
+          await pc.setRemoteDescription(new RTCSessionDescription(c.offer));
+          callState.lastAppliedOfferJson = offerJson;
+          await flushPendingCandidates();
+          const ans = await pc.createAnswer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+          await pc.setLocalDescription(ans);
+          callState.lastAppliedAnswerJson = JSON.stringify(pc.localDescription);
+          await api("/api/call/answer", {
+            callId: c.callId,
+            from: me.username,
+            answer: pc.localDescription
+          });
+          syncRemoteMediaElements();
+        } catch (e) {}
+      } else if (!callState.isCaller && (!pc || !pc.remoteDescription)) {
+        pendingOfferToApply = c.offer;
+      }
+    }
   }
 
-  if (callState.isCaller && c.answer && pc) {
+  /* Обработка ответа на наш оффер (первый ответ или ответ на ренегациацию камеры) */
+  if (c.answer && pc && c.answerBy && c.answerBy !== me.username) {
     const remoteJson = JSON.stringify(c.answer);
-    if (callState.lastAppliedAnswerJson !== remoteJson) {
+    if (remoteJson !== callState.lastAppliedAnswerJson && pc.signalingState === "have-local-offer") {
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(c.answer));
         callState.lastAppliedAnswerJson = remoteJson;
         await flushPendingCandidates();
+        flushRenegotiateIfReady();
+        syncRemoteMediaElements();
       } catch (e) {}
     }
-    if (callState.status !== "active") {
+    if (callState.isCaller && callState.status !== "active") {
       callState.status = "active";
       if (!callState.connectedAt) {
         callState.connectedAt = c.connectedAt ? Number(c.connectedAt) : Date.now();
@@ -2233,6 +2462,8 @@ async function pollCallStatus() {
     if (!item || item.from === me.username || !item.candidate) continue;
     await enqueueOrAddRemoteCandidate(item.candidate);
   }
+
+  flushRenegotiateIfReady();
 
   if (callState && callState.status === "active") {
     syncRemoteMediaElements();
@@ -2437,12 +2668,26 @@ function applyThemeButtonsState(themeKey) {
 function applyCustom(cfg) {
   const themeKey = SITE_THEMES[cfg.theme] ? cfg.theme : DEFAULT_CUSTOM.theme;
   const palette = SITE_THEMES[themeKey];
-  document.documentElement.style.setProperty("--accent", palette.accent);
-  document.documentElement.style.setProperty("--accent-contrast", palette.contrast);
-  document.documentElement.style.setProperty("--accent-soft", palette.soft);
-  document.documentElement.style.setProperty("--msg-font-size", `${cfg.msgSize}px`);
-  document.documentElement.style.setProperty("--emoji-size", `${cfg.emojiSize}px`);
-  document.documentElement.style.setProperty("--photo-max-size", `${cfg.photoSize}px`);
+  const rootStyle = document.documentElement.style;
+  rootStyle.setProperty("--outer-bg", palette.outerBg);
+  rootStyle.setProperty("--surface-bg", palette.surfaceBg);
+  rootStyle.setProperty("--header-bg", palette.headerBg);
+  rootStyle.setProperty("--dock-bg", palette.dockBg);
+  rootStyle.setProperty("--card-bg", palette.cardBg);
+  rootStyle.setProperty("--card-alt-bg", palette.cardAltBg);
+  rootStyle.setProperty("--input-bg", palette.inputBg);
+  rootStyle.setProperty("--border-col", palette.borderCol);
+  rootStyle.setProperty("--text-col", palette.textCol);
+  rootStyle.setProperty("--muted-col", palette.mutedCol);
+  rootStyle.setProperty("--sec-btn-bg", palette.secBtnBg);
+  rootStyle.setProperty("--sec-btn-text", palette.secBtnText);
+  rootStyle.setProperty("--accent", palette.accent);
+  rootStyle.setProperty("--accent-contrast", palette.contrast);
+  rootStyle.setProperty("--accent-soft", palette.soft);
+
+  rootStyle.setProperty("--msg-font-size", `${cfg.msgSize}px`);
+  rootStyle.setProperty("--emoji-size", `${cfg.emojiSize}px`);
+  rootStyle.setProperty("--photo-max-size", `${cfg.photoSize}px`);
 
   applyThemeButtonsState(themeKey);
 
@@ -2597,7 +2842,10 @@ function enterChats() {
   lastRenderedMsgsJson = "";
   document.getElementById("myAva").textContent = sanitizeAvatarEmoji(me.emoji);
   document.getElementById("myNick").innerHTML = nickLabelHtml(me.username, me.isOwner);
-  requestBrowserNotificationPermissionOnce();
+  refreshNotificationUiStatus();
+  if ("Notification" in window && Notification.permission === "default") {
+    showInAppAlert("Включить уведомления?", "Разреши уведомления для личных сообщений и звонков.");
+  }
   showScreen("chatsScreen");
   refreshChats();
   pollUserAlerts();
@@ -2984,13 +3232,13 @@ async function renderGroupSettings() {
 
   const actionZoneHtml = isGroupOwner
     ? `
-      <div style="margin-top:22px; padding-top:14px; border-top:1px solid #2b382d;">
+      <div style="margin-top:22px; padding-top:14px; border-top:1px solid var(--border-col);">
         <div style="font-weight:700; color:#ff8c8c;">Управление группой (только владелец)</div>
         <button type="button" class="del mt-8" style="width:100%;" onclick="deleteCurrentGroup()">Удалить группу</button>
       </div>
     `
     : `
-      <div style="margin-top:22px; padding-top:14px; border-top:1px solid #2b382d;">
+      <div style="margin-top:22px; padding-top:14px; border-top:1px solid var(--border-col);">
         <button type="button" class="del" style="width:100%;" onclick="leaveCurrentGroup()">Выйти из группы</button>
       </div>
     `;
@@ -3100,6 +3348,7 @@ function getNickCooldownInfo(userObj) {
 
 function openSettings() {
   playSound("click");
+  refreshNotificationUiStatus();
   renderAvatarChoices();
   applyCustom(loadCustom());
   document.getElementById("setErr").textContent = "";
@@ -3196,7 +3445,7 @@ async function refreshChats() {
           triggerSystemNotification(
             `Сообщение от @${c.username}`,
             c.last || "Новое сообщение",
-            { allowInApp: false, isDirectMessage: true, peer: c.username }
+            { allowInApp: true, isDirectMessage: true, peer: c.username }
           );
         }
       }
@@ -3204,7 +3453,7 @@ async function refreshChats() {
   }
 
   if (!res.chats.length) {
-    list.innerHTML = `<div class="muted mt-12">Чатов пока нет. Нажми на 🔍 в правом верхнем углу или на синий ✏️ внизу.</div>`;
+    list.innerHTML = `<div class="muted mt-12">Чатов пока нет. Нажми на 🔍 в правом верхнем углу или на ✏️ внизу.</div>`;
     return;
   }
   list.innerHTML = res.chats.map(c => {
@@ -3294,7 +3543,7 @@ function openMsgActionModal(msgIndex) {
     grid.innerHTML = REACTION_EMOJIS.map(em => {
       const users = myReactions[em] || [];
       const active = users.includes(me.username);
-      return `<button type="button" class="reaction-pick-btn" style="${active ? 'outline:2px solid var(--accent); background:#1c3242;' : ''}" onclick="pickReactionForSelected('${em}')">${em}</button>`;
+      return `<button type="button" class="reaction-pick-btn" style="${active ? 'outline:2px solid var(--accent); background:var(--accent-soft);' : ''}" onclick="pickReactionForSelected('${em}')">${em}</button>`;
     }).join("");
   }
 
@@ -3374,7 +3623,6 @@ function bindLongPressToBubble(el, msgIndex) {
 
 async function openDirectChat(username, emoji, isOwner = false) {
   playSound("click");
-  requestBrowserNotificationPermissionOnce();
   const cleanAva = sanitizeAvatarEmoji(emoji);
   activeChat = { type: "direct", id: username, username, emoji: cleanAva, isOwner, tripleBadge: false };
   replyTarget = null;
@@ -3401,7 +3649,6 @@ async function openDirectChat(username, emoji, isOwner = false) {
 
 async function openGroupChat(groupId, title, emoji, tripleBadge = false) {
   playSound("click");
-  requestBrowserNotificationPermissionOnce();
   const badgeFlag = Boolean(tripleBadge) || isTripleBadgeGroupTitle(title);
   const gAva = sanitizeAvatarEmoji(emoji || "🦜");
   activeChat = { type: "group", id: groupId, username: title, emoji: gAva, isOwner: false, tripleBadge: badgeFlag };
@@ -3803,6 +4050,7 @@ function esc(s) {
 
 applyCustom(loadCustom());
 renderAvatarChoices();
+refreshNotificationUiStatus();
 
 (async function boot() {
   let savedNick = "";
@@ -3932,7 +4180,9 @@ def call_start():
         "callerEmoji": caller_emoji,
         "status": "ringing",
         "offer": None,
+        "offerBy": "",
         "answer": None,
+        "answerBy": "",
         "candidates": [],
         "createdAt": now,
         "updatedAt": now,
@@ -3952,6 +4202,7 @@ def call_offer():
     if not c or from_u not in (c.get("caller"), c.get("callee")):
         return jsonify({"ok": False})
     c["offer"] = offer
+    c["offerBy"] = from_u
     c["updatedAt"] = int(time.time() * 1000)
     return jsonify({"ok": True})
 
@@ -3968,6 +4219,7 @@ def call_answer():
         return jsonify({"ok": False})
     now = int(time.time() * 1000)
     c["answer"] = answer
+    c["answerBy"] = from_u
     c["status"] = "active"
     if not c.get("connectedAt"):
         c["connectedAt"] = now
