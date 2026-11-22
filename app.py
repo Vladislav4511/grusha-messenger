@@ -25,10 +25,18 @@ TRIPLE_BADGE_GROUP_TITLE = "ырка сквад"
 MAX_IMAGE_LEN = 1_500_000
 DEFAULT_GROUP_ICON = "🦜"
 DEFAULT_USER_EMOJI = "🍐"
+VALID_CALL_ACCESS = ("all", "owner", "nobody")
 
 TYPING_STATUS = {}
 ACTIVE_CALLS = {}       # direct call_id -> dict
 GROUP_CALLS = {}        # group_id -> dict
+
+
+def sanitize_call_access(val):
+    v = (val or "").strip().lower()
+    if v in VALID_CALL_ACCESS:
+        return v
+    return "all"
 
 
 def sanitize_user_emoji(em):
@@ -58,7 +66,6 @@ def init_db():
                     )
                 """)
                 cur.execute("UPDATE users SET emoji = '🙂' WHERE emoji IN ('👑', '💩')")
-                cur.execute("UPDATE groups SET emoji = '🙂' WHERE emoji IN ('👑', '💩')")
 
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS messages (
@@ -84,9 +91,13 @@ def init_db():
                         owner TEXT NOT NULL,
                         members_json TEXT NOT NULL DEFAULT '[]',
                         muted_json TEXT NOT NULL DEFAULT '[]',
+                        call_access TEXT NOT NULL DEFAULT 'all',
                         created_at BIGINT NOT NULL
                     )
                 """)
+                cur.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS call_access TEXT NOT NULL DEFAULT 'all'")
+                cur.execute("UPDATE groups SET emoji = '🙂' WHERE emoji IN ('👑', '💩')")
+
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS group_messages (
                         id SERIAL PRIMARY KEY,
@@ -114,9 +125,13 @@ def init_db():
                     u_obj["emoji"] = "🙂"
                     changed = True
             for _, g_obj in db.get("groups", {}).items():
-                if isinstance(g_obj, dict) and g_obj.get("emoji") in ("👑", "💩"):
-                    g_obj["emoji"] = "🙂"
-                    changed = True
+                if isinstance(g_obj, dict):
+                    if g_obj.get("emoji") in ("👑", "💩"):
+                        g_obj["emoji"] = "🙂"
+                        changed = True
+                    if "callAccess" not in g_obj:
+                        g_obj["callAccess"] = "all"
+                        changed = True
             if changed:
                 save_json_db(db)
 
@@ -384,6 +399,7 @@ def format_group_row(row):
     members = parse_json_list(row.get("members_json") if isinstance(row, dict) else getattr(row, "members_json", "[]"))
     muted = parse_json_list(row.get("muted_json") if isinstance(row, dict) else getattr(row, "muted_json", "[]"))
     title = row["title"]
+    raw_access = row.get("call_access") if isinstance(row, dict) else getattr(row, "call_access", "all")
     return {
         "id": row["id"],
         "title": title,
@@ -391,6 +407,7 @@ def format_group_row(row):
         "owner": row["owner"],
         "members": members,
         "muted": muted,
+        "callAccess": sanitize_call_access(raw_access),
         "createdAt": int(row.get("created_at", 0) or 0),
         "tripleBadge": is_triple_badge_group(title),
     }
@@ -417,9 +434,23 @@ def get_group_by_id(group_id):
         "owner": g["owner"],
         "members": list(g.get("members") or []),
         "muted": list(g.get("muted") or []),
+        "callAccess": sanitize_call_access(g.get("callAccess")),
         "createdAt": int(g.get("createdAt") or 0),
         "tripleBadge": is_triple_badge_group(title),
     }
+
+
+def can_user_call_in_group(group_obj, username):
+    if not group_obj or not username:
+        return False
+    if username not in (group_obj.get("members") or []):
+        return False
+    access = sanitize_call_access(group_obj.get("callAccess"))
+    if access == "nobody":
+        return False
+    if access == "owner":
+        return group_obj.get("owner") == username
+    return True
 
 
 def is_group_title_taken(title, exclude_group_id=None):
@@ -585,7 +616,7 @@ HTML_PAGE = """<!DOCTYPE html>
   button.del { background: #b93838; color: #fff; }
   button.warn { background: #c88a1e; color: #101511; }
   button.blue-btn { background: var(--accent); color: var(--accent-contrast); }
-  button:disabled { opacity: 0.48; cursor: not-allowed; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
   .mt-8 { margin-top: 8px; }
   .mt-12 { margin-top: 12px; }
   .err { color: #ff7b7b; font-size: 13px; margin-top: 8px; min-height: 18px; }
@@ -698,6 +729,25 @@ HTML_PAGE = """<!DOCTYPE html>
     background: var(--card-bg);
     border: 1px solid var(--border-col);
     margin-top: 14px;
+  }
+  .call-access-row {
+    display: flex;
+    gap: 6px;
+    margin-top: 10px;
+  }
+  .call-access-btn {
+    flex: 1;
+    padding: 9px 8px;
+    font-size: 12px;
+    border-radius: 10px;
+    background: var(--input-bg);
+    color: var(--text-col);
+    border: 1px solid var(--border-col);
+  }
+  .call-access-btn.active-mode {
+    background: var(--accent);
+    color: var(--accent-contrast);
+    border-color: var(--accent);
   }
   .group-member-row {
     display: flex;
@@ -951,7 +1001,6 @@ HTML_PAGE = """<!DOCTYPE html>
     border-radius: 10px;
   }
 
-  /* Переработанный полноэкранный звонок (1-на-1 и групповой) */
   .call-overlay {
     position: fixed;
     inset: 0;
@@ -1072,10 +1121,6 @@ HTML_PAGE = """<!DOCTYPE html>
     align-items: center;
     justify-content: center;
     padding: 10px;
-  }
-  .call-tile.speaking {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 2px var(--accent-soft);
   }
   .call-tile-video {
     position: absolute;
@@ -1399,7 +1444,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
     <div id="groupCallBanner" class="group-call-banner hidden">
       <div class="group-call-banner-text" id="groupCallBannerText">Идёт звонок в группе</div>
-      <button type="button" class="mini-btn blue-btn" onclick="joinActiveGroupCall()">Войти в звонок</button>
+      <button type="button" id="btnJoinGroupCallBanner" class="mini-btn blue-btn" onclick="joinActiveGroupCall()">Войти в звонок</button>
     </div>
 
     <div id="msgsBox" class="msgs"></div>
@@ -1449,7 +1494,6 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Переработанный полноэкранный звонок -->
   <div id="callOverlay" class="call-overlay hidden">
     <div class="call-top-bar">
       <div class="call-timer-pill" id="callTimerLabel">00:00</div>
@@ -1670,6 +1714,7 @@ let me = null;
 let authTab = "login";
 let activeChat = null;
 let currentGroupOwner = "";
+let currentGroupCallAccess = "all";
 let pendingImageData = "";
 let replyTarget = null;
 let currentRoomMsgs = [];
@@ -1700,7 +1745,9 @@ let audioCtx = null;
 let callState = null;
 let pc = null;
 let localStream = null;
-let remoteStream = null;
+let remoteAudioStream = null;
+let remoteVideoStream = null;
+let remoteCamActive = false;
 let micMuted = false;
 let cameraEnabled = false;
 let callTimerInterval = null;
@@ -1712,7 +1759,7 @@ let renegotiating = false;
 let needsRenegotiate = false;
 let endingCallInProgress = false;
 
-/* Mesh peer connections для групповых звонков: peerNick -> { pc, stream, videoTrack, audioEl, pendingCands, appliedCands, sentCands, makingOffer, ignoreOffer, camOff } */
+/* Mesh peer connections для групповых звонков */
 let groupPeers = new Map();
 let activeGroupCallInfo = null;
 let groupGridRenderSignature = "";
@@ -1815,6 +1862,35 @@ function bindStreamToVideoElement(vidEl, stream, muted = true) {
   }
 }
 
+function unlockAllAudioOutputs() {
+  getAudioContext();
+  const aud = document.getElementById("remoteAudioEl");
+  if (aud && remoteAudioStream) {
+    aud.muted = false;
+    aud.volume = 1.0;
+    if (aud.srcObject !== remoteAudioStream) {
+      aud.srcObject = remoteAudioStream;
+    }
+    remoteAudioStream.getAudioTracks().forEach(t => { t.enabled = true; });
+    const p = aud.play();
+    if (p && typeof p.catch === "function") p.catch(() => {});
+  }
+  groupPeers.forEach(entry => {
+    if (entry.audioStream) {
+      entry.audioStream.getAudioTracks().forEach(t => { t.enabled = true; });
+    }
+    if (entry.audioEl) {
+      entry.audioEl.muted = false;
+      entry.audioEl.volume = 1.0;
+      if (entry.stream && entry.audioEl.srcObject !== entry.stream) {
+        entry.audioEl.srcObject = entry.stream;
+      }
+      const gp = entry.audioEl.play();
+      if (gp && typeof gp.catch === "function") gp.catch(() => {});
+    }
+  });
+}
+
 function syncDirectMediaElements() {
   const aud = document.getElementById("remoteAudioEl");
   const vid = document.getElementById("remoteVideoEl");
@@ -1822,11 +1898,11 @@ function syncDirectMediaElements() {
   const locVid = document.getElementById("localVideoEl");
   const locPip = document.getElementById("callLocalPip");
 
-  if (aud) {
+  if (aud && remoteAudioStream) {
     aud.muted = false;
     aud.volume = 1.0;
-    if (remoteStream && aud.srcObject !== remoteStream) {
-      aud.srcObject = remoteStream;
+    if (aud.srcObject !== remoteAudioStream) {
+      aud.srcObject = remoteAudioStream;
     }
     const ap = aud.play();
     if (ap && typeof ap.catch === "function") {
@@ -1834,20 +1910,25 @@ function syncDirectMediaElements() {
     }
   }
 
-  const liveVideoTracks = remoteStream
-    ? remoteStream.getVideoTracks().filter(t => t.readyState === "live" && t.enabled && !t.muted)
-    : [];
-  const hasLiveRemoteVideo = liveVideoTracks.length > 0;
+  const hasLiveRemoteVideo = Boolean(
+    remoteCamActive &&
+    remoteVideoStream &&
+    remoteVideoStream.getVideoTracks().some(t => t.readyState === "live" && t.enabled)
+  );
 
   if (hasLiveRemoteVideo) {
-    bindStreamToVideoElement(vid, remoteStream, true);
+    bindStreamToVideoElement(vid, remoteVideoStream, true);
     if (fallback) fallback.classList.add("hidden");
   } else {
     hardResetVideoElement(vid);
     if (fallback) fallback.classList.remove("hidden");
   }
 
-  const hasLocalCam = cameraEnabled && localStream && localStream.getVideoTracks().some(t => t.readyState === "live" && t.enabled);
+  const hasLocalCam = Boolean(
+    cameraEnabled &&
+    localStream &&
+    localStream.getVideoTracks().some(t => t.readyState === "live" && t.enabled)
+  );
   if (hasLocalCam) {
     if (locPip) locPip.classList.remove("hidden");
     bindStreamToVideoElement(locVid, localStream, true);
@@ -1858,15 +1939,10 @@ function syncDirectMediaElements() {
 }
 
 document.addEventListener("pointerdown", () => {
-  getAudioContext();
+  unlockAllAudioOutputs();
   if (callState && callState.mode === "direct") {
     syncDirectMediaElements();
   }
-  groupPeers.forEach(entry => {
-    if (entry.audioEl && entry.audioEl.paused) {
-      entry.audioEl.play().catch(() => {});
-    }
-  });
 }, { passive: true });
 
 function sanitizeAvatarEmoji(em) {
@@ -1952,7 +2028,6 @@ function renderGroupCallGrid() {
   const participants = Array.isArray(callState.participants) ? callState.participants : [];
   const sig = participants.map(p => `${p.username}:${p.emoji}:${p.camOn ? 1 : 0}`).join("|") + `|selfCam:${cameraEnabled ? 1 : 0}`;
   if (sig === groupGridRenderSignature && grid.children.length === participants.length) {
-    // Обновляем видео потоки внутри существующих плиток без пересоздания DOM
     participants.forEach(p => {
       const tile = grid.querySelector(`[data-peer="${CSS.escape(p.username)}"]`);
       if (!tile) return;
@@ -1965,9 +2040,9 @@ function renderGroupCallGrid() {
         }
       } else {
         const entry = groupPeers.get(p.username);
-        const hasRemoteVid = p.camOn && entry && entry.videoTrack && entry.videoTrack.readyState === "live" && !entry.camOff;
+        const hasRemoteVid = Boolean(p.camOn && entry && entry.videoTrack && entry.videoTrack.readyState === "live" && !entry.camOff);
         if (hasRemoteVid) {
-          bindStreamToVideoElement(vid, entry.stream, true);
+          bindStreamToVideoElement(vid, entry.videoStream, true);
         } else {
           hardResetVideoElement(vid);
         }
@@ -1983,7 +2058,7 @@ function renderGroupCallGrid() {
     const label = isSelf ? `@${esc(p.username)} (вы)` : `@${esc(p.username)}`;
     return `
       <div class="call-tile" data-peer="${esc(p.username)}">
-        <video class="call-tile-video hidden" autoplay playsinline ${isSelf ? "muted" : "muted"}></video>
+        <video class="call-tile-video hidden" autoplay playsinline muted></video>
         <div class="call-tile-ava">${ava}</div>
         <div class="call-tile-name">${label}</div>
       </div>
@@ -2002,9 +2077,9 @@ function renderGroupCallGrid() {
       }
     } else {
       const entry = groupPeers.get(p.username);
-      const hasRemoteVid = p.camOn && entry && entry.videoTrack && entry.videoTrack.readyState === "live" && !entry.camOff;
+      const hasRemoteVid = Boolean(p.camOn && entry && entry.videoTrack && entry.videoTrack.readyState === "live" && !entry.camOff);
       if (hasRemoteVid) {
-        bindStreamToVideoElement(vid, entry.stream, true);
+        bindStreamToVideoElement(vid, entry.videoStream, true);
       } else {
         hardResetVideoElement(vid);
       }
@@ -2109,14 +2184,24 @@ function forceResetCallUi() {
     } catch (e) {}
     localStream = null;
   }
-  if (remoteStream) {
+  if (remoteAudioStream) {
     try {
-      remoteStream.getTracks().forEach(t => {
+      remoteAudioStream.getTracks().forEach(t => {
         try { t.stop(); } catch (e) {}
       });
     } catch (e) {}
-    remoteStream = null;
+    remoteAudioStream = null;
   }
+  if (remoteVideoStream) {
+    try {
+      remoteVideoStream.getTracks().forEach(t => {
+        try { t.stop(); } catch (e) {}
+      });
+    } catch (e) {}
+    remoteVideoStream = null;
+  }
+  remoteCamActive = false;
+
   const aud = document.getElementById("remoteAudioEl");
   if (aud) {
     try { aud.pause(); } catch (e) {}
@@ -2150,6 +2235,7 @@ function forceResetCallUi() {
 }
 
 async function ensureLocalAudioStream() {
+  getAudioContext();
   if (localStream && localStream.getAudioTracks().length > 0) {
     localStream.getAudioTracks().forEach(t => { t.enabled = !micMuted; });
     return localStream;
@@ -2217,11 +2303,12 @@ function stopLocalVideoTracksCompletely() {
 }
 
 function stopRemoteVideoTracksCompletely() {
-  if (remoteStream) {
-    remoteStream.getVideoTracks().forEach(t => {
+  remoteCamActive = false;
+  if (remoteVideoStream) {
+    remoteVideoStream.getVideoTracks().forEach(t => {
       try { t.enabled = false; } catch (e) {}
       try { t.stop(); } catch (e) {}
-      remoteStream.removeTrack(t);
+      remoteVideoStream.removeTrack(t);
     });
   }
   hardResetVideoElement(document.getElementById("remoteVideoEl"));
@@ -2229,12 +2316,19 @@ function stopRemoteVideoTracksCompletely() {
   if (fallback) fallback.classList.remove("hidden");
 }
 
+function applyRemoteCameraState(isOn) {
+  remoteCamActive = Boolean(isOn);
+  if (!remoteCamActive) {
+    stopRemoteVideoTracksCompletely();
+  }
+  syncDirectMediaElements();
+}
+
 function disableCameraLocallyAndSync() {
   stopLocalVideoTracksCompletely();
-  stopRemoteVideoTracksCompletely();
 
   if (callState && callState.mode === "group") {
-    groupPeers.forEach((entry) => {
+    groupPeers.forEach((entry, peerNick) => {
       const sender = entry.pc.getSenders().find(s => s.track && s.track.kind === "video");
       if (sender) {
         sender.replaceTrack(null).catch(() => {});
@@ -2243,20 +2337,26 @@ function disableCameraLocallyAndSync() {
         try { entry.videoTrack.stop(); } catch (e) {}
         entry.videoTrack = null;
       }
-      if (entry.stream) {
-        entry.stream.getVideoTracks().forEach(t => entry.stream.removeTrack(t));
+      if (entry.videoStream) {
+        entry.videoStream.getVideoTracks().forEach(t => entry.videoStream.removeTrack(t));
       }
+      sendGroupSignal(callState.groupId, me.username, peerNick, "cam-state", { camOn: false }).catch(() => {});
     });
     api("/api/group-call/media", {
       groupId: callState.groupId,
       user: me.username,
       camOn: false
     }).catch(() => {});
-  } else if (pc) {
+  } else if (pc && callState) {
     const sender = pc.getSenders().find(s => s.track && s.track.kind === "video");
     if (sender) {
       sender.replaceTrack(null).catch(() => {});
     }
+    api("/api/call/cam-state", {
+      callId: callState.callId,
+      from: me.username,
+      camOn: false
+    }).catch(() => {});
     scheduleRenegotiate();
   }
 
@@ -2286,6 +2386,7 @@ async function toggleCamera() {
       });
       const vTrack = camStream.getVideoTracks()[0];
       if (!vTrack || !callState) return;
+      vTrack.enabled = true;
 
       stopLocalVideoTracksCompletely();
       if (!localStream) {
@@ -2302,6 +2403,7 @@ async function toggleCamera() {
           } else {
             entry.pc.addTrack(vTrack, localStream);
           }
+          await sendGroupSignal(callState.groupId, me.username, peerNick, "cam-state", { camOn: true }).catch(() => {});
           if (entry.pc.signalingState === "stable") {
             const offer = await entry.pc.createOffer();
             await entry.pc.setLocalDescription(offer);
@@ -2326,6 +2428,11 @@ async function toggleCamera() {
             pc.addTrack(vTrack, localStream);
           }
         }
+        await api("/api/call/cam-state", {
+          callId: callState.callId,
+          from: me.username,
+          camOn: true
+        }).catch(() => {});
         scheduleRenegotiate();
       }
 
@@ -2373,36 +2480,51 @@ async function enqueueOrAddRemoteCandidate(candObj) {
 
 function attachTrackToRemoteStream(track) {
   if (!track || !callState) return;
-  if (!remoteStream) {
-    remoteStream = new MediaStream();
-  }
-  const sameKind = remoteStream.getTracks().filter(t => t.kind === track.kind && t.id !== track.id);
-  sameKind.forEach(t => remoteStream.removeTrack(t));
-
-  if (!remoteStream.getTracks().some(t => t.id === track.id)) {
-    remoteStream.addTrack(track);
-  }
   if (track.kind === "audio") {
+    if (!remoteAudioStream) {
+      remoteAudioStream = new MediaStream();
+    }
+    remoteAudioStream.getAudioTracks().filter(t => t.id !== track.id).forEach(t => remoteAudioStream.removeTrack(t));
+    if (!remoteAudioStream.getAudioTracks().some(t => t.id === track.id)) {
+      remoteAudioStream.addTrack(track);
+    }
     track.enabled = true;
+    unlockAllAudioOutputs();
+    return;
   }
-  track.onunmute = () => syncDirectMediaElements();
-  track.onmute = () => {
-    if (track.kind === "video") stopRemoteVideoTracksCompletely();
+
+  if (track.kind === "video") {
+    if (!remoteVideoStream) {
+      remoteVideoStream = new MediaStream();
+    }
+    remoteVideoStream.getVideoTracks().filter(t => t.id !== track.id).forEach(t => remoteVideoStream.removeTrack(t));
+    if (!remoteVideoStream.getVideoTracks().some(t => t.id === track.id)) {
+      remoteVideoStream.addTrack(track);
+    }
+    remoteCamActive = true;
+    track.onunmute = () => {
+      remoteCamActive = true;
+      syncDirectMediaElements();
+    };
+    track.onmute = () => {
+      applyRemoteCameraState(false);
+    };
+    track.onended = () => {
+      applyRemoteCameraState(false);
+    };
     syncDirectMediaElements();
-  };
-  track.onended = () => {
-    if (track.kind === "video") stopRemoteVideoTracksCompletely();
-    syncDirectMediaElements();
-  };
-  syncDirectMediaElements();
+  }
 }
 
 function createPeerConnectionForCall(cid) {
   const conn = new RTCPeerConnection(RTC_CONFIG);
-  remoteStream = new MediaStream();
+  remoteAudioStream = new MediaStream();
+  remoteVideoStream = new MediaStream();
+  remoteCamActive = false;
+
   const aud = document.getElementById("remoteAudioEl");
   if (aud) {
-    aud.srcObject = remoteStream;
+    aud.srcObject = remoteAudioStream;
     aud.muted = false;
     aud.volume = 1.0;
   }
@@ -2457,6 +2579,7 @@ function createPeerConnectionForCall(cid) {
     if (st === "connected" || st === "completed") {
       callState.iceNote = "Связь установлена";
       setCallStatusNote("Связь установлена");
+      unlockAllAudioOutputs();
       syncDirectMediaElements();
     } else if (st === "checking") {
       callState.iceNote = "Установка соединения...";
@@ -2485,19 +2608,21 @@ function ensureGroupPeer(peerNick, shouldCreateOffer) {
     return groupPeers.get(peerNick);
   }
   const peerConn = new RTCPeerConnection(RTC_CONFIG);
-  const stream = new MediaStream();
+  const audioStream = new MediaStream();
+  const videoStream = new MediaStream();
   const sink = document.getElementById("groupAudioSink");
   const audioEl = document.createElement("audio");
   audioEl.autoplay = true;
   audioEl.playsInline = true;
   audioEl.muted = false;
   audioEl.volume = 1.0;
-  audioEl.srcObject = stream;
+  audioEl.srcObject = audioStream;
   if (sink) sink.appendChild(audioEl);
 
   const entry = {
     pc: peerConn,
-    stream,
+    audioStream,
+    videoStream,
     audioEl,
     videoTrack: null,
     pendingCands: [],
@@ -2508,11 +2633,21 @@ function ensureGroupPeer(peerNick, shouldCreateOffer) {
   };
   groupPeers.set(peerNick, entry);
 
+  try {
+    peerConn.addTransceiver("audio", { direction: "sendrecv" });
+    peerConn.addTransceiver("video", { direction: "sendrecv" });
+  } catch (e) {}
+
   if (localStream) {
     localStream.getTracks().forEach(track => {
       if (track.kind === "video" && !cameraEnabled) return;
       if (track.kind === "audio") track.enabled = !micMuted;
-      peerConn.addTrack(track, localStream);
+      const existingSender = peerConn.getSenders().find(s => s.track && s.track.kind === track.kind);
+      if (existingSender) {
+        existingSender.replaceTrack(track).catch(() => {});
+      } else {
+        peerConn.addTrack(track, localStream);
+      }
     });
   }
 
@@ -2520,16 +2655,24 @@ function ensureGroupPeer(peerNick, shouldCreateOffer) {
     const tr = event.track;
     if (!tr) return;
     if (tr.kind === "audio") {
-      stream.getAudioTracks().filter(t => t.id !== tr.id).forEach(t => stream.removeTrack(t));
-      stream.addTrack(tr);
+      audioStream.getAudioTracks().filter(t => t.id !== tr.id).forEach(t => audioStream.removeTrack(t));
+      audioStream.addTrack(tr);
       tr.enabled = true;
-      audioEl.srcObject = stream;
-      audioEl.play().catch(() => {});
+      audioEl.srcObject = audioStream;
+      audioEl.muted = false;
+      audioEl.volume = 1.0;
+      const gp = audioEl.play();
+      if (gp && typeof gp.catch === "function") gp.catch(() => {});
     } else if (tr.kind === "video") {
-      stream.getVideoTracks().filter(t => t.id !== tr.id).forEach(t => stream.removeTrack(t));
-      stream.addTrack(tr);
+      videoStream.getVideoTracks().filter(t => t.id !== tr.id).forEach(t => videoStream.removeTrack(t));
+      videoStream.addTrack(tr);
       entry.videoTrack = tr;
       entry.camOff = false;
+      tr.onmute = () => {
+        entry.camOff = true;
+        groupGridRenderSignature = "";
+        renderGroupCallGrid();
+      };
       tr.onended = () => {
         entry.videoTrack = null;
         entry.camOff = true;
@@ -2576,6 +2719,25 @@ async function handleGroupSignalItem(sigItem) {
   const shouldOffer = me.username.localeCompare(peerNick) < 0;
   const entry = ensureGroupPeer(peerNick, false);
 
+  if (sigItem.kind === "cam-state" && sigItem.payload) {
+    const isCamOn = Boolean(sigItem.payload.camOn);
+    if (!isCamOn) {
+      entry.camOff = true;
+      if (entry.videoTrack) {
+        try { entry.videoTrack.stop(); } catch (e) {}
+        entry.videoTrack = null;
+      }
+      if (entry.videoStream) {
+        entry.videoStream.getVideoTracks().forEach(t => entry.videoStream.removeTrack(t));
+      }
+    } else {
+      entry.camOff = false;
+    }
+    groupGridRenderSignature = "";
+    renderGroupCallGrid();
+    return;
+  }
+
   if (sigItem.kind === "offer" && sigItem.payload) {
     const offerDesc = new RTCSessionDescription(sigItem.payload);
     const offerCollision = entry.makingOffer || entry.pc.signalingState !== "stable";
@@ -2615,9 +2777,41 @@ async function handleGroupSignalItem(sigItem) {
   }
 }
 
+function canCallInCurrentGroup() {
+  if (!activeChat || activeChat.type !== "group" || !me) return false;
+  if (currentGroupCallAccess === "nobody") return false;
+  if (currentGroupCallAccess === "owner") return currentGroupOwner === me.username;
+  return true;
+}
+
+function syncGroupCallPermissionUi() {
+  const btnCall = document.getElementById("btnCallRoom");
+  const btnJoinBanner = document.getElementById("btnJoinGroupCallBanner");
+  if (!activeChat || activeChat.type !== "group") return;
+  const allowed = canCallInCurrentGroup();
+  if (btnCall) {
+    btnCall.classList.remove("hidden");
+    btnCall.disabled = !allowed;
+    btnCall.title = allowed
+      ? "Позвонить в группу"
+      : (currentGroupCallAccess === "nobody" ? "Звонки в группе отключены" : "Звонить может только владелец группы");
+  }
+  if (btnJoinBanner) {
+    btnJoinBanner.disabled = !allowed;
+  }
+}
+
 async function startOrJoinGroupCall(groupId, groupTitle) {
-  if (!me || !groupId) return;
-  if (callState) return;
+  if (!me || !groupId || callState) return;
+  if (!canCallInCurrentGroup()) {
+    alert(
+      currentGroupCallAccess === "nobody"
+        ? "В этой группе звонки отключены настройками."
+        : "Начинать или входить в звонок в этой группе может только владелец."
+    );
+    return;
+  }
+
   playSound("join");
   requestPageFullscreen();
   cameraEnabled = false;
@@ -2653,6 +2847,7 @@ async function startOrJoinGroupCall(groupId, groupTitle) {
 
   showCallModalUi();
   startCallDurationTicker();
+  unlockAllAudioOutputs();
 
   (callState.participants || []).forEach(p => {
     if (p.username && p.username !== me.username) {
@@ -2677,8 +2872,7 @@ async function startRoomCall() {
 }
 
 async function startDirectCall() {
-  if (!me || !activeChat || activeChat.type !== "direct") return;
-  if (callState) return;
+  if (!me || !activeChat || activeChat.type !== "direct" || callState) return;
   playSound("click");
   requestPageFullscreen();
   cameraEnabled = false;
@@ -2772,6 +2966,7 @@ async function acceptIncomingCall() {
   }
   showCallModalUi();
   startCallDurationTicker();
+  unlockAllAudioOutputs();
   syncDirectMediaElements();
 }
 
@@ -2796,6 +2991,7 @@ function toggleMicMute() {
       }
     });
   });
+  unlockAllAudioOutputs();
   playSound("click");
   const btn = document.getElementById("btnToggleMic");
   if (btn) {
@@ -2867,6 +3063,7 @@ function updateGroupCallBannerUi() {
     const names = activeGroupCallInfo.participants.map(p => `@${p.username}`).join(", ");
     txt.textContent = `📞 Идёт звонок (${names})`;
     banner.classList.remove("hidden");
+    syncGroupCallPermissionUi();
   } else {
     banner.classList.add("hidden");
   }
@@ -2875,7 +3072,6 @@ function updateGroupCallBannerUi() {
 async function pollCallStatus() {
   if (!me || endingCallInProgress) return;
 
-  // Опрос группового звонка, если находимся в группе или уже в групповом звонке
   const watchGroupId = (callState && callState.mode === "group")
     ? callState.groupId
     : ((activeChat && activeChat.type === "group") ? activeChat.id : "");
@@ -2912,6 +3108,19 @@ async function pollCallStatus() {
           if (p.username && p.username !== me.username) {
             const shouldOffer = me.username.localeCompare(p.username) < 0;
             ensureGroupPeer(p.username, shouldOffer);
+            const entry = groupPeers.get(p.username);
+            if (entry && !p.camOn) {
+              entry.camOff = true;
+              if (entry.videoTrack) {
+                try { entry.videoTrack.stop(); } catch (e) {}
+                entry.videoTrack = null;
+              }
+              if (entry.videoStream) {
+                entry.videoStream.getVideoTracks().forEach(t => entry.videoStream.removeTrack(t));
+              }
+            } else if (entry && p.camOn) {
+              entry.camOff = false;
+            }
           }
         });
 
@@ -2920,6 +3129,7 @@ async function pollCallStatus() {
           await handleGroupSignalItem(sigItem);
         }
 
+        unlockAllAudioOutputs();
         showCallModalUi();
       }
     }
@@ -2932,7 +3142,6 @@ async function pollCallStatus() {
     return;
   }
 
-  // Опрос звонков 1-на-1
   const activeId = (callState && callState.mode === "direct") ? callState.callId : "";
   const res = await api(`/api/call/poll?user=${encodeURIComponent(me.username)}&callId=${encodeURIComponent(activeId)}`);
   if (!res || !res.ok) return;
@@ -2991,6 +3200,10 @@ async function pollCallStatus() {
 
   if (c.callId !== callState.callId) return;
 
+  if (typeof c.peerCamOn === "boolean" && c.peerCamOn !== remoteCamActive) {
+    applyRemoteCameraState(c.peerCamOn);
+  }
+
   if (callState.isCaller && c.offer && !pc) {
     pc = createPeerConnectionForCall(c.callId);
   }
@@ -2999,10 +3212,6 @@ async function pollCallStatus() {
     const offerJson = JSON.stringify(c.offer);
     const isNewOfferFromPeer = c.offerBy && c.offerBy !== me.username && offerJson !== callState.lastAppliedOfferJson;
     if (isNewOfferFromPeer) {
-      const hasVideoInOffer = typeof c.offer.sdp === "string" && /m=video\s+\d+/.test(c.offer.sdp) && !/a=inactive/.test((c.offer.sdp.split("m=video")[1] || "").split("m=")[0] || "");
-      if (!hasVideoInOffer) {
-        stopRemoteVideoTracksCompletely();
-      }
       if (pc && pc.signalingState === "stable") {
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(c.offer));
@@ -3017,6 +3226,7 @@ async function pollCallStatus() {
             from: me.username,
             answer: pc.localDescription
           });
+          unlockAllAudioOutputs();
           syncDirectMediaElements();
         } catch (e) {}
       } else if (!callState.isCaller && (!pc || !pc.remoteDescription)) {
@@ -3033,6 +3243,7 @@ async function pollCallStatus() {
         callState.lastAppliedAnswerJson = remoteJson;
         await flushPendingCandidates();
         flushRenegotiateIfReady();
+        unlockAllAudioOutputs();
         syncDirectMediaElements();
       } catch (e) {}
     }
@@ -3044,6 +3255,7 @@ async function pollCallStatus() {
       playSound("join");
       showCallModalUi();
       startCallDurationTicker();
+      unlockAllAudioOutputs();
       syncDirectMediaElements();
     }
   }
@@ -3055,6 +3267,7 @@ async function pollCallStatus() {
     }
     showCallModalUi();
     startCallDurationTicker();
+    unlockAllAudioOutputs();
     syncDirectMediaElements();
   }
 
@@ -3419,6 +3632,7 @@ function enterChats() {
   activeChat = null;
   activeGroupCallInfo = null;
   currentGroupOwner = "";
+  currentGroupCallAccess = "all";
   replyTarget = null;
   roomHistoryInitialized = false;
   clearAttachment();
@@ -3435,6 +3649,7 @@ function backToChats() {
   activeChat = null;
   activeGroupCallInfo = null;
   currentGroupOwner = "";
+  currentGroupCallAccess = "all";
   replyTarget = null;
   roomHistoryInitialized = false;
   clearAttachment();
@@ -3615,6 +3830,22 @@ function renderEditGroupIconPicker() {
   }).join("");
 }
 
+async function setGroupCallAccessMode(mode) {
+  if (!activeChat || activeChat.type !== "group" || !me) return;
+  if (!["all", "owner", "nobody"].includes(mode)) return;
+  const res = await api("/api/groups/call-access", {
+    actor: me.username,
+    groupId: activeChat.id,
+    callAccess: mode
+  });
+  if (res.ok) {
+    playSound("react");
+    currentGroupCallAccess = res.callAccess || mode;
+    syncGroupCallPermissionUi();
+    await renderGroupSettings();
+  }
+}
+
 async function saveGroupMeta() {
   if (!activeChat || activeChat.type !== "group") return;
   const inp = document.getElementById("editGroupTitleInput");
@@ -3641,6 +3872,7 @@ async function saveGroupMeta() {
   activeChat.username = res.group.title;
   activeChat.emoji = sanitizeAvatarEmoji(res.group.emoji);
   activeChat.tripleBadge = Boolean(res.group.tripleBadge);
+  currentGroupCallAccess = res.group.callAccess || currentGroupCallAccess;
   document.getElementById("peerAva").textContent = activeChat.emoji;
   document.getElementById("peerNick").innerHTML = groupTitleHtml(res.group.title, activeChat.tripleBadge);
   await renderGroupSettings();
@@ -3687,6 +3919,12 @@ async function submitInviteMembers() {
   await refreshChats();
 }
 
+function callAccessLabel(mode) {
+  if (mode === "owner") return "Только Владелец";
+  if (mode === "nobody") return "Никто";
+  return "Все";
+}
+
 async function renderGroupSettings() {
   const body = document.getElementById("groupSettingsBody");
   if (!body || !activeChat || activeChat.type !== "group") return;
@@ -3701,6 +3939,8 @@ async function renderGroupSettings() {
 
   const g = res.group;
   currentGroupOwner = g.owner || "";
+  currentGroupCallAccess = g.callAccess || "all";
+  syncGroupCallPermissionUi();
   const isGroupOwner = g.owner === me.username;
   const membersSet = new Set(g.members || []);
   const mutedSet = new Set(g.muted || []);
@@ -3720,6 +3960,24 @@ async function renderGroupSettings() {
     }
     inviteGroupMembers = new Set(Array.from(inviteGroupMembers).filter(n => !membersSet.has(n)));
   }
+
+  const callAccessBoxHtml = `
+    <div class="group-edit-card">
+      <div style="font-weight:700;">📞 Кто может делать звонки</div>
+      <div class="muted mt-8">Текущий режим: <strong>${callAccessLabel(currentGroupCallAccess)}</strong></div>
+      ${
+        isGroupOwner
+          ? `
+            <div class="call-access-row">
+              <button type="button" class="call-access-btn ${currentGroupCallAccess === 'all' ? 'active-mode' : ''}" onclick="setGroupCallAccessMode('all')">Все</button>
+              <button type="button" class="call-access-btn ${currentGroupCallAccess === 'owner' ? 'active-mode' : ''}" onclick="setGroupCallAccessMode('owner')">Только Владелец</button>
+              <button type="button" class="call-access-btn ${currentGroupCallAccess === 'nobody' ? 'active-mode' : ''}" onclick="setGroupCallAccessMode('nobody')">Никто</button>
+            </div>
+          `
+          : `<div class="muted mt-8">Менять это правило может только владелец группы.</div>`
+      }
+    </div>
+  `;
 
   const ownerEditMetaHtml = isGroupOwner ? `
     <div class="group-edit-card">
@@ -3814,6 +4072,7 @@ async function renderGroupSettings() {
       </div>
     </div>
 
+    ${callAccessBoxHtml}
     ${ownerEditMetaHtml}
     ${ownerInviteHtml}
 
@@ -3987,6 +4246,8 @@ async function refreshChats() {
       activeChat.emoji = sanitizeAvatarEmoji(matchedGroup.emoji);
       activeChat.tripleBadge = Boolean(matchedGroup.tripleBadge);
       if (matchedGroup.owner) currentGroupOwner = matchedGroup.owner;
+      if (matchedGroup.callAccess) currentGroupCallAccess = matchedGroup.callAccess;
+      syncGroupCallPermissionUi();
       document.getElementById("peerAva").textContent = activeChat.emoji;
       document.getElementById("peerNick").innerHTML = groupTitleHtml(matchedGroup.title, activeChat.tripleBadge);
     }
@@ -4206,6 +4467,7 @@ async function openDirectChat(username, emoji, isOwner = false) {
   activeChat = { type: "direct", id: username, username, emoji: cleanAva, isOwner, tripleBadge: false };
   activeGroupCallInfo = null;
   currentGroupOwner = "";
+  currentGroupCallAccess = "all";
   replyTarget = null;
   roomHistoryInitialized = false;
   seenDirectMsgIds = new Set();
@@ -4217,7 +4479,11 @@ async function openDirectChat(username, emoji, isOwner = false) {
   const headerMain = document.getElementById("roomHeaderMain");
   if (headerMain) headerMain.classList.add("clickable-header");
   const callBtn = document.getElementById("btnCallRoom");
-  if (callBtn) callBtn.classList.remove("hidden");
+  if (callBtn) {
+    callBtn.classList.remove("hidden");
+    callBtn.disabled = false;
+    callBtn.title = "Позвонить";
+  }
   document.getElementById("peerAva").textContent = cleanAva;
   document.getElementById("peerNick").innerHTML = nickLabelHtml(username, isOwner);
   document.getElementById("peerStatus").textContent = "";
@@ -4236,6 +4502,7 @@ async function openGroupChat(groupId, title, emoji, tripleBadge = false) {
   activeChat = { type: "group", id: groupId, username: title, emoji: gAva, isOwner: false, tripleBadge: badgeFlag };
   activeGroupCallInfo = null;
   currentGroupOwner = "";
+  currentGroupCallAccess = "all";
   replyTarget = null;
   roomHistoryInitialized = false;
   seenGroupMsgIds = new Set();
@@ -4246,8 +4513,7 @@ async function openGroupChat(groupId, title, emoji, tripleBadge = false) {
   updateGroupCallBannerUi();
   const headerMain = document.getElementById("roomHeaderMain");
   if (headerMain) headerMain.classList.add("clickable-header");
-  const callBtn = document.getElementById("btnCallRoom");
-  if (callBtn) callBtn.classList.remove("hidden");
+  syncGroupCallPermissionUi();
   document.getElementById("peerAva").textContent = gAva;
   document.getElementById("peerNick").innerHTML = groupTitleHtml(title, badgeFlag);
   document.getElementById("peerStatus").textContent = "";
@@ -4369,6 +4635,8 @@ async function refreshMessages(forceScroll = false) {
       return;
     }
     if (res.owner) currentGroupOwner = res.owner;
+    if (res.callAccess) currentGroupCallAccess = res.callAccess;
+    syncGroupCallPermissionUi();
     syncRoomComposerLock(Boolean(res.isMuted));
     activeChat.username = res.title || activeChat.username;
     activeChat.emoji = sanitizeAvatarEmoji(res.emoji || activeChat.emoji);
@@ -4600,6 +4868,7 @@ async function logout() {
   saveLocalUser(null);
   activeChat = null;
   currentGroupOwner = "";
+  currentGroupCallAccess = "all";
   replyTarget = null;
   roomHistoryInitialized = false;
   clearAttachment();
@@ -4614,6 +4883,7 @@ async function deleteAccount() {
   saveLocalUser(null);
   activeChat = null;
   currentGroupOwner = "";
+  currentGroupCallAccess = "all";
   replyTarget = null;
   roomHistoryInitialized = false;
   clearAttachment();
@@ -4763,6 +5033,7 @@ def call_start():
         "answer": None,
         "answerBy": "",
         "candidates": [],
+        "camState": {},
         "createdAt": now,
         "updatedAt": now,
         "connectedAt": None,
@@ -4770,6 +5041,21 @@ def call_start():
         "summarySent": False,
     }
     return jsonify({"ok": True, "callId": cid})
+
+
+@app.post("/api/call/cam-state")
+def call_cam_state():
+    cleanup_stale_calls()
+    d = request.get_json(force=True) or {}
+    cid = (d.get("callId") or "").strip()
+    from_u = (d.get("from") or "").strip()
+    cam_on = bool(d.get("camOn"))
+    c = ACTIVE_CALLS.get(cid)
+    if not c or c.get("status") == "ended" or from_u not in (c.get("caller"), c.get("callee")):
+        return jsonify({"ok": False})
+    c.setdefault("camState", {})[from_u] = cam_on
+    c["updatedAt"] = int(time.time() * 1000)
+    return jsonify({"ok": True})
 
 
 @app.post("/api/call/offer")
@@ -4867,11 +5153,16 @@ def call_poll():
         if not c or c.get("status") == "ended" or user not in (c.get("caller"), c.get("callee")):
             return jsonify({"ok": True, "ended": True})
         c["updatedAt"] = int(time.time() * 1000)
-        return jsonify({"ok": True, "call": c})
+        peer_nick = c["callee"] if user == c["caller"] else c["caller"]
+        payload_call = dict(c)
+        payload_call["peerCamOn"] = bool((c.get("camState") or {}).get(peer_nick, False))
+        return jsonify({"ok": True, "call": payload_call})
 
     for cid, c in ACTIVE_CALLS.items():
         if c.get("status") == "ringing" and c.get("callee") == user:
-            return jsonify({"ok": True, "call": c})
+            payload_call = dict(c)
+            payload_call["peerCamOn"] = bool((c.get("camState") or {}).get(c.get("caller"), False))
+            return jsonify({"ok": True, "call": payload_call})
 
     return jsonify({"ok": True, "call": None})
 
@@ -4887,6 +5178,8 @@ def group_call_join():
     g = get_group_by_id(gid)
     if not g or user not in (g.get("members") or []):
         return jsonify({"ok": False, "error": "Вы не состоите в этой группе."})
+    if not can_user_call_in_group(g, user):
+        return jsonify({"ok": False, "error": "У вас нет прав для звонка в этой группе."})
 
     u_row = get_user(user) or {}
     emoji = sanitize_user_emoji(d.get("emoji") or u_row.get("emoji"))
@@ -5137,6 +5430,7 @@ def chats():
                     "groupId": g["id"],
                     "title": g["title"],
                     "owner": g["owner"],
+                    "callAccess": g["callAccess"],
                     "emoji": normalize_group_emoji(g["emoji"]),
                     "tripleBadge": g["tripleBadge"],
                     "typing": len(typers) > 0,
@@ -5191,6 +5485,7 @@ def chats():
                 "groupId": gid,
                 "title": g["title"],
                 "owner": g.get("owner", ""),
+                "callAccess": sanitize_call_access(g.get("callAccess")),
                 "emoji": normalize_group_emoji(g.get("emoji")),
                 "tripleBadge": is_triple_badge_group(g.get("title")),
                 "typing": len(typers) > 0,
@@ -5486,8 +5781,8 @@ def create_group():
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
                     """
-                    INSERT INTO groups (id, title, emoji, owner, members_json, muted_json, created_at)
-                    VALUES (%s, %s, %s, %s, %s, '[]', %s)
+                    INSERT INTO groups (id, title, emoji, owner, members_json, muted_json, call_access, created_at)
+                    VALUES (%s, %s, %s, %s, %s, '[]', 'all', %s)
                     RETURNING *
                     """,
                     (gid, title, emoji, owner, json.dumps(members_clean, ensure_ascii=False), now),
@@ -5503,6 +5798,7 @@ def create_group():
         "owner": owner,
         "members": members_clean,
         "muted": [],
+        "callAccess": "all",
         "createdAt": now,
         "tripleBadge": is_triple_badge_group(title),
     }
@@ -5510,6 +5806,32 @@ def create_group():
     db["group_msgs"].setdefault(gid, [])
     save_json_db(db)
     return jsonify({"ok": True, "group": group_obj})
+
+
+@app.post("/api/groups/call-access")
+def group_call_access():
+    d = request.get_json(force=True) or {}
+    actor = (d.get("actor") or "").strip()
+    gid = (d.get("groupId") or "").strip()
+    raw_mode = (d.get("callAccess") or "").strip().lower()
+    if raw_mode not in VALID_CALL_ACCESS:
+        return jsonify({"ok": False, "error": "Некорректный режим звонков."})
+
+    g = get_group_by_id(gid)
+    if not g or g["owner"] != actor:
+        return jsonify({"ok": False, "error": "Менять настройку звонков может только владелец группы."})
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE groups SET call_access = %s WHERE id = %s", (raw_mode, gid))
+        return jsonify({"ok": True, "callAccess": raw_mode})
+
+    db = load_json_db()
+    if gid in db["groups"]:
+        db["groups"][gid]["callAccess"] = raw_mode
+        save_json_db(db)
+    return jsonify({"ok": True, "callAccess": raw_mode})
 
 
 @app.post("/api/groups/update")
@@ -5673,6 +5995,7 @@ def group_msgs():
             "msgs": formatted,
             "title": g["title"],
             "owner": g["owner"],
+            "callAccess": g["callAccess"],
             "emoji": normalize_group_emoji(g["emoji"]),
             "tripleBadge": g["tripleBadge"],
             "isMuted": is_muted,
@@ -5700,6 +6023,7 @@ def group_msgs():
         "msgs": formatted,
         "title": g["title"],
         "owner": g.get("owner", ""),
+        "callAccess": sanitize_call_access(g.get("callAccess")),
         "emoji": normalize_group_emoji(g.get("emoji")),
         "tripleBadge": is_triple_badge_group(g.get("title")),
         "isMuted": is_muted,
@@ -5884,39 +6208,71 @@ def nick():
                     """
                     INSERT INTO users (username, password, emoji, created_at, last_nick_change_at)
                     VALUES (%s, %s, %s, %s, %s)
-                    ON CONFLICT (username) DO UPDATE
-                    SET password = EXCLUDED.password,
-                        emoji = EXCLUDED.emoji,
-                        last_nick_change_at = EXCLUDED.last_nick_change_at
                     """,
                     (new_n, user["password"], clean_emoji, created_at, now),
                 )
-                if new_n != old_n:
-                    cur.execute("SELECT chat_key FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{old_n}::%", f"%::{old_n}"))
-                    keys = [r["chat_key"] for r in cur.fetchall()]
-                    for k in set(keys):
-                        parts = [new_n if x == old_n else x for x in k.split("::")]
-                        cur.execute("UPDATE messages SET chat_key = %s WHERE chat_key = %s", (chat_key(parts[0], parts[1]), k))
-                    cur.execute("UPDATE messages SET sender = %s WHERE sender = %s", (new_n, old_n))
-                    cur.execute("UPDATE group_messages SET sender = %s WHERE sender = %s", (new_n, old_n))
-                    cur.execute("DELETE FROM users WHERE username = %s", (old_n,))
+                cur.execute("UPDATE messages SET sender = %s WHERE sender = %s", (new_n, old_n))
+                cur.execute("SELECT id, chat_key FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{old_n}::%", f"%::{old_n}"))
+                for mrow in cur.fetchall():
+                    parts = mrow["chat_key"].split("::")
+                    new_ck = chat_key(new_n if parts[0] == old_n else parts[0], new_n if parts[1] == old_n else parts[1])
+                    cur.execute("UPDATE messages SET chat_key = %s WHERE id = %s", (new_ck, mrow["id"]))
+                cur.execute("UPDATE groups SET owner = %s WHERE owner = %s", (new_n, old_n))
+                cur.execute("SELECT * FROM groups")
+                for grow in cur.fetchall():
+                    g = format_group_row(grow)
+                    changed = False
+                    new_members = [new_n if x == old_n else x for x in g["members"]]
+                    new_muted = [new_n if x == old_n else x for x in g["muted"]]
+                    if new_members != g["members"] or new_muted != g["muted"]:
+                        changed = True
+                    if changed:
+                        cur.execute(
+                            "UPDATE groups SET members_json = %s, muted_json = %s WHERE id = %s",
+                            (json.dumps(new_members, ensure_ascii=False), json.dumps(new_muted, ensure_ascii=False), g["id"]),
+                        )
+                cur.execute("UPDATE group_messages SET sender = %s WHERE sender = %s", (new_n, old_n))
+                cur.execute("DELETE FROM users WHERE username = %s", (old_n,))
                 cur.execute("SELECT * FROM users WHERE username = %s", (new_n,))
-                updated = cur.fetchone()
-        return auth_response(updated)
+                updated_user = cur.fetchone()
+        resp = make_response(jsonify({"ok": True, "user": format_user(updated_user)}))
+        resp.set_cookie("grusha_user", new_n, max_age=30 * 24 * 3600, samesite="Lax")
+        return resp
 
     db = load_json_db()
-    if new_n != old_n and new_n in db["users"]:
+    if new_n in db["users"] and new_n != old_n:
         return jsonify({"ok": False, "error": "Ник уже занят!"})
-    db["users"][new_n] = {**user, "username": new_n, "emoji": clean_emoji, "createdAt": created_at, "lastNickChangeAt": now}
+    db["users"][new_n] = {
+        "username": new_n,
+        "password": user["password"],
+        "emoji": clean_emoji,
+        "createdAt": created_at,
+        "lastNickChangeAt": now,
+    }
     if new_n != old_n:
         db["users"].pop(old_n, None)
-        new_chats = {}
-        for k, m in db["chats"].items():
-            parts = [new_n if x == old_n else x for x in k.split("::")]
-            new_chats[chat_key(parts[0], parts[1])] = [{**x, "from": new_n if x["from"] == old_n else x["from"]} for x in m]
-        db["chats"] = new_chats
+    new_chats = {}
+    for k, m in db["chats"].items():
+        parts = k.split("::")
+        nk = chat_key(new_n if parts[0] == old_n else parts[0], new_n if parts[1] == old_n else parts[1])
+        for item in m:
+            if item.get("from") == old_n:
+                item["from"] = new_n
+        new_chats.setdefault(nk, []).extend(m)
+    db["chats"] = new_chats
+    for _, g in db["groups"].items():
+        if g.get("owner") == old_n:
+            g["owner"] = new_n
+        g["members"] = [new_n if x == old_n else x for x in (g.get("members") or [])]
+        g["muted"] = [new_n if x == old_n else x for x in (g.get("muted") or [])]
+    for _, gmsgs in db["group_msgs"].items():
+        for item in gmsgs:
+            if item.get("from") == old_n:
+                item["from"] = new_n
     save_json_db(db)
-    return auth_response(db["users"][new_n])
+    resp = make_response(jsonify({"ok": True, "user": format_user(db["users"][new_n])}))
+    resp.set_cookie("grusha_user", new_n, max_age=30 * 24 * 3600, samesite="Lax")
+    return resp
 
 
 @app.post("/api/delete")
@@ -5926,8 +6282,18 @@ def delete():
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{u}::%", f"%::{u}"))
                 cur.execute("DELETE FROM users WHERE username = %s", (u,))
+                cur.execute("DELETE FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{u}::%", f"%::{u}"))
+                cur.execute("DELETE FROM groups WHERE owner = %s", (u,))
+                cur.execute("SELECT id, members_json, muted_json FROM groups")
+                for row in cur.fetchall():
+                    gid = row[0]
+                    m_list = [x for x in parse_json_list(row[1]) if x != u]
+                    mu_list = [x for x in parse_json_list(row[2]) if x != u]
+                    cur.execute(
+                        "UPDATE groups SET members_json = %s, muted_json = %s WHERE id = %s",
+                        (json.dumps(m_list, ensure_ascii=False), json.dumps(mu_list, ensure_ascii=False), gid),
+                    )
         resp = make_response(jsonify({"ok": True}))
         resp.delete_cookie("grusha_user")
         return resp
@@ -5935,6 +6301,13 @@ def delete():
     db = load_json_db()
     db["users"].pop(u, None)
     db["chats"] = {k: v for k, v in db["chats"].items() if u not in k.split("::")}
+    owned_gids = [gid for gid, g in db["groups"].items() if g.get("owner") == u]
+    for gid in owned_gids:
+        db["groups"].pop(gid, None)
+        db["group_msgs"].pop(gid, None)
+    for _, g in db["groups"].items():
+        g["members"] = [x for x in (g.get("members") or []) if x != u]
+        g["muted"] = [x for x in (g.get("muted") or []) if x != u]
     save_json_db(db)
     resp = make_response(jsonify({"ok": True}))
     resp.delete_cookie("grusha_user")
@@ -5942,4 +6315,5 @@ def delete():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
