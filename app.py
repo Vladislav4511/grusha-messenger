@@ -23,8 +23,16 @@ OWNER_NICK = "владислав"
 TRIPLE_BADGE_GROUP_TITLE = "ырка сквад"
 MAX_IMAGE_LEN = 1_500_000
 DEFAULT_GROUP_ICON = "🦜"
+DEFAULT_USER_EMOJI = "🍐"
 
 TYPING_STATUS = {}
+
+
+def sanitize_user_emoji(em):
+    val = (em or "").strip()
+    if not val or val == "👑":
+        return "💩" if val == "👑" else DEFAULT_USER_EMOJI
+    return val
 
 
 def get_pg_conn():
@@ -44,6 +52,8 @@ def init_db():
                         last_nick_change_at BIGINT NOT NULL
                     )
                 """)
+                cur.execute("UPDATE users SET emoji = '💩' WHERE emoji = '👑'")
+
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS messages (
                         id SERIAL PRIMARY KEY,
@@ -90,6 +100,15 @@ def init_db():
         if not os.path.exists(DB_FILE):
             with open(DB_FILE, "w", encoding="utf-8") as f:
                 json.dump({"users": {}, "chats": {}, "groups": {}, "group_msgs": {}}, f, ensure_ascii=False, indent=2)
+        else:
+            db = load_json_db()
+            changed = False
+            for u_name, u_obj in db.get("users", {}).items():
+                if isinstance(u_obj, dict) and u_obj.get("emoji") == "👑":
+                    u_obj["emoji"] = "💩"
+                    changed = True
+            if changed:
+                save_json_db(db)
 
 
 def load_json_db():
@@ -132,6 +151,8 @@ def normalize_group_emoji(em):
     val = (em or "").strip()
     if not val or val == "👥":
         return DEFAULT_GROUP_ICON
+    if val == "👑":
+        return "💩"
     return val
 
 
@@ -152,11 +173,13 @@ def get_group_typing_users(group_id, exclude_nick):
 
 def format_user(row):
     username = row["username"]
+    created_at = int(row.get("createdAt", row.get("created_at", 0)) or 0)
+    last_change = int(row.get("lastNickChangeAt", row.get("last_nick_change_at", created_at)) or created_at)
     return {
         "username": username,
-        "emoji": row.get("emoji") or "🍐",
-        "createdAt": int(row.get("createdAt", row.get("created_at", 0)) or 0),
-        "lastNickChangeAt": int(row.get("lastNickChangeAt", row.get("last_nick_change_at", 0)) or 0),
+        "emoji": sanitize_user_emoji(row.get("emoji")),
+        "createdAt": created_at,
+        "lastNickChangeAt": last_change,
         "isOwner": is_owner_nick(username),
     }
 
@@ -168,9 +191,17 @@ def get_user(username):
         with get_pg_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT * FROM users WHERE username = %s", (username,))
-                return cur.fetchone()
+                row = cur.fetchone()
+                if row and row.get("emoji") == "👑":
+                    cur.execute("UPDATE users SET emoji = '💩' WHERE username = %s", (username,))
+                    row["emoji"] = "💩"
+                return row
     db = load_json_db()
-    return db["users"].get(username)
+    u = db["users"].get(username)
+    if u and u.get("emoji") == "👑":
+        u["emoji"] = "💩"
+        save_json_db(db)
+    return u
 
 
 def parse_json_list(val):
@@ -226,6 +257,27 @@ def normalize_reactions(raw):
         if cleaned:
             out[emoji_key] = cleaned
     return out
+
+
+def append_group_system_message(gid, text):
+    ts = int(time.time() * 1000)
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO group_messages (group_id, sender, text, image, ts, reply_to_json, reactions_json) VALUES (%s, %s, %s, '', %s, '', '{}')",
+                    (gid, "system", text, ts),
+                )
+        return
+    db = load_json_db()
+    db["group_msgs"].setdefault(gid, []).append({
+        "id": f"g_{uuid.uuid4().hex[:10]}",
+        "from": "system",
+        "text": text,
+        "ts": ts,
+        "reactions": {},
+    })
+    save_json_db(db)
 
 
 def format_group_row(row):
@@ -406,6 +458,7 @@ HTML_PAGE = """<!DOCTYPE html>
   button.del { background: #b93838; color: #fff; }
   button.warn { background: #c88a1e; color: #101511; }
   button.blue-btn { background: #2da9ff; color: #ffffff; }
+  button:disabled { opacity: 0.48; cursor: not-allowed; }
   .mt-8 { margin-top: 8px; }
   .mt-12 { margin-top: 12px; }
   .err { color: #ff7b7b; font-size: 13px; margin-top: 8px; min-height: 18px; }
@@ -612,6 +665,16 @@ HTML_PAGE = """<!DOCTYPE html>
     flex-direction: column;
     gap: 8px;
     padding: 12px 14px;
+  }
+  .sys-msg {
+    align-self: center;
+    background: rgba(255, 255, 255, 0.06);
+    color: #b5c3b7;
+    font-size: 12px;
+    padding: 4px 12px;
+    border-radius: 999px;
+    max-width: 90%;
+    text-align: center;
   }
   .msg-sender {
     font-size: 11px;
@@ -954,6 +1017,7 @@ HTML_PAGE = """<!DOCTYPE html>
           <div class="typing-line" id="peerStatus"></div>
         </div>
       </div>
+      <button type="button" id="btnDeleteDirectChat" class="mini-btn del hidden" title="Удалить чат" onclick="deleteDirectChat()">Удалить чат</button>
     </div>
     <div id="msgsBox" class="msgs"></div>
     <div class="bottom-dock" id="bottomDock">
@@ -1057,17 +1121,19 @@ HTML_PAGE = """<!DOCTYPE html>
 </div>
 
 <script>
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
 const AVATAR_EMOJIS = [
   "🍐", "😎", "🐱", "🐸", "🔥", "👾",
   "⚡", "🍕", "🦊", "🐼", "🤖", "👻",
   "🦄", "🐉", "🌙", "⭐", "💎", "🎮",
-  "🎧", "🚀", "🌵", "🍀", "🍓", "👑",
+  "🎧", "🚀", "🌵", "🍀", "🍓", "💩",
   "🐄", "🐗", "🔶"
 ];
 
 const GROUP_ICONS = [
   "🦜", "🍐", "🔥", "⚡", "🎮", "🚀",
-  "🍕", "👑", "💎", "🐗", "🐄", "🔶"
+  "🍕", "💩", "💎", "🐗", "🐄", "🔶"
 ];
 
 const REACTION_EMOJIS = [
@@ -1103,9 +1169,17 @@ let lastChatsScrollTop = 0;
 let selectedGroupEmoji = "🦜";
 let selectedGroupMembers = new Set();
 let editGroupEmoji = "🦜";
+let inviteGroupMembers = new Set();
 
 let composerFocused = false;
 let baselineViewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+
+function sanitizeAvatarEmoji(em) {
+  const s = String(em || "").trim();
+  if (!s) return "🍐";
+  if (s === "👑") return "💩";
+  return s;
+}
 
 function isSystemOwnerNick(nick) {
   return String(nick || "").trim().toLowerCase() === "владислав";
@@ -1376,6 +1450,9 @@ async function api(url, body = null) {
 }
 
 function saveLocalUser(user) {
+  if (user) {
+    user = { ...user, emoji: sanitizeAvatarEmoji(user.emoji) };
+  }
   me = user;
   try {
     if (user) localStorage.setItem("grusha_nick", user.username);
@@ -1423,7 +1500,7 @@ function enterChats() {
   replyTarget = null;
   clearAttachment();
   lastRenderedMsgsJson = "";
-  document.getElementById("myAva").textContent = me.emoji || "🍐";
+  document.getElementById("myAva").textContent = sanitizeAvatarEmoji(me.emoji);
   document.getElementById("myNick").innerHTML = nickLabelHtml(me.username, me.isOwner);
   showScreen("chatsScreen");
   refreshChats();
@@ -1486,10 +1563,11 @@ function renderGroupCandidates(candidates = null) {
   }
   box.innerHTML = list.map(u => {
     const checked = selectedGroupMembers.has(u.username);
+    const ava = sanitizeAvatarEmoji(u.emoji);
     return `
       <div class="member-pick ${checked ? 'selected' : ''}" onclick="toggleGroupMember('${esc(u.username)}')">
         <input type="checkbox" ${checked ? 'checked' : ''} onclick="event.stopPropagation(); toggleGroupMember('${esc(u.username)}')">
-        <div class="ava" style="width:36px; height:36px; font-size:18px;">${u.emoji || '🍐'}</div>
+        <div class="ava" style="width:36px; height:36px; font-size:18px;">${ava}</div>
         <div class="chat-name">${nickLabelHtml(u.username, u.isOwner)}</div>
       </div>
     `;
@@ -1542,6 +1620,7 @@ function onRoomTitleClick() {
 
 async function openGroupSettings() {
   if (!activeChat || activeChat.type !== "group") return;
+  inviteGroupMembers = new Set();
   showScreen("groupSettingsScreen");
   await renderGroupSettings();
 }
@@ -1595,6 +1674,42 @@ async function saveGroupMeta() {
   await refreshChats();
 }
 
+function toggleInviteCandidate(nick) {
+  if (inviteGroupMembers.has(nick)) inviteGroupMembers.delete(nick);
+  else inviteGroupMembers.add(nick);
+  const el = document.querySelector(`.invite-pick[data-nick="${CSS.escape(nick)}"]`);
+  if (el) {
+    const checked = inviteGroupMembers.has(nick);
+    el.classList.toggle("selected", checked);
+    const cb = el.querySelector('input[type="checkbox"]');
+    if (cb) cb.checked = checked;
+  }
+}
+
+async function submitInviteMembers() {
+  if (!activeChat || activeChat.type !== "group") return;
+  const errEl = document.getElementById("inviteGroupErr");
+  const list = Array.from(inviteGroupMembers);
+  if (!list.length) {
+    if (errEl) errEl.textContent = "Выберите хотя бы одного пользователя для добавления";
+    return;
+  }
+  if (errEl) errEl.textContent = "";
+  const res = await api("/api/groups/add-members", {
+    actor: me.username,
+    groupId: activeChat.id,
+    members: list
+  });
+  if (!res.ok) {
+    if (errEl) errEl.textContent = res.error || "Не удалось добавить участников";
+    return;
+  }
+  inviteGroupMembers = new Set();
+  await renderGroupSettings();
+  await refreshMessages(false);
+  await refreshChats();
+}
+
 async function renderGroupSettings() {
   const body = document.getElementById("groupSettingsBody");
   if (!body || !activeChat || activeChat.type !== "group") return;
@@ -1603,12 +1718,13 @@ async function renderGroupSettings() {
 
   const res = await api(`/api/groups/info?groupId=${encodeURIComponent(activeChat.id)}&user=${encodeURIComponent(me.username)}`);
   if (!res.ok || !res.group) {
-    body.innerHTML = `<div class="muted">Группа не найдена или была удалена.</div><button class="sec mt-12" onclick="backToChats()">← К чатам</button>`;
+    body.innerHTML = `<div class="muted">Группа не найдена, удалена или вы вышли из неё.</div><button class="sec mt-12" onclick="backToChats()">← К чатам</button>`;
     return;
   }
 
   const g = res.group;
   const isGroupOwner = g.owner === me.username;
+  const membersSet = new Set(g.members || []);
   const mutedSet = new Set(g.muted || []);
   editGroupEmoji = g.emoji || "🦜";
 
@@ -1617,6 +1733,15 @@ async function renderGroupSettings() {
   activeChat.tripleBadge = Boolean(g.tripleBadge);
   document.getElementById("peerAva").textContent = editGroupEmoji;
   document.getElementById("peerNick").innerHTML = groupTitleHtml(g.title, activeChat.tripleBadge);
+
+  let inviteCandidates = [];
+  if (isGroupOwner) {
+    const chatsRes = await api(`/api/chats?user=${encodeURIComponent(me.username)}`);
+    if (chatsRes.ok && Array.isArray(chatsRes.chats)) {
+      inviteCandidates = chatsRes.chats.filter(c => c.type !== "group" && !membersSet.has(c.username));
+    }
+    inviteGroupMembers = new Set(Array.from(inviteGroupMembers).filter(n => !membersSet.has(n)));
+  }
 
   const ownerEditMetaHtml = isGroupOwner ? `
     <div class="group-edit-card">
@@ -1627,6 +1752,28 @@ async function renderGroupSettings() {
       <div id="editGroupErr" class="err"></div>
       <div id="editGroupOk" class="ok"></div>
       <button type="button" class="blue-btn mt-8" style="width:100%;" onclick="saveGroupMeta()">Сохранить изменения</button>
+    </div>
+  ` : "";
+
+  const ownerInviteHtml = isGroupOwner ? `
+    <div class="group-edit-card">
+      <div style="font-weight:700;">Добавить участников</div>
+      ${
+        inviteCandidates.length
+          ? inviteCandidates.map(u => {
+              const checked = inviteGroupMembers.has(u.username);
+              const ava = sanitizeAvatarEmoji(u.emoji);
+              return `
+                <div class="member-pick invite-pick ${checked ? 'selected' : ''}" data-nick="${esc(u.username)}" onclick="toggleInviteCandidate('${esc(u.username)}')">
+                  <input type="checkbox" ${checked ? 'checked' : ''} onclick="event.stopPropagation(); toggleInviteCandidate('${esc(u.username)}')">
+                  <div class="ava" style="width:34px; height:34px; font-size:17px;">${ava}</div>
+                  <div class="chat-name">${nickLabelHtml(u.username, u.isOwner)}</div>
+                </div>
+              `;
+            }).join("") +
+            `<div id="inviteGroupErr" class="err"></div><button type="button" class="blue-btn mt-8" style="width:100%;" onclick="submitInviteMembers()">Добавить выбранных</button>`
+          : `<div class="muted mt-8">Нет других собеседников из личных чатов для добавления.</div>`
+      }
     </div>
   ` : "";
 
@@ -1642,7 +1789,7 @@ async function renderGroupSettings() {
 
     let roleBadgeHtml = `<span class="role-badge-member">Обычный участник</span>`;
     if (isMemberOwner) {
-      roleBadgeHtml = `<span class="role-badge-owner">👑 Владелец</span>`;
+      roleBadgeHtml = `<span class="role-badge-owner">Владелец</span>`;
     } else if (isMuted) {
       roleBadgeHtml = `<span class="role-badge-muted">Обычный участник • не может писать</span>`;
     }
@@ -1667,12 +1814,18 @@ async function renderGroupSettings() {
     `;
   }).join("");
 
-  const ownerDeleteHtml = isGroupOwner ? `
-    <div style="margin-top:22px; padding-top:14px; border-top:1px solid #2b382d;">
-      <div style="font-weight:700; color:#ff8c8c;">Управление группой (только владелец)</div>
-      <button type="button" class="del mt-8" style="width:100%;" onclick="deleteCurrentGroup()">Удалить группу</button>
-    </div>
-  ` : "";
+  const actionZoneHtml = isGroupOwner
+    ? `
+      <div style="margin-top:22px; padding-top:14px; border-top:1px solid #2b382d;">
+        <div style="font-weight:700; color:#ff8c8c;">Управление группой (только владелец)</div>
+        <button type="button" class="del mt-8" style="width:100%;" onclick="deleteCurrentGroup()">Удалить группу</button>
+      </div>
+    `
+    : `
+      <div style="margin-top:22px; padding-top:14px; border-top:1px solid #2b382d;">
+        <button type="button" class="del" style="width:100%;" onclick="leaveCurrentGroup()">Выйти из группы</button>
+      </div>
+    `;
 
   body.innerHTML = `
     <div style="display:flex; align-items:center; gap:12px;">
@@ -1684,14 +1837,26 @@ async function renderGroupSettings() {
     </div>
 
     ${ownerEditMetaHtml}
+    ${ownerInviteHtml}
 
     <div style="font-weight:700; margin-top:18px;">Участники (${orderedMembers.length})</div>
     <div id="groupMembersList">${membersHtml}</div>
-    ${ownerDeleteHtml}
+    ${actionZoneHtml}
   `;
 
   if (isGroupOwner) {
     renderEditGroupIconPicker();
+  }
+}
+
+async function leaveCurrentGroup() {
+  if (!activeChat || activeChat.type !== "group" || !me) return;
+  const res = await api("/api/groups/leave", {
+    actor: me.username,
+    groupId: activeChat.id
+  });
+  if (res.ok) {
+    backToChats();
   }
 }
 
@@ -1733,21 +1898,46 @@ async function deleteCurrentGroup() {
   }
 }
 
+async function deleteDirectChat() {
+  if (!activeChat || activeChat.type !== "direct" || !me) return;
+  const res = await api("/api/chats/delete", {
+    a: me.username,
+    b: activeChat.username
+  });
+  if (res.ok) {
+    backToChats();
+  }
+}
+
+function getNickCooldownInfo(userObj) {
+  const now = Date.now();
+  const baseTs = Number(userObj.lastNickChangeAt || userObj.createdAt || 0);
+  if (!baseTs) {
+    return { canChange: true, daysLeft: 0, hoursLeft: 0 };
+  }
+  const elapsed = now - baseTs;
+  const remaining = SEVEN_DAYS_MS - elapsed;
+  if (remaining <= 0) {
+    return { canChange: true, daysLeft: 0, hoursLeft: 0 };
+  }
+  const daysLeft = Math.floor(remaining / 86400000);
+  const hoursLeft = Math.max(1, Math.ceil((remaining % 86400000) / 3600000));
+  return { canChange: false, daysLeft, hoursLeft };
+}
+
 function openSettings() {
   renderAvatarChoices();
   applyCustom(loadCustom());
   document.getElementById("setErr").textContent = "";
   document.getElementById("setOk").textContent = "";
-  const leftMs = 7 * 24 * 3600 * 1000 - (Date.now() - (me.lastNickChangeAt || me.createdAt || Date.now()));
-  const canChange = leftMs > 0;
-  const days = Math.max(0, Math.floor(leftMs / 86400000));
-  document.getElementById("nickHint").textContent = canChange
-    ? `Можно сменить ещё примерно ${days} дн. (доступно только первые 7 дней)`
-    : "Срок смены никнейма (7 дней) истёк";
+  const cd = getNickCooldownInfo(me);
+  document.getElementById("nickHint").textContent = cd.canChange
+    ? "Никнейм можно менять раз в 7 дней. Сейчас смена доступна!"
+    : `Сменить никнейм можно раз в 7 дней. Осталось: ${cd.daysLeft} дн. ${cd.hoursLeft} ч.`;
   const inp = document.getElementById("newNickInput");
   inp.value = me.username;
-  inp.disabled = !canChange;
-  document.getElementById("btnSaveNick").disabled = !canChange;
+  inp.disabled = !cd.canChange;
+  document.getElementById("btnSaveNick").disabled = !cd.canChange;
   showScreen("settingsScreen");
 }
 
@@ -1771,15 +1961,18 @@ async function onSearchInput() {
     box.innerHTML = `<div class="muted mt-8">Никого не найдено на «${esc(q)}»</div>`;
     return;
   }
-  box.innerHTML = res.users.map(u => `
-    <div class="chat-card" onclick="openDirectChat('${esc(u.username)}', '${esc(u.emoji || '🍐')}', ${u.isOwner ? 'true' : 'false'})">
-      <div class="ava">${u.emoji || '🍐'}</div>
-      <div class="chat-info">
-        <div class="chat-name">${nickLabelHtml(u.username, u.isOwner)}</div>
-        <div class="chat-last">Нажми, чтобы открыть чат</div>
+  box.innerHTML = res.users.map(u => {
+    const ava = sanitizeAvatarEmoji(u.emoji);
+    return `
+      <div class="chat-card" onclick="openDirectChat('${esc(u.username)}', '${esc(ava)}', ${u.isOwner ? 'true' : 'false'})">
+        <div class="ava">${ava}</div>
+        <div class="chat-info">
+          <div class="chat-name">${nickLabelHtml(u.username, u.isOwner)}</div>
+          <div class="chat-last">Нажми, чтобы открыть чат</div>
+        </div>
       </div>
-    </div>
-  `).join("");
+    `;
+  }).join("");
 }
 
 async function refreshChats() {
@@ -1791,10 +1984,13 @@ async function refreshChats() {
   if (activeChat) {
     if (activeChat.type === "direct") {
       const matched = res.chats.find(c => c.type !== "group" && c.username === activeChat.username);
-      if (matched && matched.emoji && matched.emoji !== activeChat.emoji) {
-        activeChat.emoji = matched.emoji;
-        const peerAvaEl = document.getElementById("peerAva");
-        if (peerAvaEl) peerAvaEl.textContent = matched.emoji;
+      if (matched && matched.emoji) {
+        const cleanAva = sanitizeAvatarEmoji(matched.emoji);
+        if (cleanAva !== activeChat.emoji) {
+          activeChat.emoji = cleanAva;
+          const peerAvaEl = document.getElementById("peerAva");
+          if (peerAvaEl) peerAvaEl.textContent = cleanAva;
+        }
       }
     } else if (activeChat.type === "group") {
       const matchedGroup = res.chats.find(c => c.type === "group" && c.groupId === activeChat.id);
@@ -1827,9 +2023,10 @@ async function refreshChats() {
         </div>
       `;
     }
+    const cleanAva = sanitizeAvatarEmoji(c.emoji);
     return `
-      <div class="chat-card" onclick="openDirectChat('${esc(c.username)}', '${esc(c.emoji || '🍐')}', ${c.isOwner ? 'true' : 'false'})">
-        <div class="ava">${c.emoji || '🍐'}</div>
+      <div class="chat-card" onclick="openDirectChat('${esc(c.username)}', '${esc(cleanAva)}', ${c.isOwner ? 'true' : 'false'})">
+        <div class="ava">${cleanAva}</div>
         <div class="chat-info">
           <div class="chat-name">${nickLabelHtml(c.username, c.isOwner)}</div>
           <div class="chat-last ${c.typing ? 'typing-active' : ''}">${c.typing ? 'печатает...' : esc(c.last || 'Сообщений пока нет')}</div>
@@ -1853,7 +2050,7 @@ function clearReplyTarget() {
 }
 
 function setReplyTarget(msg) {
-  if (!msg) return;
+  if (!msg || msg.from === "system") return;
   replyTarget = {
     from: msg.from,
     text: (msg.text || "").trim(),
@@ -1873,7 +2070,7 @@ function setReplyTarget(msg) {
 
 function openMsgActionModal(msgIndex) {
   const msg = currentRoomMsgs[msgIndex];
-  if (!msg) return;
+  if (!msg || msg.from === "system") return;
   selectedMsgForAction = msg;
   const prev = document.getElementById("msgActionPreview");
   const snippet = (msg.text || "").trim() || (msg.image ? "📷 Картинка" : "Сообщение");
@@ -1963,7 +2160,8 @@ function bindLongPressToBubble(el, msgIndex) {
 }
 
 async function openDirectChat(username, emoji, isOwner = false) {
-  activeChat = { type: "direct", id: username, username, emoji, isOwner, tripleBadge: false };
+  const cleanAva = sanitizeAvatarEmoji(emoji);
+  activeChat = { type: "direct", id: username, username, emoji: cleanAva, isOwner, tripleBadge: false };
   replyTarget = null;
   clearReplyTarget();
   clearAttachment();
@@ -1971,7 +2169,9 @@ async function openDirectChat(username, emoji, isOwner = false) {
   syncRoomComposerLock(false);
   const headerMain = document.getElementById("roomHeaderMain");
   if (headerMain) headerMain.classList.remove("clickable-header");
-  document.getElementById("peerAva").textContent = emoji || "🍐";
+  const delBtn = document.getElementById("btnDeleteDirectChat");
+  if (delBtn) delBtn.classList.remove("hidden");
+  document.getElementById("peerAva").textContent = cleanAva;
   document.getElementById("peerNick").innerHTML = nickLabelHtml(username, isOwner);
   document.getElementById("peerStatus").textContent = "";
   const inp = document.getElementById("msgInput");
@@ -1992,6 +2192,8 @@ async function openGroupChat(groupId, title, emoji, tripleBadge = false) {
   syncRoomComposerLock(false);
   const headerMain = document.getElementById("roomHeaderMain");
   if (headerMain) headerMain.classList.add("clickable-header");
+  const delBtn = document.getElementById("btnDeleteDirectChat");
+  if (delBtn) delBtn.classList.add("hidden");
   document.getElementById("peerAva").textContent = emoji || "🦜";
   document.getElementById("peerNick").innerHTML = groupTitleHtml(title, badgeFlag);
   document.getElementById("peerStatus").textContent = "";
@@ -2009,6 +2211,9 @@ function formatTextWithEmojis(rawText) {
 }
 
 function renderMsgItem(m, index) {
+  if (m.from === "system") {
+    return `<div class="sys-msg">${esc(m.text || "")}</div>`;
+  }
   const isMe = m.from === me.username;
   const cls = isMe ? "me" : "them";
   const text = (m.text || "").trim();
@@ -2040,7 +2245,7 @@ function renderMsgItem(m, index) {
     ? `<div class="reactions-row">${reactionKeys.map(em => {
         const users = reactionsObj[em];
         const reactedByMe = users.includes(me.username);
-        return `<span class="reaction-chip ${reactedByMe ? 'reacted-by-me' : ''}" onclick="event.stopPropagation(); toggleMessageReaction(${Number(m.id)}, '${em}')">${em} <span>${users.length}</span></span>`;
+        return `<span class="reaction-chip ${reactedByMe ? 'reacted-by-me' : ''}" onclick="event.stopPropagation(); toggleMessageReaction(${JSON.stringify(m.id)}, '${em}')">${em} <span>${users.length}</span></span>`;
       }).join("")}</div>`
     : "";
 
@@ -2105,10 +2310,13 @@ async function refreshMessages(forceScroll = false) {
   const res = await api(`/api/msgs?a=${encodeURIComponent(me.username)}&b=${encodeURIComponent(activeChat.username)}`);
   if (!res.ok) return;
 
-  if (res.peerEmoji && res.peerEmoji !== activeChat.emoji) {
-    activeChat.emoji = res.peerEmoji;
-    const peerAvaEl = document.getElementById("peerAva");
-    if (peerAvaEl) peerAvaEl.textContent = res.peerEmoji;
+  if (res.peerEmoji) {
+    const cleanAva = sanitizeAvatarEmoji(res.peerEmoji);
+    if (cleanAva !== activeChat.emoji) {
+      activeChat.emoji = cleanAva;
+      const peerAvaEl = document.getElementById("peerAva");
+      if (peerAvaEl) peerAvaEl.textContent = cleanAva;
+    }
   }
 
   const statusEl = document.getElementById("peerStatus");
@@ -2246,11 +2454,12 @@ async function sendMsg() {
 }
 
 async function setEmoji(em) {
-  const res = await api("/api/emoji", { username: me.username, emoji: em });
+  const cleanEm = sanitizeAvatarEmoji(em);
+  const res = await api("/api/emoji", { username: me.username, emoji: cleanEm });
   if (res.ok) {
-    me.emoji = em;
-    document.getElementById("myAva").textContent = em;
-    document.getElementById("setOk").textContent = `Аватарка обновлена на ${em}`;
+    me.emoji = cleanEm;
+    document.getElementById("myAva").textContent = cleanEm;
+    document.getElementById("setOk").textContent = `Аватарка обновлена на ${cleanEm}`;
     document.getElementById("setErr").textContent = "";
     refreshChats();
   }
@@ -2267,7 +2476,12 @@ async function changeNick() {
   saveLocalUser(res.user);
   document.getElementById("myNick").innerHTML = nickLabelHtml(me.username, me.isOwner);
   document.getElementById("setErr").textContent = "";
-  document.getElementById("setOk").textContent = "Никнейм изменён";
+  document.getElementById("setOk").textContent = "Никнейм изменён (следующая смена через 7 дней)";
+  const cd = getNickCooldownInfo(me);
+  document.getElementById("nickHint").textContent = `Сменить никнейм можно раз в 7 дней. Осталось: ${cd.daysLeft} дн. ${cd.hoursLeft} ч.`;
+  const inp = document.getElementById("newNickInput");
+  inp.disabled = !cd.canChange;
+  document.getElementById("btnSaveNick").disabled = !cd.canChange;
 }
 
 async function logout() {
@@ -2431,12 +2645,12 @@ def search():
                     (ex, f"{escaped_q}%"),
                 )
                 rows = cur.fetchall()
-        res = [{"username": r["username"], "emoji": r.get("emoji") or "🍐", "isOwner": is_owner_nick(r["username"])} for r in rows]
+        res = [{"username": r["username"], "emoji": sanitize_user_emoji(r.get("emoji")), "isOwner": is_owner_nick(r["username"])} for r in rows]
         return jsonify({"ok": True, "users": res})
 
     db = load_json_db()
     res = [
-        {"username": k, "emoji": v.get("emoji", "🍐"), "isOwner": is_owner_nick(k)}
+        {"username": k, "emoji": sanitize_user_emoji(v.get("emoji")), "isOwner": is_owner_nick(k)}
         for k, v in sorted(db["users"].items(), key=lambda x: x[0].lower())
         if k != ex and k.lower().startswith(q)
     ]
@@ -2450,7 +2664,7 @@ def chats():
         with get_pg_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT username, emoji FROM users")
-                users_map = {r["username"]: (r.get("emoji") or "🍐") for r in cur.fetchall()}
+                users_map = {r["username"]: sanitize_user_emoji(r.get("emoji")) for r in cur.fetchall()}
 
                 cur.execute(
                     """
@@ -2497,7 +2711,10 @@ def chats():
                 gm = group_last_map.get(g["id"])
                 if gm:
                     base_txt = gm.get("text") or ("📷 Картинка" if gm.get("image") else "Сообщений пока нет")
-                    preview_text = f"@{gm['sender']}: {base_txt}"
+                    if gm.get("sender") == "system":
+                        preview_text = base_txt
+                    else:
+                        preview_text = f"@{gm['sender']}: {base_txt}"
                     ts_val = int(gm.get("ts") or g["createdAt"])
                 else:
                     preview_text = "Группа создана"
@@ -2531,7 +2748,7 @@ def chats():
             out.append({
                 "type": "direct",
                 "username": peer,
-                "emoji": db["users"][peer].get("emoji", "🍐"),
+                "emoji": sanitize_user_emoji(db["users"][peer].get("emoji")),
                 "isOwner": is_owner_nick(peer),
                 "typing": is_peer_typing(peer, u),
                 "last": preview_text,
@@ -2545,7 +2762,10 @@ def chats():
             if g_msgs:
                 gm = g_msgs[-1]
                 base_txt = gm.get("text") or ("📷 Картинка" if gm.get("image") else "Сообщений пока нет")
-                preview_text = f"@{gm['from']}: {base_txt}"
+                if gm.get("from") == "system":
+                    preview_text = base_txt
+                else:
+                    preview_text = f"@{gm['from']}: {base_txt}"
                 ts_val = int(gm.get("ts") or g.get("createdAt") or 0)
             else:
                 preview_text = "Группа создана"
@@ -2567,6 +2787,25 @@ def chats():
     return jsonify({"ok": True, "chats": out})
 
 
+@app.post("/api/chats/delete")
+def delete_direct_chat_api():
+    d = request.get_json(force=True) or {}
+    a = (d.get("a") or "").strip()
+    b = (d.get("b") or "").strip()
+    if not a or not b:
+        return jsonify({"ok": False})
+    ck = chat_key(a, b)
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM messages WHERE chat_key = %s", (ck,))
+        return jsonify({"ok": True})
+    db = load_json_db()
+    db["chats"].pop(ck, None)
+    save_json_db(db)
+    return jsonify({"ok": True})
+
+
 @app.get("/api/msgs")
 def msgs():
     a = request.args.get("a") or ""
@@ -2583,7 +2822,7 @@ def msgs():
                 rows = cur.fetchall()
                 cur.execute("SELECT emoji FROM users WHERE username = %s", (b,))
                 peer_row = cur.fetchone()
-        peer_emoji = (peer_row.get("emoji") if peer_row else None) or "🍐"
+        peer_emoji = sanitize_user_emoji(peer_row.get("emoji") if peer_row else None)
         formatted = [
             format_message_record(
                 r["id"],
@@ -2618,7 +2857,7 @@ def msgs():
     return jsonify({
         "ok": True,
         "msgs": formatted,
-        "peerEmoji": peer_user.get("emoji") or "🍐",
+        "peerEmoji": sanitize_user_emoji(peer_user.get("emoji")),
         "peerTyping": peer_typing,
     })
 
@@ -2830,6 +3069,82 @@ def group_update():
     return jsonify({"ok": False, "error": "Группа не найдена."})
 
 
+@app.post("/api/groups/add-members")
+def group_add_members():
+    d = request.get_json(force=True) or {}
+    actor = (d.get("actor") or "").strip()
+    gid = (d.get("groupId") or "").strip()
+    raw_members = d.get("members") or []
+
+    g = get_group_by_id(gid)
+    if not g or g["owner"] != actor:
+        return jsonify({"ok": False, "error": "Только владелец группы может добавлять участников."})
+
+    members = list(g.get("members") or [])
+    existing_set = set(members)
+    added = []
+    for m in raw_members:
+        nick = str(m or "").strip()
+        if nick and nick not in existing_set:
+            existing_set.add(nick)
+            members.append(nick)
+            added.append(nick)
+
+    if not added:
+        return jsonify({"ok": False, "error": "Нет новых участников для добавления."})
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE groups SET members_json = %s WHERE id = %s",
+                    (json.dumps(members, ensure_ascii=False), gid),
+                )
+    else:
+        db = load_json_db()
+        if gid in db["groups"]:
+            db["groups"][gid]["members"] = members
+            save_json_db(db)
+
+    for nick in added:
+        append_group_system_message(gid, f'"{nick}" зашел')
+
+    return jsonify({"ok": True, "added": added, "group": get_group_by_id(gid)})
+
+
+@app.post("/api/groups/leave")
+def group_leave():
+    d = request.get_json(force=True) or {}
+    actor = (d.get("actor") or "").strip()
+    gid = (d.get("groupId") or "").strip()
+
+    g = get_group_by_id(gid)
+    if not g or actor not in (g.get("members") or []):
+        return jsonify({"ok": False})
+    if g["owner"] == actor:
+        return jsonify({"ok": False, "error": "Владелец не может просто выйти — используйте «Удалить группу»."})
+
+    members = [m for m in (g.get("members") or []) if m != actor]
+    muted = [m for m in (g.get("muted") or []) if m != actor]
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE groups SET members_json = %s, muted_json = %s WHERE id = %s",
+                    (json.dumps(members, ensure_ascii=False), json.dumps(muted, ensure_ascii=False), gid),
+                )
+    else:
+        db = load_json_db()
+        if gid in db["groups"]:
+            db["groups"][gid]["members"] = members
+            db["groups"][gid]["muted"] = muted
+            save_json_db(db)
+
+    append_group_system_message(gid, f'"{actor}" вышел')
+    return jsonify({"ok": True})
+
+
 @app.get("/api/groups/info")
 def group_info():
     gid = (request.args.get("groupId") or "").strip()
@@ -3009,13 +3324,14 @@ def group_kick():
                     "UPDATE groups SET members_json = %s, muted_json = %s WHERE id = %s",
                     (json.dumps(members, ensure_ascii=False), json.dumps(muted, ensure_ascii=False), gid),
                 )
-        return jsonify({"ok": True})
+    else:
+        db = load_json_db()
+        if gid in db["groups"]:
+            db["groups"][gid]["members"] = members
+            db["groups"][gid]["muted"] = muted
+            save_json_db(db)
 
-    db = load_json_db()
-    if gid in db["groups"]:
-        db["groups"][gid]["members"] = members
-        db["groups"][gid]["muted"] = muted
-        save_json_db(db)
+    append_group_system_message(gid, f'"{target}" вышел')
     return jsonify({"ok": True})
 
 
@@ -3045,7 +3361,8 @@ def group_delete():
 @app.post("/api/emoji")
 def emoji():
     d = request.get_json(force=True) or {}
-    u, em = (d.get("username") or "").strip(), d.get("emoji") or "🍐"
+    u = (d.get("username") or "").strip()
+    em = sanitize_user_emoji(d.get("emoji"))
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
@@ -3069,46 +3386,55 @@ def nick():
     now = int(time.time() * 1000)
     created_at = int(user.get("createdAt", user.get("created_at", now)) or now)
     last_change = int(user.get("lastNickChangeAt", user.get("last_nick_change_at", created_at)) or created_at)
-    if now - last_change > SEVEN_DAYS_MS:
-        return jsonify({"ok": False, "error": "7 дней прошло, сменить ник нельзя."})
+    if now - last_change < SEVEN_DAYS_MS:
+        rem_days = max(0, (SEVEN_DAYS_MS - (now - last_change)) // 86400000)
+        return jsonify({"ok": False, "error": f"Никнейм можно менять раз в 7 дней. Подождите ещё ~{rem_days} дн."})
     if len(new_n) < 2:
         return jsonify({"ok": False, "error": "Ник слишком короткий."})
+
+    clean_emoji = sanitize_user_emoji(user.get("emoji"))
 
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT username FROM users WHERE username = %s", (new_n,))
+                cur.execute("SELECT username FROM users WHERE username = %s AND username <> %s", (new_n, old_n))
                 if cur.fetchone():
                     return jsonify({"ok": False, "error": "Ник уже занят!"})
                 cur.execute(
                     """
                     INSERT INTO users (username, password, emoji, created_at, last_nick_change_at)
                     VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (username) DO UPDATE
+                    SET password = EXCLUDED.password,
+                        emoji = EXCLUDED.emoji,
+                        last_nick_change_at = EXCLUDED.last_nick_change_at
                     """,
-                    (new_n, user["password"], user.get("emoji") or "🍐", created_at, now),
+                    (new_n, user["password"], clean_emoji, created_at, now),
                 )
-                cur.execute("SELECT chat_key FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{old_n}::%", f"%::{old_n}"))
-                keys = [r["chat_key"] for r in cur.fetchall()]
-                for k in set(keys):
-                    parts = [new_n if x == old_n else x for x in k.split("::")]
-                    cur.execute("UPDATE messages SET chat_key = %s WHERE chat_key = %s", (chat_key(parts[0], parts[1]), k))
-                cur.execute("UPDATE messages SET sender = %s WHERE sender = %s", (new_n, old_n))
-                cur.execute("UPDATE group_messages SET sender = %s WHERE sender = %s", (new_n, old_n))
-                cur.execute("DELETE FROM users WHERE username = %s", (old_n,))
+                if new_n != old_n:
+                    cur.execute("SELECT chat_key FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{old_n}::%", f"%::{old_n}"))
+                    keys = [r["chat_key"] for r in cur.fetchall()]
+                    for k in set(keys):
+                        parts = [new_n if x == old_n else x for x in k.split("::")]
+                        cur.execute("UPDATE messages SET chat_key = %s WHERE chat_key = %s", (chat_key(parts[0], parts[1]), k))
+                    cur.execute("UPDATE messages SET sender = %s WHERE sender = %s", (new_n, old_n))
+                    cur.execute("UPDATE group_messages SET sender = %s WHERE sender = %s", (new_n, old_n))
+                    cur.execute("DELETE FROM users WHERE username = %s", (old_n,))
                 cur.execute("SELECT * FROM users WHERE username = %s", (new_n,))
                 updated = cur.fetchone()
         return auth_response(updated)
 
     db = load_json_db()
-    if new_n in db["users"]:
+    if new_n != old_n and new_n in db["users"]:
         return jsonify({"ok": False, "error": "Ник уже занят!"})
-    db["users"][new_n] = {**user, "username": new_n, "lastNickChangeAt": now}
-    del db["users"][old_n]
-    new_chats = {}
-    for k, m in db["chats"].items():
-        parts = [new_n if x == old_n else x for x in k.split("::")]
-        new_chats[chat_key(parts[0], parts[1])] = [{**x, "from": new_n if x["from"] == old_n else x["from"]} for x in m]
-    db["chats"] = new_chats
+    db["users"][new_n] = {**user, "username": new_n, "emoji": clean_emoji, "createdAt": created_at, "lastNickChangeAt": now}
+    if new_n != old_n:
+        db["users"].pop(old_n, None)
+        new_chats = {}
+        for k, m in db["chats"].items():
+            parts = [new_n if x == old_n else x for x in k.split("::")]
+            new_chats[chat_key(parts[0], parts[1])] = [{**x, "from": new_n if x["from"] == old_n else x["from"]} for x in m]
+        db["chats"] = new_chats
     save_json_db(db)
     return auth_response(db["users"][new_n])
 
