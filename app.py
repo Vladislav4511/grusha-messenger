@@ -21,11 +21,9 @@ SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
 TYPING_TTL_MS = 4500
 OWNER_NICK = "владислав"
 MAX_IMAGE_LEN = 1_500_000
+DEFAULT_GROUP_ICON = "🦜"
 
 TYPING_STATUS = {}
-
-# Fallback JSON структура при запуске без DATABASE_URL:
-# {"users": {}, "chats": {}, "groups": {group_id: {...}}, "group_msgs": {group_id: [...]}}
 
 
 def get_pg_conn():
@@ -61,7 +59,7 @@ def init_db():
                     CREATE TABLE IF NOT EXISTS groups (
                         id TEXT PRIMARY KEY,
                         title TEXT NOT NULL,
-                        emoji TEXT NOT NULL DEFAULT '👥',
+                        emoji TEXT NOT NULL DEFAULT '🦜',
                         owner TEXT NOT NULL,
                         members_json TEXT NOT NULL DEFAULT '[]',
                         muted_json TEXT NOT NULL DEFAULT '[]',
@@ -115,6 +113,13 @@ def group_typing_key(group_id):
 
 def is_owner_nick(username):
     return (username or "").strip().lower() == OWNER_NICK
+
+
+def normalize_group_emoji(em):
+    val = (em or "").strip()
+    if not val or val == "👥":
+        return DEFAULT_GROUP_ICON
+    return val
 
 
 def is_peer_typing(peer, me_nick):
@@ -171,7 +176,7 @@ def format_group_row(row):
     return {
         "id": row["id"],
         "title": row["title"],
-        "emoji": row.get("emoji") or "👥",
+        "emoji": normalize_group_emoji(row.get("emoji")),
         "owner": row["owner"],
         "members": members,
         "muted": muted,
@@ -195,7 +200,7 @@ def get_group_by_id(group_id):
     return {
         "id": g["id"],
         "title": g["title"],
-        "emoji": g.get("emoji") or "👥",
+        "emoji": normalize_group_emoji(g.get("emoji")),
         "owner": g["owner"],
         "members": list(g.get("members") or []),
         "muted": list(g.get("muted") or []),
@@ -270,7 +275,7 @@ HTML_PAGE = """<!DOCTYPE html>
     overflow-y: auto;
     min-height: 0;
   }
-  input[type="text"], input[type="password"], input:not([type="range"]):not([type="file"]), textarea {
+  input[type="text"], input[type="password"], input:not([type="range"]):not([type="file"]):not([type="checkbox"]), textarea {
     width: 100%;
     padding: 10px 12px;
     border-radius: 12px;
@@ -312,6 +317,9 @@ HTML_PAGE = """<!DOCTYPE html>
     color: #9be15d;
     min-height: 16px;
     line-height: 1.2;
+  }
+  .typing-line:empty {
+    display: none;
   }
   .chat-card {
     display: flex;
@@ -399,16 +407,53 @@ HTML_PAGE = """<!DOCTYPE html>
     flex-shrink: 0;
   }
 
-  /* Строка участника в настройках группы */
+  /* Настройки группы */
+  .group-edit-card {
+    padding: 14px;
+    border-radius: 14px;
+    background: #202a21;
+    border: 1px solid #2d3b2f;
+    margin-top: 14px;
+  }
   .group-member-row {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    padding: 10px;
+    padding: 10px 12px;
     border-radius: 12px;
     background: #202a21;
     margin-top: 8px;
+  }
+  .role-badge-owner {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: rgba(45, 169, 255, 0.16);
+    color: #5bc0ff;
+    font-size: 12px;
+    font-weight: 700;
+    margin-top: 3px;
+  }
+  .role-badge-member {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: #28342a;
+    color: #9aa89c;
+    font-size: 12px;
+    font-weight: 600;
+    margin-top: 3px;
+  }
+  .role-badge-muted {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: rgba(200, 138, 30, 0.2);
+    color: #ffcf70;
+    font-size: 12px;
+    font-weight: 600;
+    margin-top: 3px;
   }
   .group-member-btns {
     display: flex;
@@ -428,19 +473,30 @@ HTML_PAGE = """<!DOCTYPE html>
     min-height: 0;
     overflow: hidden;
   }
-  .room-title-btn {
-    background: transparent;
-    color: #f3f7f3;
-    padding: 2px 4px;
-    text-align: left;
+  .room-header-main {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    flex: 1;
+  }
+  .room-header-main.clickable-header {
+    cursor: pointer;
+    padding: 4px 6px;
+    border-radius: 10px;
+  }
+  .room-header-main.clickable-header:active {
+    background: #263228;
+  }
+  .room-title-text {
     font-size: 15px;
     font-weight: 700;
     display: inline-flex;
     align-items: center;
     gap: 5px;
-  }
-  .room-title-btn.clickable-title:hover {
-    text-decoration: underline;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .msgs {
     flex: 1;
@@ -630,7 +686,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
       <div style="font-weight:700; margin-top:14px;">Иконка группы</div>
       <div id="groupIconPicker" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;"></div>
-      <div class="muted mt-8">Выбрана иконка: <strong id="selectedGroupIconLabel">👥</strong></div>
+      <div class="muted mt-8">Выбрана иконка: <strong id="selectedGroupIconLabel">🦜</strong></div>
 
       <div style="font-weight:700; margin-top:16px;">Добавить участников (из тех, с кем был чат)</div>
       <div id="groupCandidatesList" class="mt-8"></div>
@@ -664,13 +720,11 @@ HTML_PAGE = """<!DOCTYPE html>
 
   <div id="roomScreen" class="hidden">
     <div class="top">
-      <div style="display:flex; align-items:center; gap:10px; min-width:0;">
-        <button class="sec" onclick="backToChats()">← Чаты</button>
+      <button class="sec" onclick="backToChats()">← Чаты</button>
+      <div id="roomHeaderMain" class="room-header-main" onclick="onRoomTitleClick()">
         <div class="ava" id="peerAva">🍐</div>
-        <div style="min-width:0;">
-          <button type="button" id="peerTitleBtn" class="room-title-btn" onclick="onRoomTitleClick()">
-            <span id="peerNick">@peer</span>
-          </button>
+        <div style="min-width:0; flex:1;">
+          <div class="room-title-text" id="peerNick">@peer</div>
           <div class="typing-line" id="peerStatus"></div>
         </div>
       </div>
@@ -769,7 +823,7 @@ const AVATAR_EMOJIS = [
 ];
 
 const GROUP_ICONS = [
-  "👥", "🍐", "🔥", "⚡", "🎮", "🚀",
+  "🦜", "🍐", "🔥", "⚡", "🎮", "🚀",
   "🍕", "👑", "💎", "🐗", "🐄", "🔶"
 ];
 
@@ -793,11 +847,16 @@ let pollTimer = null;
 let fabPulseTimer = null;
 let lastChatsScrollTop = 0;
 
-let selectedGroupEmoji = "👥";
+let selectedGroupEmoji = "🦜";
 let selectedGroupMembers = new Set();
+let editGroupEmoji = "🦜";
 
 let composerFocused = false;
 let baselineViewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+
+function isSystemOwnerNick(nick) {
+  return String(nick || "").trim().toLowerCase() === "владислав";
+}
 
 function setKeyboardLift(px) {
   const safePx = Math.max(0, Math.min(Math.round(px), Math.round(window.innerHeight * 0.55)));
@@ -881,7 +940,6 @@ window.addEventListener("resize", syncViewportHeight);
 window.addEventListener("orientationchange", () => setTimeout(syncViewportHeight, 150));
 syncViewportHeight();
 
-/* Поведение голубого кружка с карандашом: появляется и прячется при прокрутке/переключении */
 function setFabVisible(visible) {
   const fab = document.getElementById("fabCreateBtn");
   if (!fab) return;
@@ -1023,7 +1081,7 @@ function isFullscreenNow() {
 async function toggleFullscreenByTap(e) {
   if (!e.target.closest) return;
   const interactive = e.target.closest(
-    "button, input, textarea, select, a, .chat-card, .member-pick, .group-member-row, .m, .msg-img, .em-btn, .clip-btn, .attach-preview, .top, .bottom-dock, .custom-box, .fab-create"
+    "button, input, textarea, select, a, .chat-card, .member-pick, .group-member-row, .group-edit-card, .room-header-main, .m, .msg-img, .em-btn, .clip-btn, .attach-preview, .top, .bottom-dock, .custom-box, .fab-create"
   );
   if (interactive) return;
 
@@ -1173,7 +1231,7 @@ function renderGroupCandidates(candidates = null) {
 }
 
 async function openCreateGroup() {
-  selectedGroupEmoji = "👥";
+  selectedGroupEmoji = "🦜";
   selectedGroupMembers = new Set();
   document.getElementById("groupTitleInput").value = "";
   document.getElementById("selectedGroupIconLabel").textContent = selectedGroupEmoji;
@@ -1210,7 +1268,7 @@ async function submitCreateGroup() {
   await openGroupChat(res.group.id, res.group.title, res.group.emoji);
 }
 
-/* Настройки группы при нажатии на название чата */
+/* Настройки группы при нажатии на шапку чата */
 function onRoomTitleClick() {
   if (!activeChat || activeChat.type !== "group") return;
   openGroupSettings();
@@ -1222,9 +1280,59 @@ async function openGroupSettings() {
   await renderGroupSettings();
 }
 
+function selectEditGroupEmoji(em) {
+  editGroupEmoji = em;
+  const lbl = document.getElementById("editGroupIconLabel");
+  if (lbl) lbl.textContent = em;
+  renderEditGroupIconPicker();
+}
+
+function renderEditGroupIconPicker() {
+  const box = document.getElementById("editGroupIconPicker");
+  if (!box) return;
+  box.innerHTML = GROUP_ICONS.map(em => {
+    const cls = em === editGroupEmoji ? "em-btn" : "em-btn sec";
+    return `<button type="button" class="${cls}" style="${em === editGroupEmoji ? 'outline:2px solid #2da9ff;' : ''}" onclick="selectEditGroupEmoji('${em}')">${em}</button>`;
+  }).join("");
+}
+
+async function saveGroupMeta() {
+  if (!activeChat || activeChat.type !== "group") return;
+  const inp = document.getElementById("editGroupTitleInput");
+  const errEl = document.getElementById("editGroupErr");
+  const okEl = document.getElementById("editGroupOk");
+  const newTitle = (inp ? inp.value : "").trim();
+  if (!newTitle) {
+    if (errEl) errEl.textContent = "Введите название группы";
+    if (okEl) okEl.textContent = "";
+    return;
+  }
+  const res = await api("/api/groups/update", {
+    actor: me.username,
+    groupId: activeChat.id,
+    title: newTitle,
+    emoji: editGroupEmoji
+  });
+  if (!res.ok) {
+    if (errEl) errEl.textContent = res.error || "Не удалось сохранить изменения";
+    if (okEl) okEl.textContent = "";
+    return;
+  }
+  activeChat.username = res.group.title;
+  activeChat.emoji = res.group.emoji;
+  document.getElementById("peerAva").textContent = res.group.emoji || "🦜";
+  document.getElementById("peerNick").innerHTML = esc(res.group.title);
+  await renderGroupSettings();
+  const okAfter = document.getElementById("editGroupOk");
+  if (okAfter) okAfter.textContent = "Название и иконка обновлены!";
+  await refreshChats();
+}
+
 async function renderGroupSettings() {
   const body = document.getElementById("groupSettingsBody");
   if (!body || !activeChat || activeChat.type !== "group") return;
+
+  body.innerHTML = `<div class="muted">Загрузка настроек группы...</div>`;
 
   const res = await api(`/api/groups/info?groupId=${encodeURIComponent(activeChat.id)}&user=${encodeURIComponent(me.username)}`);
   if (!res.ok || !res.group) {
@@ -1235,23 +1343,46 @@ async function renderGroupSettings() {
   const g = res.group;
   const isGroupOwner = g.owner === me.username;
   const mutedSet = new Set(g.muted || []);
+  editGroupEmoji = g.emoji || "🦜";
 
   activeChat.username = g.title;
-  activeChat.emoji = g.emoji;
-  document.getElementById("peerAva").textContent = g.emoji || "👥";
+  activeChat.emoji = editGroupEmoji;
+  document.getElementById("peerAva").textContent = editGroupEmoji;
   document.getElementById("peerNick").innerHTML = esc(g.title);
 
-  const membersHtml = (g.members || []).map(nick => {
+  const ownerEditMetaHtml = isGroupOwner ? `
+    <div class="group-edit-card">
+      <div style="font-weight:700;">Изменить название и иконку</div>
+      <input id="editGroupTitleInput" class="mt-8" value="${esc(g.title)}" maxlength="40" placeholder="Название группы" autocomplete="off">
+      <div id="editGroupIconPicker" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:10px;"></div>
+      <div class="muted mt-8">Выбрана иконка: <strong id="editGroupIconLabel">${editGroupEmoji}</strong></div>
+      <div id="editGroupErr" class="err"></div>
+      <div id="editGroupOk" class="ok"></div>
+      <button type="button" class="blue-btn mt-8" style="width:100%;" onclick="saveGroupMeta()">Сохранить изменения</button>
+    </div>
+  ` : "";
+
+  const orderedMembers = [
+    g.owner,
+    ...(g.members || []).filter(m => m !== g.owner)
+  ];
+
+  const membersHtml = orderedMembers.map(nick => {
     const isMemberOwner = nick === g.owner;
     const isMuted = mutedSet.has(nick);
-    const statusBadge = isMemberOwner
-      ? `<span class="muted">владелец</span>`
-      : (isMuted ? `<span style="color:#ffcf70; font-size:12px;">мут</span>` : `<span class="muted">участник</span>`);
+    const isMeTag = nick === me.username ? ` <span class="muted" style="font-weight:500;">(вы)</span>` : "";
+
+    let roleBadgeHtml = `<span class="role-badge-member">Обычный участник</span>`;
+    if (isMemberOwner) {
+      roleBadgeHtml = `<span class="role-badge-owner">👑 Владелец</span>`;
+    } else if (isMuted) {
+      roleBadgeHtml = `<span class="role-badge-muted">Обычный участник • не может писать</span>`;
+    }
 
     const controlsHtml = (isGroupOwner && !isMemberOwner) ? `
       <div class="group-member-btns">
         <button type="button" class="mini-btn ${isMuted ? 'ok' : 'warn'}" onclick="toggleMuteMember('${esc(nick)}')">
-          ${isMuted ? 'Размутить' : 'Запретить писать'}
+          ${isMuted ? 'Разрешить писать' : 'Запретить писать'}
         </button>
         <button type="button" class="mini-btn del" onclick="kickGroupMember('${esc(nick)}')">Удалить</button>
       </div>
@@ -1260,8 +1391,8 @@ async function renderGroupSettings() {
     return `
       <div class="group-member-row">
         <div style="min-width:0;">
-          <div class="chat-name">${nickLabelHtml(nick, isOwnerNick(nick))}</div>
-          <div>${statusBadge}</div>
+          <div class="chat-name">${nickLabelHtml(nick, isSystemOwnerNick(nick))}${isMeTag}</div>
+          <div>${roleBadgeHtml}</div>
         </div>
         ${controlsHtml}
       </div>
@@ -1273,23 +1404,27 @@ async function renderGroupSettings() {
       <div style="font-weight:700; color:#ff8c8c;">Управление группой (только владелец)</div>
       <button type="button" class="del mt-8" style="width:100%;" onclick="deleteCurrentGroup()">Удалить группу</button>
     </div>
-  ` : `
-    <div class="muted mt-12">Только владелец группы может менять права участников или удалить группу.</div>
-  `;
+  ` : "";
 
   body.innerHTML = `
     <div style="display:flex; align-items:center; gap:12px;">
-      <div class="ava" style="width:52px; height:52px; font-size:26px;">${g.emoji || '👥'}</div>
+      <div class="ava" style="width:52px; height:52px; font-size:26px;">${editGroupEmoji}</div>
       <div>
         <div style="font-size:18px; font-weight:800;">${esc(g.title)}</div>
-        <div class="muted">Владелец: ${nickLabelHtml(g.owner, isOwnerNick(g.owner))}</div>
+        <div class="muted">Владелец: ${nickLabelHtml(g.owner, isSystemOwnerNick(g.owner))}</div>
       </div>
     </div>
 
-    <div style="font-weight:700; margin-top:18px;">Участники (${(g.members || []).length})</div>
+    ${ownerEditMetaHtml}
+
+    <div style="font-weight:700; margin-top:18px;">Участники (${orderedMembers.length})</div>
     <div id="groupMembersList">${membersHtml}</div>
     ${ownerDeleteHtml}
   `;
+
+  if (isGroupOwner) {
+    renderEditGroupIconPicker();
+  }
 }
 
 async function toggleMuteMember(targetNick) {
@@ -1401,7 +1536,7 @@ async function refreshChats() {
       }
       activeChat.username = matchedGroup.title;
       activeChat.emoji = matchedGroup.emoji;
-      document.getElementById("peerAva").textContent = matchedGroup.emoji || "👥";
+      document.getElementById("peerAva").textContent = matchedGroup.emoji || "🦜";
       document.getElementById("peerNick").innerHTML = esc(matchedGroup.title);
     }
   }
@@ -1413,8 +1548,8 @@ async function refreshChats() {
   list.innerHTML = res.chats.map(c => {
     if (c.type === "group") {
       return `
-        <div class="chat-card" onclick="openGroupChat('${esc(c.groupId)}', '${esc(c.title)}', '${esc(c.emoji || '👥')}')">
-          <div class="ava">${c.emoji || '👥'}</div>
+        <div class="chat-card" onclick="openGroupChat('${esc(c.groupId)}', '${esc(c.title)}', '${esc(c.emoji || '🦜')}')">
+          <div class="ava">${c.emoji || '🦜'}</div>
           <div class="chat-info">
             <div class="chat-name">${esc(c.title)} <span class="muted" style="font-weight:500; font-size:12px;">• группа</span></div>
             <div class="chat-last ${c.typing ? 'typing-active' : ''}">${c.typing ? 'печатает...' : esc(c.last || 'Сообщений пока нет')}</div>
@@ -1446,8 +1581,8 @@ async function openDirectChat(username, emoji, isOwner = false) {
   clearAttachment();
   lastRenderedMsgsJson = "";
   syncRoomComposerLock(false);
-  const titleBtn = document.getElementById("peerTitleBtn");
-  if (titleBtn) titleBtn.classList.remove("clickable-title");
+  const headerMain = document.getElementById("roomHeaderMain");
+  if (headerMain) headerMain.classList.remove("clickable-header");
   document.getElementById("peerAva").textContent = emoji || "🍐";
   document.getElementById("peerNick").innerHTML = nickLabelHtml(username, isOwner);
   document.getElementById("peerStatus").textContent = "";
@@ -1460,13 +1595,13 @@ async function openDirectChat(username, emoji, isOwner = false) {
 }
 
 async function openGroupChat(groupId, title, emoji) {
-  activeChat = { type: "group", id: groupId, username: title, emoji: emoji || "👥", isOwner: false };
+  activeChat = { type: "group", id: groupId, username: title, emoji: emoji || "🦜", isOwner: false };
   clearAttachment();
   lastRenderedMsgsJson = "";
   syncRoomComposerLock(false);
-  const titleBtn = document.getElementById("peerTitleBtn");
-  if (titleBtn) titleBtn.classList.add("clickable-title");
-  document.getElementById("peerAva").textContent = emoji || "👥";
+  const headerMain = document.getElementById("roomHeaderMain");
+  if (headerMain) headerMain.classList.add("clickable-header");
+  document.getElementById("peerAva").textContent = emoji || "🦜";
   document.getElementById("peerNick").innerHTML = esc(title);
   document.getElementById("peerStatus").textContent = "";
   const inp = document.getElementById("msgInput");
@@ -1516,7 +1651,7 @@ async function refreshMessages(forceScroll = false) {
     syncRoomComposerLock(Boolean(res.isMuted));
     activeChat.username = res.title || activeChat.username;
     activeChat.emoji = res.emoji || activeChat.emoji;
-    document.getElementById("peerAva").textContent = activeChat.emoji || "👥";
+    document.getElementById("peerAva").textContent = activeChat.emoji || "🦜";
     document.getElementById("peerNick").innerHTML = esc(activeChat.username);
 
     const statusEl = document.getElementById("peerStatus");
@@ -1938,7 +2073,7 @@ def chats():
                     "type": "group",
                     "groupId": g["id"],
                     "title": g["title"],
-                    "emoji": g["emoji"] or "👥",
+                    "emoji": normalize_group_emoji(g["emoji"]),
                     "typing": len(get_group_typing_users(g["id"], u)) > 0,
                     "last": preview_text,
                     "ts": ts_val,
@@ -1983,7 +2118,7 @@ def chats():
                 "type": "group",
                 "groupId": gid,
                 "title": g["title"],
-                "emoji": g.get("emoji") or "👥",
+                "emoji": normalize_group_emoji(g.get("emoji")),
                 "typing": len(get_group_typing_users(gid, u)) > 0,
                 "last": preview_text,
                 "ts": ts_val,
@@ -2065,7 +2200,7 @@ def create_group():
     d = request.get_json(force=True) or {}
     owner = (d.get("owner") or "").strip()
     title = (d.get("title") or "").strip()
-    emoji = (d.get("emoji") or "👥").strip() or "👥"
+    emoji = normalize_group_emoji(d.get("emoji"))
     raw_members = d.get("members") or []
     if not owner or not title:
         return jsonify({"ok": False, "error": "Укажите название группы."})
@@ -2108,6 +2243,39 @@ def create_group():
     db["group_msgs"].setdefault(gid, [])
     save_json_db(db)
     return jsonify({"ok": True, "group": group_obj})
+
+
+@app.post("/api/groups/update")
+def group_update():
+    d = request.get_json(force=True) or {}
+    actor = (d.get("actor") or "").strip()
+    gid = (d.get("groupId") or "").strip()
+    title = (d.get("title") or "").strip()
+    emoji = normalize_group_emoji(d.get("emoji"))
+
+    g = get_group_by_id(gid)
+    if not g or g["owner"] != actor:
+        return jsonify({"ok": False, "error": "Только создатель группы может менять настройки."})
+    if not title:
+        return jsonify({"ok": False, "error": "Название не может быть пустым."})
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "UPDATE groups SET title = %s, emoji = %s WHERE id = %s RETURNING *",
+                    (title, emoji, gid),
+                )
+                row = cur.fetchone()
+        return jsonify({"ok": True, "group": format_group_row(row)})
+
+    db = load_json_db()
+    if gid in db["groups"]:
+        db["groups"][gid]["title"] = title
+        db["groups"][gid]["emoji"] = emoji
+        save_json_db(db)
+        return jsonify({"ok": True, "group": get_group_by_id(gid)})
+    return jsonify({"ok": False, "error": "Группа не найдена."})
 
 
 @app.get("/api/groups/info")
@@ -2153,7 +2321,7 @@ def group_msgs():
             "ok": True,
             "msgs": formatted,
             "title": g["title"],
-            "emoji": g["emoji"],
+            "emoji": normalize_group_emoji(g["emoji"]),
             "isMuted": is_muted,
             "typingUsers": typers,
         })
@@ -2163,7 +2331,7 @@ def group_msgs():
         "ok": True,
         "msgs": db["group_msgs"].get(gid, []),
         "title": g["title"],
-        "emoji": g["emoji"],
+        "emoji": normalize_group_emoji(g["emoji"]),
         "isMuted": is_muted,
         "typingUsers": typers,
     })
