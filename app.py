@@ -17,13 +17,16 @@ DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 USE_PG = bool(DATABASE_URL and psycopg2 is not None)
 
 SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
+TYPING_TTL_MS = 4500
 OWNER_NICK = "владислав"
 MAX_IMAGE_LEN = 1_500_000
 
+# In-memory карта статусов набора: {(sender, recipient): timestamp_ms}
+TYPING_STATUS = {}
+
 
 def get_pg_conn():
-    conn = psycopg2.connect(DATABASE_URL)
-    return conn
+    return psycopg2.connect(DATABASE_URL)
 
 
 def init_db():
@@ -79,6 +82,11 @@ def is_owner_nick(username):
     return (username or "").strip().lower() == OWNER_NICK
 
 
+def is_peer_typing(peer, me_nick):
+    ts = TYPING_STATUS.get((peer, me_nick), 0)
+    return (int(time.time() * 1000) - ts) <= TYPING_TTL_MS
+
+
 def format_user(row):
     username = row["username"]
     return {
@@ -106,18 +114,81 @@ HTML_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, interactive-widget=resizes-content">
 <title>Груша</title>
 <style>
+  :root {
+    --msg-font-size: 15px;
+    --emoji-size: 24px;
+    --photo-max-size: 240px;
+    --app-height: 100dvh;
+  }
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; background: #101511; color: #f3f7f3; font-family: system-ui, -apple-system, sans-serif; min-height: 100%; }
-  .wrap { max-width: 480px; margin: 0 auto; min-height: 100dvh; background: #171e18; display: flex; flex-direction: column; }
-  .top { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; background: #1f2920; border-bottom: 1px solid #2b382d; gap: 8px; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #101511;
+    color: #f3f7f3;
+    font-family: system-ui, -apple-system, sans-serif;
+    height: var(--app-height);
+    overflow: hidden;
+  }
+  .wrap {
+    max-width: 480px;
+    margin: 0 auto;
+    height: var(--app-height);
+    background: #171e18;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    background: #1f2920;
+    border-bottom: 1px solid #2b382d;
+    gap: 8px;
+    flex-shrink: 0;
+  }
   .brand { font-size: 20px; font-weight: 800; }
-  .pad { padding: 14px; flex: 1; display: flex; flex-direction: column; }
-  input { width: 100%; padding: 11px 12px; border-radius: 10px; border: 1px solid #2f3d31; background: #101511; color: #fff; font-size: 15px; outline: none; }
-  input:focus { border-color: #9be15d; }
-  button { padding: 10px 14px; border-radius: 10px; border: none; background: #9be15d; color: #101511; font-weight: 700; font-size: 14px; cursor: pointer; }
+  .pad {
+    padding: 14px;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    min-height: 0;
+  }
+  input[type="text"], input[type="password"], input:not([type="range"]):not([type="file"]), textarea {
+    width: 100%;
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid #2f3d31;
+    background: #101511;
+    color: #fff;
+    font-size: 15px;
+    font-family: inherit;
+    outline: none;
+  }
+  input:focus, textarea:focus { border-color: #9be15d; }
+  input[type="range"] {
+    width: 100%;
+    accent-color: #9be15d;
+    cursor: pointer;
+  }
+  button {
+    padding: 10px 14px;
+    border-radius: 10px;
+    border: none;
+    background: #9be15d;
+    color: #101511;
+    font-weight: 700;
+    font-size: 14px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
   button.sec { background: #263228; color: #eef5ee; }
   button.del { background: #b93838; color: #fff; }
   .mt-8 { margin-top: 8px; }
@@ -125,27 +196,178 @@ HTML_PAGE = """<!DOCTYPE html>
   .err { color: #ff7b7b; font-size: 13px; margin-top: 8px; min-height: 18px; }
   .ok { color: #9be15d; font-size: 13px; margin-top: 8px; }
   .muted { color: #96a598; font-size: 13px; }
-  .chat-card { display: flex; align-items: center; gap: 12px; padding: 11px; border-radius: 12px; background: #202a21; margin-top: 8px; cursor: pointer; }
-  .ava { width: 44px; height: 44px; border-radius: 50%; background: #141a15; display: grid; place-items: center; font-size: 22px; flex-shrink: 0; }
+  .typing-line {
+    font-size: 12px;
+    color: #9be15d;
+    min-height: 16px;
+    line-height: 1.2;
+  }
+  .chat-card {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 11px;
+    border-radius: 12px;
+    background: #202a21;
+    margin-top: 8px;
+    cursor: pointer;
+  }
+  .ava {
+    width: 44px;
+    height: 44px;
+    border-radius: 50%;
+    background: #141a15;
+    display: grid;
+    place-items: center;
+    font-size: 22px;
+    flex-shrink: 0;
+  }
   .chat-info { min-width: 0; flex: 1; }
   .chat-name { font-weight: 700; font-size: 15px; display: inline-flex; align-items: center; gap: 5px; }
   .chat-last { color: #9aa89c; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
-  .verified-badge { display: inline-flex; align-items: center; justify-content: center; width: 17px; height: 17px; border-radius: 50%; background: #2da9ff; color: #ffffff; font-size: 11px; font-weight: 900; line-height: 1; flex-shrink: 0; }
-  .msgs { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; max-height: 58dvh; }
-  .m { padding: 9px 12px; border-radius: 14px; max-width: 82%; word-break: break-word; font-size: 15px; line-height: 1.35; }
+  .chat-last.typing-active { color: #9be15d; font-weight: 600; }
+  .verified-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 17px;
+    height: 17px;
+    border-radius: 50%;
+    background: #2da9ff;
+    color: #ffffff;
+    font-size: 11px;
+    font-weight: 900;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+
+  #roomScreen {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .msgs {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+  }
+  .m {
+    padding: 9px 12px;
+    border-radius: 14px;
+    max-width: 82%;
+    word-break: break-word;
+    white-space: pre-wrap;
+    font-size: var(--msg-font-size);
+    line-height: 1.35;
+  }
   .me { align-self: flex-end; background: #9be15d; color: #101511; font-weight: 500; }
   .them { align-self: flex-start; background: #243026; color: #f3f7f3; }
-  .msg-img { display: block; max-width: 100%; max-height: 240px; border-radius: 10px; object-fit: cover; cursor: pointer; }
-  .msg-txt { margin-top: 6px; }
+  .msg-img {
+    display: block;
+    max-width: min(100%, var(--photo-max-size));
+    max-height: var(--photo-max-size);
+    border-radius: 10px;
+    object-fit: cover;
+    cursor: pointer;
+  }
+  .msg-txt { margin-top: 6px; font-size: var(--msg-font-size); white-space: pre-wrap; }
   .msg-txt:first-child { margin-top: 0; }
-  .em-row { display: flex; gap: 6px; padding: 6px 14px; background: #1b231c; border-top: 1px solid #28342a; overflow-x: auto; }
-  .em-btn { background: #263228; color: #fff; padding: 6px 9px; font-size: 18px; border-radius: 8px; flex-shrink: 0; }
-  .attach-preview { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: #1f2920; border-top: 1px solid #2b382d; }
-  .attach-preview img { width: 52px; height: 52px; object-fit: cover; border-radius: 8px; border: 1px solid #394a3c; }
+  .emoji-only-bubble {
+    background: transparent !important;
+    padding: 2px 4px !important;
+    font-size: var(--emoji-size) !important;
+    line-height: 1.15 !important;
+  }
+  .inline-emoji {
+    font-size: var(--emoji-size);
+    line-height: 1.1;
+    vertical-align: middle;
+  }
+
+  .bottom-dock {
+    flex-shrink: 0;
+    background: #1b231c;
+    border-top: 1px solid #28342a;
+  }
+  .em-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    background: #1b231c;
+    overflow-x: auto;
+  }
+  .em-btn {
+    background: #263228;
+    color: #fff;
+    padding: 5px 9px;
+    font-size: var(--emoji-size);
+    line-height: 1.1;
+    border-radius: 8px;
+    flex-shrink: 0;
+  }
+  .attach-preview {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px;
+    background: #1f2920;
+    border-top: 1px solid #2b382d;
+  }
+  .attach-preview img {
+    width: 52px;
+    height: 52px;
+    object-fit: cover;
+    border-radius: 8px;
+    border: 1px solid #394a3c;
+  }
   .attach-remove { padding: 6px 10px; font-size: 12px; border-radius: 8px; background: #b93838; color: #fff; margin-left: auto; }
-  .composer { display: flex; align-items: center; gap: 6px; padding: 10px 14px 14px; background: #1b231c; }
-  .clip-btn { background: #263228; color: #eef5ee; padding: 10px 11px; font-size: 17px; border-radius: 10px; flex-shrink: 0; }
-  .composer input { flex: 1; }
+  .composer {
+    display: flex;
+    align-items: flex-end;
+    gap: 6px;
+    padding: 8px 12px 10px;
+    background: #1b231c;
+  }
+  .clip-btn {
+    background: #263228;
+    color: #eef5ee;
+    padding: 10px 11px;
+    font-size: 17px;
+    border-radius: 10px;
+    flex-shrink: 0;
+  }
+  .composer textarea {
+    flex: 1;
+    min-width: 0;
+    min-height: 42px;
+    max-height: 120px;
+    resize: none;
+    overflow-y: auto;
+    line-height: 1.35;
+  }
+
+  .custom-box {
+    margin-top: 22px;
+    padding: 14px;
+    border-radius: 14px;
+    background: #202a21;
+    border: 1px solid #2d3b2f;
+  }
+  .slider-row { margin-top: 12px; }
+  .slider-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 13px;
+    margin-bottom: 6px;
+  }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -169,7 +391,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <button class="mt-8" style="width:100%;" onclick="doAuth()">Продолжить</button>
   </div>
 
-  <div id="chatsScreen" class="hidden" style="flex:1; display:flex; flex-direction:column;">
+  <div id="chatsScreen" class="hidden" style="flex:1; display:flex; flex-direction:column; min-height:0;">
     <div class="top">
       <div style="display:flex; align-items:center; gap:10px; min-width:0;">
         <div class="ava" id="myAva">🍐</div>
@@ -185,39 +407,44 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <div id="roomScreen" class="hidden" style="flex:1; display:flex; flex-direction:column;">
+  <div id="roomScreen" class="hidden">
     <div class="top">
       <div style="display:flex; align-items:center; gap:10px; min-width:0;">
         <button class="sec" onclick="backToChats()">← Чаты</button>
         <div class="ava" id="peerAva">🍐</div>
-        <div class="chat-name" id="peerNick">@peer</div>
+        <div style="min-width:0;">
+          <div class="chat-name" id="peerNick">@peer</div>
+          <div class="typing-line" id="peerStatus"></div>
+        </div>
       </div>
     </div>
     <div id="msgsBox" class="msgs"></div>
-    <div class="em-row">
-      <button type="button" class="em-btn" onclick="insertEmoji('😀')">😀</button>
-      <button type="button" class="em-btn" onclick="insertEmoji('😂')">😂</button>
-      <button type="button" class="em-btn" onclick="insertEmoji('❤️')">❤️</button>
-      <button type="button" class="em-btn" onclick="insertEmoji('🔥')">🔥</button>
-      <button type="button" class="em-btn" onclick="insertEmoji('👍')">👍</button>
-      <button type="button" class="em-btn" onclick="insertEmoji('🍐')">🍐</button>
-      <button type="button" class="em-btn" onclick="insertEmoji('🎉')">🎉</button>
-      <button type="button" class="em-btn" onclick="insertEmoji('😭')">😭</button>
-    </div>
-    <div id="attachPreview" class="attach-preview hidden">
-      <img id="attachThumb" alt="Превью">
-      <div class="muted" id="attachName">Картинка прикреплена</div>
-      <button type="button" class="attach-remove" onclick="clearAttachment()">Убрать</button>
-    </div>
-    <div class="composer">
-      <input id="fileInput" type="file" accept="image/*" class="hidden" onchange="onFileSelected(event)">
-      <button type="button" class="clip-btn" title="Прикрепить картинку" onclick="document.getElementById('fileInput').click()">📎</button>
-      <input id="msgInput" placeholder="Сообщение..." autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter'){event.preventDefault();sendMsg();}">
-      <button type="button" onclick="sendMsg()">➤</button>
+    <div class="bottom-dock">
+      <div class="em-row">
+        <button type="button" class="em-btn" onclick="insertEmoji('😀')">😀</button>
+        <button type="button" class="em-btn" onclick="insertEmoji('😂')">😂</button>
+        <button type="button" class="em-btn" onclick="insertEmoji('❤️')">❤️</button>
+        <button type="button" class="em-btn" onclick="insertEmoji('🔥')">🔥</button>
+        <button type="button" class="em-btn" onclick="insertEmoji('👍')">👍</button>
+        <button type="button" class="em-btn" onclick="insertEmoji('🍐')">🍐</button>
+        <button type="button" class="em-btn" onclick="insertEmoji('🎉')">🎉</button>
+        <button type="button" class="em-btn" onclick="insertEmoji('😭')">😭</button>
+      </div>
+      <div id="attachPreview" class="attach-preview hidden">
+        <img id="attachThumb" alt="Превью">
+        <div class="muted" id="attachName">Картинка прикреплена</div>
+        <button type="button" class="attach-remove" onclick="clearAttachment()">Убрать</button>
+      </div>
+      <div class="composer">
+        <input id="fileInput" type="file" accept="image/*" class="hidden" onchange="onFileSelected(event)">
+        <button type="button" class="clip-btn" title="Прикрепить картинку" onclick="document.getElementById('fileInput').click()">📎</button>
+        <textarea id="msgInput" rows="1" placeholder="Сообщение..." autocomplete="off" spellcheck="false" oninput="onComposerInput()" onkeydown="onComposerKeydown(event)"></textarea>
+        <button type="button" onclick="sendMsg()">➤</button>
+      </div>
     </div>
   </div>
 
-  <div id="settingsScreen" class="hidden" style="flex:1; display:flex; flex-direction:column;">
+  <div id="settingsScreen" class="hidden" style="flex:1; display:flex; flex-direction:column; min-height:0;">
     <div class="top">
       <button class="sec" onclick="backToChats()">← Назад</button>
       <strong>Настройки</strong>
@@ -237,6 +464,37 @@ HTML_PAGE = """<!DOCTYPE html>
 
       <button class="sec mt-12" style="width:100%;" onclick="logout()">Выйти из аккаунта</button>
       <button class="del mt-8" style="width:100%;" onclick="deleteAccount()">Удалить аккаунт</button>
+
+      <div class="custom-box" id="customizationTab">
+        <div style="font-weight:800; font-size:15px;">🎨 Кастомизация</div>
+        <div class="muted mt-8">Настрой размер элементов под себя</div>
+
+        <div class="slider-row">
+          <div class="slider-head">
+            <span>Размер сообщений</span>
+            <strong id="msgSizeVal">15px</strong>
+          </div>
+          <input id="msgSizeRange" type="range" min="12" max="22" step="1" oninput="updateCustomization()">
+        </div>
+
+        <div class="slider-row">
+          <div class="slider-head">
+            <span>Размер смайликов</span>
+            <strong id="emojiSizeVal">24px</strong>
+          </div>
+          <input id="emojiSizeRange" type="range" min="18" max="44" step="2" oninput="updateCustomization()">
+        </div>
+
+        <div class="slider-row">
+          <div class="slider-head">
+            <span>Размер фотографий</span>
+            <strong id="photoSizeVal">240px</strong>
+          </div>
+          <input id="photoSizeRange" type="range" min="140" max="360" step="10" oninput="updateCustomization()">
+        </div>
+
+        <button type="button" class="sec mt-12" style="width:100%;" onclick="resetCustomization()">Сбросить кастомизацию</button>
+      </div>
     </div>
   </div>
 </div>
@@ -249,12 +507,132 @@ const AVATAR_EMOJIS = [
   "🎧", "🚀", "🌵", "🍀", "🍓", "👑"
 ];
 
+const DEFAULT_CUSTOM = {
+  msgSize: 15,
+  emojiSize: 24,
+  photoSize: 240
+};
+
+const EMOJI_ONLY_RE = /^(?:[\p{Emoji_Presentation}\p{Extended_Pictographic}]\uFE0F?(?:\u200D[\p{Emoji_Presentation}\p{Extended_Pictographic}]\uFE0F?)*|\s)+$/u;
+const SINGLE_EMOJI_RE = /([\p{Emoji_Presentation}\p{Extended_Pictographic}]\uFE0F?(?:\u200D[\p{Emoji_Presentation}\p{Extended_Pictographic}]\uFE0F?)*)/gu;
+
 let me = null;
 let authTab = "login";
 let activePeer = null;
 let pendingImageData = "";
 let lastRenderedMsgsJson = "";
+let lastRenderedCustomJson = "";
+let lastTypingPingTs = 0;
 let pollTimer = null;
+
+/* Подгоняем высоту под видимую область экрана при открытии экранной клавиатуры на телефоне */
+function syncViewportHeight() {
+  const vv = window.visualViewport;
+  const h = vv ? vv.height : window.innerHeight;
+  document.documentElement.style.setProperty("--app-height", `${Math.round(h)}px`);
+  if (vv && vv.offsetTop > 0) {
+    window.scrollTo(0, 0);
+  }
+  const box = document.getElementById("msgsBox");
+  if (box && activePeer) {
+    box.scrollTop = box.scrollHeight;
+  }
+}
+
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", syncViewportHeight);
+  window.visualViewport.addEventListener("scroll", syncViewportHeight);
+}
+window.addEventListener("resize", syncViewportHeight);
+syncViewportHeight();
+
+function autoResizeComposer() {
+  const inp = document.getElementById("msgInput");
+  if (!inp) return;
+  inp.style.height = "auto";
+  const next = Math.min(inp.scrollHeight, 120);
+  inp.style.height = `${Math.max(42, next)}px`;
+}
+
+function sendTypingSignal(force = false) {
+  if (!me || !activePeer) return;
+  const now = Date.now();
+  if (!force && now - lastTypingPingTs < 1500) return;
+  lastTypingPingTs = now;
+  api("/api/typing", { from: me.username, to: activePeer.username }).catch(() => {});
+}
+
+function onComposerInput() {
+  autoResizeComposer();
+  const inp = document.getElementById("msgInput");
+  if (inp && inp.value.trim().length > 0) {
+    sendTypingSignal(false);
+  }
+}
+
+function onComposerKeydown(event) {
+  const isTouchDevice = "ontouchstart" in window || navigator.maxTouchPoints > 0;
+  if (event.key === "Enter" && !event.shiftKey && !isTouchDevice) {
+    event.preventDefault();
+    sendMsg();
+  }
+}
+
+function loadCustom() {
+  try {
+    const raw = JSON.parse(localStorage.getItem("grusha_custom") || "{}");
+    return {
+      msgSize: Number(raw.msgSize) || DEFAULT_CUSTOM.msgSize,
+      emojiSize: Number(raw.emojiSize) || DEFAULT_CUSTOM.emojiSize,
+      photoSize: Number(raw.photoSize) || DEFAULT_CUSTOM.photoSize
+    };
+  } catch (e) {
+    return { ...DEFAULT_CUSTOM };
+  }
+}
+
+function applyCustom(cfg) {
+  document.documentElement.style.setProperty("--msg-font-size", `${cfg.msgSize}px`);
+  document.documentElement.style.setProperty("--emoji-size", `${cfg.emojiSize}px`);
+  document.documentElement.style.setProperty("--photo-max-size", `${cfg.photoSize}px`);
+
+  const rMsg = document.getElementById("msgSizeRange");
+  const rEm = document.getElementById("emojiSizeRange");
+  const rPh = document.getElementById("photoSizeRange");
+  if (rMsg) rMsg.value = cfg.msgSize;
+  if (rEm) rEm.value = cfg.emojiSize;
+  if (rPh) rPh.value = cfg.photoSize;
+
+  const vMsg = document.getElementById("msgSizeVal");
+  const vEm = document.getElementById("emojiSizeVal");
+  const vPh = document.getElementById("photoSizeVal");
+  if (vMsg) vMsg.textContent = `${cfg.msgSize}px`;
+  if (vEm) vEm.textContent = `${cfg.emojiSize}px`;
+  if (vPh) vPh.textContent = `${cfg.photoSize}px`;
+}
+
+function updateCustomization() {
+  const cfg = {
+    msgSize: Number(document.getElementById("msgSizeRange").value) || DEFAULT_CUSTOM.msgSize,
+    emojiSize: Number(document.getElementById("emojiSizeRange").value) || DEFAULT_CUSTOM.emojiSize,
+    photoSize: Number(document.getElementById("photoSizeRange").value) || DEFAULT_CUSTOM.photoSize
+  };
+  try { localStorage.setItem("grusha_custom", JSON.stringify(cfg)); } catch (e) {}
+  applyCustom(cfg);
+  if (activePeer) {
+    lastRenderedMsgsJson = "";
+    refreshMessages(false);
+  }
+}
+
+function resetCustomization() {
+  try { localStorage.setItem("grusha_custom", JSON.stringify(DEFAULT_CUSTOM)); } catch (e) {}
+  applyCustom(DEFAULT_CUSTOM);
+  if (activePeer) {
+    lastRenderedMsgsJson = "";
+    refreshMessages(false);
+  }
+}
 
 function renderAvatarChoices() {
   const box = document.getElementById("avaPicker");
@@ -271,7 +649,7 @@ function isFullscreenNow() {
 async function toggleFullscreenByTap(e) {
   if (!e.target.closest) return;
   const interactive = e.target.closest(
-    "button, input, textarea, select, a, .chat-card, .m, .msg-img, .em-btn, .clip-btn, .attach-preview, .top, .em-row, .composer"
+    "button, input, textarea, select, a, .chat-card, .m, .msg-img, .em-btn, .clip-btn, .attach-preview, .top, .bottom-dock, .custom-box"
   );
   if (interactive) return;
 
@@ -314,6 +692,7 @@ function showScreen(id) {
   ["loadingScreen", "authScreen", "chatsScreen", "roomScreen", "settingsScreen"].forEach(s => {
     document.getElementById(s).classList.toggle("hidden", s !== id);
   });
+  syncViewportHeight();
 }
 
 function setAuthTab(tab) {
@@ -360,6 +739,7 @@ function backToChats() {
 
 function openSettings() {
   renderAvatarChoices();
+  applyCustom(loadCustom());
   document.getElementById("setErr").textContent = "";
   document.getElementById("setOk").textContent = "";
   const leftMs = 7 * 24 * 3600 * 1000 - (Date.now() - (me.lastNickChangeAt || me.createdAt || Date.now()));
@@ -403,6 +783,16 @@ async function refreshChats() {
   const res = await api(`/api/chats?user=${encodeURIComponent(me.username)}`);
   const list = document.getElementById("chatList");
   if (!list || !res.ok) return;
+
+  if (activePeer) {
+    const matched = res.chats.find(c => c.username === activePeer.username);
+    if (matched && matched.emoji && matched.emoji !== activePeer.emoji) {
+      activePeer.emoji = matched.emoji;
+      const peerAvaEl = document.getElementById("peerAva");
+      if (peerAvaEl) peerAvaEl.textContent = matched.emoji;
+    }
+  }
+
   if (!res.chats.length) {
     list.innerHTML = `<div class="muted mt-12">Чатов пока нет. Введи никнейм в поиске выше и открой диалог.</div>`;
     return;
@@ -412,7 +802,7 @@ async function refreshChats() {
       <div class="ava">${c.emoji || '🍐'}</div>
       <div class="chat-info">
         <div class="chat-name">${nickLabelHtml(c.username, c.isOwner)}</div>
-        <div class="chat-last">${esc(c.last || 'Сообщений пока нет')}</div>
+        <div class="chat-last ${c.typing ? 'typing-active' : ''}">${c.typing ? 'печатает...' : esc(c.last || 'Сообщений пока нет')}</div>
       </div>
     </div>
   `).join("");
@@ -424,25 +814,58 @@ async function openChat(username, emoji, isOwner = false) {
   lastRenderedMsgsJson = "";
   document.getElementById("peerAva").textContent = emoji || "🍐";
   document.getElementById("peerNick").innerHTML = nickLabelHtml(username, isOwner);
-  document.getElementById("msgInput").value = "";
+  document.getElementById("peerStatus").textContent = "";
+  const inp = document.getElementById("msgInput");
+  inp.value = "";
+  autoResizeComposer();
   showScreen("roomScreen");
   await refreshMessages(true);
+  await refreshChats();
+}
+
+function formatTextWithEmojis(rawText) {
+  const safe = esc(rawText);
+  return safe.replace(SINGLE_EMOJI_RE, match => `<span class="inline-emoji">${match}</span>`);
 }
 
 function renderMsgItem(m) {
   const cls = m.from === me.username ? "me" : "them";
-  const imgHtml = m.image ? `<img class="msg-img" src="${m.image}" alt="Картинка" onclick="window.open('${m.image}', '_blank')">` : "";
-  const txtHtml = m.text ? `<div class="msg-txt">${esc(m.text)}</div>` : "";
-  return `<div class="m ${cls}">${imgHtml}${txtHtml}</div>`;
+  const text = (m.text || "").trim();
+  const isEmojiOnly = !m.image && text.length > 0 && EMOJI_ONLY_RE.test(text);
+  const bubbleExtra = isEmojiOnly ? " emoji-only-bubble" : "";
+
+  const imgHtml = m.image
+    ? `<img class="msg-img" src="${m.image}" alt="Картинка" onclick="window.open('${m.image}', '_blank')">`
+    : "";
+
+  const txtHtml = text
+    ? `<div class="msg-txt">${formatTextWithEmojis(text)}</div>`
+    : "";
+
+  return `<div class="m ${cls}${bubbleExtra}">${imgHtml}${txtHtml}</div>`;
 }
 
 async function refreshMessages(forceScroll = false) {
   if (!me || !activePeer) return;
   const res = await api(`/api/msgs?a=${encodeURIComponent(me.username)}&b=${encodeURIComponent(activePeer.username)}`);
   if (!res.ok) return;
+
+  if (res.peerEmoji && res.peerEmoji !== activePeer.emoji) {
+    activePeer.emoji = res.peerEmoji;
+    const peerAvaEl = document.getElementById("peerAva");
+    if (peerAvaEl) peerAvaEl.textContent = res.peerEmoji;
+  }
+
+  const statusEl = document.getElementById("peerStatus");
+  if (statusEl) {
+    statusEl.textContent = res.peerTyping ? "печатает..." : "";
+  }
+
+  const customStamp = JSON.stringify(loadCustom());
   const json = JSON.stringify(res.msgs);
-  if (json === lastRenderedMsgsJson && !forceScroll) return;
+  if (json === lastRenderedMsgsJson && customStamp === lastRenderedCustomJson && !forceScroll) return;
   lastRenderedMsgsJson = json;
+  lastRenderedCustomJson = customStamp;
 
   const box = document.getElementById("msgsBox");
   if (!box) return;
@@ -462,6 +885,8 @@ function insertEmoji(em) {
   const pos = start + em.length;
   inp.focus();
   inp.setSelectionRange(pos, pos);
+  autoResizeComposer();
+  sendTypingSignal(false);
 }
 
 function clearAttachment() {
@@ -530,6 +955,7 @@ async function sendMsg() {
   if (!text && !image) return;
 
   inp.value = "";
+  autoResizeComposer();
   clearAttachment();
   inp.focus();
 
@@ -545,6 +971,7 @@ async function setEmoji(em) {
     document.getElementById("myAva").textContent = em;
     document.getElementById("setOk").textContent = `Аватарка обновлена на ${em}`;
     document.getElementById("setErr").textContent = "";
+    refreshChats();
   }
 }
 
@@ -585,7 +1012,7 @@ function startPolling() {
     if (!me) return;
     refreshChats();
     if (activePeer) refreshMessages(false);
-  }, 2500);
+  }, 1800);
 }
 
 function esc(s) {
@@ -594,6 +1021,7 @@ function esc(s) {
   }[c]));
 }
 
+applyCustom(loadCustom());
 renderAvatarChoices();
 
 (async function boot() {
@@ -690,6 +1118,16 @@ def logout_api():
     return resp
 
 
+@app.post("/api/typing")
+def typing_api():
+    d = request.get_json(force=True) or {}
+    f = (d.get("from") or "").strip()
+    t = (d.get("to") or "").strip()
+    if f and t:
+        TYPING_STATUS[(f, t)] = int(time.time() * 1000)
+    return jsonify({"ok": True})
+
+
 @app.get("/api/search")
 def search():
     q = (request.args.get("q") or "").strip().lower()
@@ -744,6 +1182,7 @@ def chats():
                     "username": peer,
                     "emoji": users_map[peer],
                     "isOwner": is_owner_nick(peer),
+                    "typing": is_peer_typing(peer, u),
                     "last": preview_text,
                     "ts": int(r.get("ts") or 0),
                 })
@@ -764,6 +1203,7 @@ def chats():
                 "username": peer,
                 "emoji": db["users"][peer].get("emoji", "🍐"),
                 "isOwner": is_owner_nick(peer),
+                "typing": is_peer_typing(peer, u),
                 "last": preview_text,
                 "ts": last_msg.get("ts", 0),
             })
@@ -776,6 +1216,7 @@ def msgs():
     a = request.args.get("a") or ""
     b = request.args.get("b") or ""
     ck = chat_key(a, b)
+    peer_typing = is_peer_typing(b, a)
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -784,16 +1225,25 @@ def msgs():
                     (ck,),
                 )
                 rows = cur.fetchall()
+                cur.execute("SELECT emoji FROM users WHERE username = %s", (b,))
+                peer_row = cur.fetchone()
+        peer_emoji = (peer_row.get("emoji") if peer_row else None) or "🍐"
         formatted = []
         for r in rows:
             item = {"from": r["from"], "text": r.get("text") or "", "ts": int(r.get("ts") or 0)}
             if r.get("image"):
                 item["image"] = r["image"]
             formatted.append(item)
-        return jsonify({"ok": True, "msgs": formatted})
+        return jsonify({"ok": True, "msgs": formatted, "peerEmoji": peer_emoji, "peerTyping": peer_typing})
 
     db = load_json_db()
-    return jsonify({"ok": True, "msgs": db["chats"].get(ck, [])})
+    peer_user = db["users"].get(b) or {}
+    return jsonify({
+        "ok": True,
+        "msgs": db["chats"].get(ck, []),
+        "peerEmoji": peer_user.get("emoji") or "🍐",
+        "peerTyping": peer_typing,
+    })
 
 
 @app.post("/api/send")
@@ -808,6 +1258,7 @@ def send():
     if not f or not t or (not txt and not img):
         return jsonify({"ok": False})
     ts = int(time.time() * 1000)
+    TYPING_STATUS.pop((f, t), None)
 
     if USE_PG:
         with get_pg_conn() as conn:
