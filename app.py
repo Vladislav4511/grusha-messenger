@@ -122,6 +122,7 @@ HTML_PAGE = """<!DOCTYPE html>
     --photo-max-size: 240px;
     --app-top: 0px;
     --app-height: 100dvh;
+    --kb-lift: 0px;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -147,6 +148,8 @@ HTML_PAGE = """<!DOCTYPE html>
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    transform: translateY(var(--kb-lift));
+    transition: transform 0.16s ease-out;
   }
   .top {
     display: flex;
@@ -465,7 +468,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="composer">
         <input id="fileInput" type="file" accept="image/*" class="hidden" onchange="onFileSelected(event)">
         <button type="button" class="clip-btn" title="Прикрепить картинку" onclick="document.getElementById('fileInput').click()">📎</button>
-        <textarea id="msgInput" rows="1" placeholder="Сообщение..." autocomplete="off" spellcheck="false" onfocus="onComposerFocus()" oninput="onComposerInput()" onkeydown="onComposerKeydown(event)"></textarea>
+        <textarea id="msgInput" rows="1" placeholder="Сообщение..." autocomplete="off" spellcheck="false" onfocus="onComposerFocus()" onblur="onComposerBlur()" oninput="onComposerInput()" onkeydown="onComposerKeydown(event)"></textarea>
         <button type="button" onclick="sendMsg()">➤</button>
       </div>
     </div>
@@ -553,8 +556,22 @@ let lastRenderedCustomJson = "";
 let lastTypingPingTs = 0;
 let pollTimer = null;
 
+let composerFocused = false;
+let baselineViewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+
+function setKeyboardLift(px) {
+  const safePx = Math.max(0, Math.min(Math.round(px), Math.round(window.innerHeight * 0.55)));
+  document.documentElement.style.setProperty("--kb-lift", `${-safePx}px`);
+}
+
 function syncViewportHeight() {
   const vv = window.visualViewport;
+  const currentH = vv ? vv.height : window.innerHeight;
+
+  if (!composerFocused && currentH > baselineViewportHeight * 0.85) {
+    baselineViewportHeight = Math.max(baselineViewportHeight, currentH);
+  }
+
   if (vv) {
     document.documentElement.style.setProperty("--app-top", `${Math.max(0, Math.round(vv.offsetTop))}px`);
     document.documentElement.style.setProperty("--app-height", `${Math.round(vv.height)}px`);
@@ -562,6 +579,12 @@ function syncViewportHeight() {
     document.documentElement.style.setProperty("--app-top", "0px");
     document.documentElement.style.setProperty("--app-height", `${window.innerHeight}px`);
   }
+
+  const viewportShrank = baselineViewportHeight - currentH > 90;
+  if (viewportShrank || !composerFocused) {
+    setKeyboardLift(0);
+  }
+
   if (window.scrollY !== 0) {
     window.scrollTo(0, 0);
   }
@@ -571,16 +594,43 @@ function syncViewportHeight() {
   }
 }
 
+function applyFallbackLiftIfNeeded() {
+  if (!composerFocused) return;
+  const vv = window.visualViewport;
+  const currentH = vv ? vv.height : window.innerHeight;
+  const alreadyResized = baselineViewportHeight - currentH > 90;
+
+  if (alreadyResized) {
+    setKeyboardLift(0);
+    return;
+  }
+
+  const estimatedKb = Math.round(window.innerHeight * 0.42);
+  setKeyboardLift(estimatedKb);
+}
+
 function onComposerFocus() {
-  [40, 140, 320, 550].forEach(delay => {
+  composerFocused = true;
+  [30, 140, 320, 550].forEach(delay => {
     setTimeout(() => {
       syncViewportHeight();
-      const dock = document.getElementById("bottomDock");
-      if (dock && dock.scrollIntoView) {
-        dock.scrollIntoView({ block: "end", behavior: "instant" });
-      }
+      applyFallbackLiftIfNeeded();
+      const box = document.getElementById("msgsBox");
+      if (box) box.scrollTop = box.scrollHeight;
     }, delay);
   });
+}
+
+function onComposerBlur() {
+  setTimeout(() => {
+    const active = document.activeElement;
+    const stillInDock = active && active.closest && active.closest("#bottomDock");
+    if (!stillInDock) {
+      composerFocused = false;
+      setKeyboardLift(0);
+      syncViewportHeight();
+    }
+  }, 120);
 }
 
 if (window.visualViewport) {
@@ -734,6 +784,8 @@ function saveLocalUser(user) {
 }
 
 function showScreen(id) {
+  composerFocused = false;
+  setKeyboardLift(0);
   ["loadingScreen", "authScreen", "chatsScreen", "searchScreen", "roomScreen", "settingsScreen"].forEach(s => {
     document.getElementById(s).classList.toggle("hidden", s !== id);
   });
