@@ -19,7 +19,7 @@ USE_PG = bool(DATABASE_URL and psycopg2 is not None)
 
 SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
 TYPING_TTL_MS = 4500
-CALL_TTL_MS = 35_000
+CALL_TTL_MS = 45_000
 OWNER_NICK = "владислав"
 TRIPLE_BADGE_GROUP_TITLE = "ырка сквад"
 MAX_IMAGE_LEN = 1_500_000
@@ -27,7 +27,8 @@ DEFAULT_GROUP_ICON = "🦜"
 DEFAULT_USER_EMOJI = "🍐"
 
 TYPING_STATUS = {}
-ACTIVE_CALLS = {}  # call_id -> dict
+ACTIVE_CALLS = {}       # direct call_id -> dict
+GROUP_CALLS = {}        # group_id -> dict
 
 
 def sanitize_user_emoji(em):
@@ -180,6 +181,61 @@ def get_group_typing_users(group_id, exclude_nick):
     return active
 
 
+def format_duration_mmss(sec):
+    s = max(0, int(sec))
+    mins = s // 60
+    rem = s % 60
+    return f"{mins:02d}:{rem:02d}"
+
+
+def append_direct_message(sender, peer, text):
+    if not sender or not peer or not text:
+        return
+    ts = int(time.time() * 1000)
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO messages (chat_key, sender, text, image, ts, reply_to_json, reactions_json) VALUES (%s, %s, %s, '', %s, '', '{}')",
+                    (chat_key(sender, peer), sender, text, ts),
+                )
+        return
+    db = load_json_db()
+    msg_item = {
+        "id": f"d_{uuid.uuid4().hex[:10]}",
+        "from": sender,
+        "text": text,
+        "ts": ts,
+        "reactions": {},
+    }
+    db["chats"].setdefault(chat_key(sender, peer), []).append(msg_item)
+    save_json_db(db)
+
+
+def append_group_user_message(gid, sender, text):
+    if not gid or not sender or not text:
+        return
+    ts = int(time.time() * 1000)
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO group_messages (group_id, sender, text, image, ts, reply_to_json, reactions_json) VALUES (%s, %s, %s, '', %s, '', '{}')",
+                    (gid, sender, text, ts),
+                )
+        return
+    db = load_json_db()
+    msg_item = {
+        "id": f"g_{uuid.uuid4().hex[:10]}",
+        "from": sender,
+        "text": text,
+        "ts": ts,
+        "reactions": {},
+    }
+    db["group_msgs"].setdefault(gid, []).append(msg_item)
+    save_json_db(db)
+
+
 def cleanup_stale_calls():
     now = int(time.time() * 1000)
     expired = []
@@ -191,6 +247,14 @@ def cleanup_stale_calls():
             expired.append(cid)
     for cid in expired:
         ACTIVE_CALLS.pop(cid, None)
+
+    stale_groups = []
+    for gid, gc in GROUP_CALLS.items():
+        updated = int(gc.get("updatedAt") or gc.get("createdAt") or now)
+        if not gc.get("participants") or (now - updated) > CALL_TTL_MS:
+            stale_groups.append(gid)
+    for gid in stale_groups:
+        GROUP_CALLS.pop(gid, None)
 
 
 def end_user_calls(username, now_ms=None):
@@ -720,6 +784,22 @@ HTML_PAGE = """<!DOCTYPE html>
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .group-call-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 9px 14px;
+    background: var(--accent-soft);
+    border-bottom: 1px solid var(--accent);
+    flex-shrink: 0;
+  }
+  .group-call-banner-text {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--text-col);
+    min-width: 0;
+  }
   .msgs {
     flex: 1;
     min-height: 0;
@@ -871,7 +951,7 @@ HTML_PAGE = """<!DOCTYPE html>
     border-radius: 10px;
   }
 
-  /* Полноэкранный звонок с видео и звуком (без зеркалирования) */
+  /* Переработанный полноэкранный звонок (1-на-1 и групповой) */
   .call-overlay {
     position: fixed;
     inset: 0;
@@ -882,7 +962,7 @@ HTML_PAGE = """<!DOCTYPE html>
     display: flex;
     flex-direction: column;
     justify-content: space-between;
-    padding: 20px 18px max(24px, env(safe-area-inset-bottom, 24px));
+    padding: 18px 16px max(22px, env(safe-area-inset-bottom, 22px));
     z-index: 90;
     overflow: hidden;
   }
@@ -893,14 +973,45 @@ HTML_PAGE = """<!DOCTYPE html>
     gap: 10px;
     z-index: 3;
   }
+  .call-timer-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-weight: 800;
+    font-size: 15px;
+    letter-spacing: 0.5px;
+  }
+  .call-badge-pill {
+    padding: 5px 11px;
+    border-radius: 999px;
+    background: var(--card-bg);
+    border: 1px solid var(--border-col);
+    color: var(--text-col);
+    font-size: 12px;
+    font-weight: 700;
+  }
   .call-stage {
     position: relative;
     flex: 1;
-    margin: 14px 0;
-    border-radius: 20px;
+    margin: 12px 0;
+    border-radius: 22px;
     background: var(--surface-bg);
     border: 1px solid var(--border-col);
     overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+  }
+  .call-direct-wrap {
+    position: relative;
+    width: 100%;
+    height: 100%;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -912,11 +1023,7 @@ HTML_PAGE = """<!DOCTYPE html>
     object-fit: cover;
     background: var(--input-bg);
   }
-  .call-remote-video.cam-off {
-    display: none;
-  }
   .call-avatar-fallback {
-    position: relative;
     width: 100%;
     height: 100%;
     display: flex;
@@ -924,22 +1031,18 @@ HTML_PAGE = """<!DOCTYPE html>
     align-items: center;
     justify-content: center;
     background: var(--card-bg);
-    z-index: 1;
-  }
-  .call-avatar-fallback.hidden-cam {
-    display: none;
   }
   .call-local-pip {
     position: absolute;
     right: 12px;
     bottom: 12px;
-    width: 106px;
-    height: 148px;
-    border-radius: 14px;
+    width: 108px;
+    height: 150px;
+    border-radius: 16px;
     overflow: hidden;
     border: 2px solid var(--accent);
     background: var(--input-bg);
-    z-index: 2;
+    z-index: 4;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
   }
   .call-local-video {
@@ -947,29 +1050,79 @@ HTML_PAGE = """<!DOCTYPE html>
     height: 100%;
     object-fit: cover;
   }
-  .call-timer-pill {
-    display: inline-block;
-    padding: 5px 13px;
-    border-radius: 999px;
-    background: var(--accent-soft);
-    color: var(--accent);
-    font-weight: 800;
-    font-size: 15px;
-    letter-spacing: 0.5px;
+  .call-group-grid {
+    width: 100%;
+    height: 100%;
+    padding: 12px;
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    overflow-y: auto;
+    align-content: start;
   }
-  .call-peer-ava {
-    width: 78px;
-    height: 78px;
+  .call-tile {
+    position: relative;
+    min-height: 168px;
+    border-radius: 16px;
+    background: var(--card-bg);
+    border: 1px solid var(--border-col);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 10px;
+  }
+  .call-tile.speaking {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-soft);
+  }
+  .call-tile-video {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    background: var(--input-bg);
+  }
+  .call-tile-ava {
+    width: 54px;
+    height: 54px;
     border-radius: 50%;
     background: var(--input-bg);
     border: 1px solid var(--border-col);
     display: grid;
     place-items: center;
-    font-size: 40px;
+    font-size: 28px;
+    z-index: 1;
+  }
+  .call-tile-name {
+    margin-top: 8px;
+    font-size: 13px;
+    font-weight: 700;
+    z-index: 2;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: rgba(14, 21, 16, 0.72);
+    color: var(--text-col);
+    max-width: 100%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .call-peer-ava {
+    width: 82px;
+    height: 82px;
+    border-radius: 50%;
+    background: var(--input-bg);
+    border: 1px solid var(--border-col);
+    display: grid;
+    place-items: center;
+    font-size: 42px;
     margin: 0 auto 10px;
   }
   .call-peer-name {
-    font-size: 20px;
+    font-size: 21px;
     font-weight: 800;
     text-align: center;
   }
@@ -1138,6 +1291,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
 <div class="wrap" id="appRoot">
   <audio id="remoteAudioEl" autoplay playsinline></audio>
+  <div id="groupAudioSink" class="hidden"></div>
 
   <div id="loadingScreen" class="pad" style="justify-content:center; align-items:center;">
     <div class="brand">🍐 Груша</div>
@@ -1239,9 +1393,15 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
       </div>
       <div class="top-actions">
-        <button type="button" id="btnCallDirect" class="mini-btn blue-btn hidden" title="Позвонить" onclick="startDirectCall()">📞</button>
+        <button type="button" id="btnCallRoom" class="mini-btn blue-btn hidden" title="Позвонить" onclick="startRoomCall()">📞</button>
       </div>
     </div>
+
+    <div id="groupCallBanner" class="group-call-banner hidden">
+      <div class="group-call-banner-text" id="groupCallBannerText">Идёт звонок в группе</div>
+      <button type="button" class="mini-btn blue-btn" onclick="joinActiveGroupCall()">Войти в звонок</button>
+    </div>
+
     <div id="msgsBox" class="msgs"></div>
     <div class="bottom-dock" id="bottomDock">
       <div id="mutedBanner" class="muted-banner hidden">Владелец запретил вам писать сообщения в этой группе.</div>
@@ -1289,23 +1449,27 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Полноэкранный звонок -->
+  <!-- Переработанный полноэкранный звонок -->
   <div id="callOverlay" class="call-overlay hidden">
     <div class="call-top-bar">
       <div class="call-timer-pill" id="callTimerLabel">00:00</div>
-      <div class="muted" id="callPeerTopLabel">@peer</div>
+      <div class="call-badge-pill" id="callModeBadge">Звонок</div>
     </div>
 
     <div class="call-stage">
-      <video id="remoteVideoEl" class="call-remote-video cam-off" autoplay playsinline></video>
-      <div id="callAvatarFallback" class="call-avatar-fallback">
-        <div class="call-peer-ava" id="callPeerAva">🙂</div>
-        <div class="call-peer-name" id="callPeerName">@peer</div>
-        <div class="call-status-text" id="callStatusText">Вызов...</div>
+      <div id="callDirectStage" class="call-direct-wrap">
+        <video id="remoteVideoEl" class="call-remote-video hidden" autoplay playsinline></video>
+        <div id="callAvatarFallback" class="call-avatar-fallback">
+          <div class="call-peer-ava" id="callPeerAva">🙂</div>
+          <div class="call-peer-name" id="callPeerName">@peer</div>
+          <div class="call-status-text" id="callStatusText">Вызов...</div>
+        </div>
+        <div class="call-local-pip hidden" id="callLocalPip">
+          <video id="localVideoEl" class="call-local-video" autoplay muted playsinline></video>
+        </div>
       </div>
-      <div class="call-local-pip hidden" id="callLocalPip">
-        <video id="localVideoEl" class="call-local-video" autoplay muted playsinline></video>
-      </div>
+
+      <div id="callGroupStage" class="call-group-grid hidden"></div>
     </div>
 
     <div class="call-actions-row" id="callIncomingControls">
@@ -1532,7 +1696,7 @@ let composerFocused = false;
 let baselineViewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
 let audioCtx = null;
 
-/* Состояние звонка 1 на 1 (аудио + камера) */
+/* Состояние звонков: 1-на-1 ("direct") и групповой ("group") */
 let callState = null;
 let pc = null;
 let localStream = null;
@@ -1547,6 +1711,11 @@ let appliedCandidateKeys = new Set();
 let renegotiating = false;
 let needsRenegotiate = false;
 let endingCallInProgress = false;
+
+/* Mesh peer connections для групповых звонков: peerNick -> { pc, stream, videoTrack, audioEl, pendingCands, appliedCands, sentCands, makingOffer, ignoreOffer, camOff } */
+let groupPeers = new Map();
+let activeGroupCallInfo = null;
+let groupGridRenderSignature = "";
 
 function getAudioContext() {
   try {
@@ -1622,10 +1791,36 @@ function requestPageFullscreen() {
   } catch (e) {}
 }
 
-function syncRemoteMediaElements() {
+function hardResetVideoElement(vidEl) {
+  if (!vidEl) return;
+  try { vidEl.pause(); } catch (e) {}
+  try { vidEl.srcObject = null; } catch (e) {}
+  try { vidEl.removeAttribute("src"); } catch (e) {}
+  try { vidEl.load(); } catch (e) {}
+  vidEl.classList.add("hidden");
+}
+
+function bindStreamToVideoElement(vidEl, stream, muted = true) {
+  if (!vidEl || !stream) return;
+  vidEl.muted = muted;
+  vidEl.playsInline = true;
+  vidEl.autoplay = true;
+  if (vidEl.srcObject !== stream) {
+    vidEl.srcObject = stream;
+  }
+  vidEl.classList.remove("hidden");
+  const p = vidEl.play();
+  if (p && typeof p.catch === "function") {
+    p.catch(() => {});
+  }
+}
+
+function syncDirectMediaElements() {
   const aud = document.getElementById("remoteAudioEl");
   const vid = document.getElementById("remoteVideoEl");
   const fallback = document.getElementById("callAvatarFallback");
+  const locVid = document.getElementById("localVideoEl");
+  const locPip = document.getElementById("callLocalPip");
 
   if (aud) {
     aud.muted = false;
@@ -1639,40 +1834,39 @@ function syncRemoteMediaElements() {
     }
   }
 
-  const videoTracks = remoteStream
+  const liveVideoTracks = remoteStream
     ? remoteStream.getVideoTracks().filter(t => t.readyState === "live" && t.enabled && !t.muted)
     : [];
-  const hasLiveVideo = videoTracks.length > 0;
+  const hasLiveRemoteVideo = liveVideoTracks.length > 0;
 
-  if (vid) {
-    vid.muted = true;
-    if (hasLiveVideo) {
-      if (vid.srcObject !== remoteStream) {
-        vid.srcObject = remoteStream;
-      }
-      vid.classList.remove("cam-off");
-      const vp = vid.play();
-      if (vp && typeof vp.catch === "function") {
-        vp.catch(() => {});
-      }
-    } else {
-      if (vid.srcObject) {
-        vid.srcObject = null;
-      }
-      vid.classList.add("cam-off");
-    }
+  if (hasLiveRemoteVideo) {
+    bindStreamToVideoElement(vid, remoteStream, true);
+    if (fallback) fallback.classList.add("hidden");
+  } else {
+    hardResetVideoElement(vid);
+    if (fallback) fallback.classList.remove("hidden");
   }
 
-  if (fallback) {
-    fallback.classList.toggle("hidden-cam", hasLiveVideo);
+  const hasLocalCam = cameraEnabled && localStream && localStream.getVideoTracks().some(t => t.readyState === "live" && t.enabled);
+  if (hasLocalCam) {
+    if (locPip) locPip.classList.remove("hidden");
+    bindStreamToVideoElement(locVid, localStream, true);
+  } else {
+    if (locPip) locPip.classList.add("hidden");
+    hardResetVideoElement(locVid);
   }
 }
 
 document.addEventListener("pointerdown", () => {
   getAudioContext();
-  if (remoteStream && callState) {
-    syncRemoteMediaElements();
+  if (callState && callState.mode === "direct") {
+    syncDirectMediaElements();
   }
+  groupPeers.forEach(entry => {
+    if (entry.audioEl && entry.audioEl.paused) {
+      entry.audioEl.play().catch(() => {});
+    }
+  });
 }, { passive: true });
 
 function sanitizeAvatarEmoji(em) {
@@ -1703,6 +1897,11 @@ function formatCallDuration(sec) {
   return `${String(mins).padStart(2, "0")}:${String(rem).padStart(2, "0")}`;
 }
 
+function getCurrentCallDurationSeconds() {
+  if (!callState || !callState.connectedAt) return 0;
+  return Math.max(0, Math.floor((Date.now() - callState.connectedAt) / 1000));
+}
+
 function startCallDurationTicker() {
   stopCallDurationTicker();
   updateCallDurationLabel();
@@ -1723,8 +1922,7 @@ function updateCallDurationLabel() {
     el.textContent = "00:00";
     return;
   }
-  const elapsedSec = Math.floor((Date.now() - callState.connectedAt) / 1000);
-  el.textContent = formatCallDuration(elapsedSec);
+  el.textContent = formatCallDuration(getCurrentCallDurationSeconds());
 }
 
 function setCallStatusNote(text) {
@@ -1734,7 +1932,6 @@ function setCallStatusNote(text) {
 
 function updateCamButtonUi() {
   const btn = document.getElementById("btnToggleCam");
-  const pip = document.getElementById("callLocalPip");
   if (btn) {
     if (cameraEnabled) {
       btn.textContent = "📷 Камера вкл";
@@ -1746,40 +1943,120 @@ function updateCamButtonUi() {
       btn.classList.add("sec");
     }
   }
-  if (pip) {
-    pip.classList.toggle("hidden", !cameraEnabled);
+}
+
+function renderGroupCallGrid() {
+  const grid = document.getElementById("callGroupStage");
+  if (!grid || !callState || callState.mode !== "group") return;
+
+  const participants = Array.isArray(callState.participants) ? callState.participants : [];
+  const sig = participants.map(p => `${p.username}:${p.emoji}:${p.camOn ? 1 : 0}`).join("|") + `|selfCam:${cameraEnabled ? 1 : 0}`;
+  if (sig === groupGridRenderSignature && grid.children.length === participants.length) {
+    // Обновляем видео потоки внутри существующих плиток без пересоздания DOM
+    participants.forEach(p => {
+      const tile = grid.querySelector(`[data-peer="${CSS.escape(p.username)}"]`);
+      if (!tile) return;
+      const vid = tile.querySelector("video");
+      if (p.username === me.username) {
+        if (cameraEnabled && localStream && localStream.getVideoTracks().some(t => t.readyState === "live" && t.enabled)) {
+          bindStreamToVideoElement(vid, localStream, true);
+        } else {
+          hardResetVideoElement(vid);
+        }
+      } else {
+        const entry = groupPeers.get(p.username);
+        const hasRemoteVid = p.camOn && entry && entry.videoTrack && entry.videoTrack.readyState === "live" && !entry.camOff;
+        if (hasRemoteVid) {
+          bindStreamToVideoElement(vid, entry.stream, true);
+        } else {
+          hardResetVideoElement(vid);
+        }
+      }
+    });
+    return;
   }
+
+  groupGridRenderSignature = sig;
+  grid.innerHTML = participants.map(p => {
+    const isSelf = p.username === me.username;
+    const ava = sanitizeAvatarEmoji(p.emoji || "🙂");
+    const label = isSelf ? `@${esc(p.username)} (вы)` : `@${esc(p.username)}`;
+    return `
+      <div class="call-tile" data-peer="${esc(p.username)}">
+        <video class="call-tile-video hidden" autoplay playsinline ${isSelf ? "muted" : "muted"}></video>
+        <div class="call-tile-ava">${ava}</div>
+        <div class="call-tile-name">${label}</div>
+      </div>
+    `;
+  }).join("");
+
+  participants.forEach(p => {
+    const tile = grid.querySelector(`[data-peer="${CSS.escape(p.username)}"]`);
+    if (!tile) return;
+    const vid = tile.querySelector("video");
+    if (p.username === me.username) {
+      if (cameraEnabled && localStream && localStream.getVideoTracks().some(t => t.readyState === "live" && t.enabled)) {
+        bindStreamToVideoElement(vid, localStream, true);
+      } else {
+        hardResetVideoElement(vid);
+      }
+    } else {
+      const entry = groupPeers.get(p.username);
+      const hasRemoteVid = p.camOn && entry && entry.videoTrack && entry.videoTrack.readyState === "live" && !entry.camOff;
+      if (hasRemoteVid) {
+        bindStreamToVideoElement(vid, entry.stream, true);
+      } else {
+        hardResetVideoElement(vid);
+      }
+    }
+  });
 }
 
 function showCallModalUi() {
   const overlay = document.getElementById("callOverlay");
   if (!overlay || !callState) return;
   overlay.classList.remove("hidden");
-  document.getElementById("callPeerAva").textContent = sanitizeAvatarEmoji(callState.peerEmoji || "🙂");
-  document.getElementById("callPeerName").textContent = `@${callState.peer}`;
-  document.getElementById("callPeerTopLabel").textContent = `@${callState.peer}`;
 
+  const directStage = document.getElementById("callDirectStage");
+  const groupStage = document.getElementById("callGroupStage");
+  const modeBadge = document.getElementById("callModeBadge");
   const incBox = document.getElementById("callIncomingControls");
   const actBox = document.getElementById("callActiveControls");
 
-  if (callState.status === "ringing" && !callState.isCaller) {
-    incBox.classList.remove("hidden");
-    actBox.classList.add("hidden");
-    setCallStatusNote(`Входящий звонок от @${callState.peer}`);
-  } else if (callState.status === "ringing" && callState.isCaller) {
-    incBox.classList.add("hidden");
-    actBox.classList.remove("hidden");
-    setCallStatusNote(`Звоним @${callState.peer}...`);
+  if (callState.mode === "group") {
+    if (directStage) directStage.classList.add("hidden");
+    if (groupStage) groupStage.classList.remove("hidden");
+    if (incBox) incBox.classList.add("hidden");
+    if (actBox) actBox.classList.remove("hidden");
+    if (modeBadge) modeBadge.textContent = `Группа: ${callState.groupTitle || "Звонок"}`;
+    renderGroupCallGrid();
   } else {
-    incBox.classList.add("hidden");
-    actBox.classList.remove("hidden");
-    if (!callState.iceNote) {
-      setCallStatusNote("В звонке");
+    if (directStage) directStage.classList.remove("hidden");
+    if (groupStage) groupStage.classList.add("hidden");
+    if (modeBadge) modeBadge.textContent = `@${callState.peer}`;
+    document.getElementById("callPeerAva").textContent = sanitizeAvatarEmoji(callState.peerEmoji || "🙂");
+    document.getElementById("callPeerName").textContent = `@${callState.peer}`;
+
+    if (callState.status === "ringing" && !callState.isCaller) {
+      incBox.classList.remove("hidden");
+      actBox.classList.add("hidden");
+      setCallStatusNote(`Входящий звонок от @${callState.peer}`);
+    } else if (callState.status === "ringing" && callState.isCaller) {
+      incBox.classList.add("hidden");
+      actBox.classList.remove("hidden");
+      setCallStatusNote(`Звоним @${callState.peer}...`);
+    } else {
+      incBox.classList.add("hidden");
+      actBox.classList.remove("hidden");
+      if (!callState.iceNote) {
+        setCallStatusNote("В звонке");
+      }
     }
+    syncDirectMediaElements();
   }
+
   updateCamButtonUi();
   updateCallDurationLabel();
-  syncRemoteMediaElements();
 }
 
 function hideCallModalUi() {
@@ -1787,8 +2064,34 @@ function hideCallModalUi() {
   if (overlay) overlay.classList.add("hidden");
 }
 
+function cleanupGroupPeers() {
+  groupPeers.forEach((entry) => {
+    try {
+      if (entry.pc) {
+        entry.pc.ontrack = null;
+        entry.pc.onicecandidate = null;
+        entry.pc.onnegotiationneeded = null;
+        entry.pc.close();
+      }
+    } catch (e) {}
+    try {
+      if (entry.audioEl) {
+        entry.audioEl.pause();
+        entry.audioEl.srcObject = null;
+        entry.audioEl.remove();
+      }
+    } catch (e) {}
+  });
+  groupPeers.clear();
+  groupGridRenderSignature = "";
+  const sink = document.getElementById("groupAudioSink");
+  if (sink) sink.innerHTML = "";
+}
+
 function forceResetCallUi() {
   stopCallDurationTicker();
+  cleanupGroupPeers();
+
   if (pc) {
     try {
       pc.ontrack = null;
@@ -1819,19 +2122,12 @@ function forceResetCallUi() {
     try { aud.pause(); } catch (e) {}
     aud.srcObject = null;
   }
-  const remVid = document.getElementById("remoteVideoEl");
-  if (remVid) {
-    try { remVid.pause(); } catch (e) {}
-    remVid.srcObject = null;
-    remVid.classList.add("cam-off");
-  }
-  const locVid = document.getElementById("localVideoEl");
-  if (locVid) {
-    try { locVid.pause(); } catch (e) {}
-    locVid.srcObject = null;
-  }
+  hardResetVideoElement(document.getElementById("remoteVideoEl"));
+  hardResetVideoElement(document.getElementById("localVideoEl"));
+  const locPip = document.getElementById("callLocalPip");
+  if (locPip) locPip.classList.add("hidden");
   const fallback = document.getElementById("callAvatarFallback");
-  if (fallback) fallback.classList.remove("hidden-cam");
+  if (fallback) fallback.classList.remove("hidden");
 
   micMuted = false;
   cameraEnabled = false;
@@ -1879,7 +2175,7 @@ async function ensureLocalAudioStream() {
 }
 
 async function flushRenegotiateIfReady() {
-  if (!pc || !callState) return;
+  if (!pc || !callState || callState.mode !== "direct") return;
   if (!needsRenegotiate || renegotiating) return;
   if (pc.signalingState !== "stable") return;
 
@@ -1907,34 +2203,71 @@ function scheduleRenegotiate() {
   flushRenegotiateIfReady();
 }
 
-function disableCameraLocallyAndSync() {
+function stopLocalVideoTracksCompletely() {
   if (localStream) {
     localStream.getVideoTracks().forEach(t => {
+      try { t.enabled = false; } catch (e) {}
       try { t.stop(); } catch (e) {}
       localStream.removeTrack(t);
     });
   }
-  const locVid = document.getElementById("localVideoEl");
-  if (locVid) {
-    try { locVid.pause(); } catch (e) {}
-    locVid.srcObject = null;
-  }
+  hardResetVideoElement(document.getElementById("localVideoEl"));
+  const locPip = document.getElementById("callLocalPip");
+  if (locPip) locPip.classList.add("hidden");
+}
+
+function stopRemoteVideoTracksCompletely() {
   if (remoteStream) {
     remoteStream.getVideoTracks().forEach(t => {
+      try { t.enabled = false; } catch (e) {}
       try { t.stop(); } catch (e) {}
       remoteStream.removeTrack(t);
     });
   }
-  if (pc) {
+  hardResetVideoElement(document.getElementById("remoteVideoEl"));
+  const fallback = document.getElementById("callAvatarFallback");
+  if (fallback) fallback.classList.remove("hidden");
+}
+
+function disableCameraLocallyAndSync() {
+  stopLocalVideoTracksCompletely();
+  stopRemoteVideoTracksCompletely();
+
+  if (callState && callState.mode === "group") {
+    groupPeers.forEach((entry) => {
+      const sender = entry.pc.getSenders().find(s => s.track && s.track.kind === "video");
+      if (sender) {
+        sender.replaceTrack(null).catch(() => {});
+      }
+      if (entry.videoTrack) {
+        try { entry.videoTrack.stop(); } catch (e) {}
+        entry.videoTrack = null;
+      }
+      if (entry.stream) {
+        entry.stream.getVideoTracks().forEach(t => entry.stream.removeTrack(t));
+      }
+    });
+    api("/api/group-call/media", {
+      groupId: callState.groupId,
+      user: me.username,
+      camOn: false
+    }).catch(() => {});
+  } else if (pc) {
     const sender = pc.getSenders().find(s => s.track && s.track.kind === "video");
     if (sender) {
       sender.replaceTrack(null).catch(() => {});
     }
     scheduleRenegotiate();
   }
+
   cameraEnabled = false;
   updateCamButtonUi();
-  syncRemoteMediaElements();
+  if (callState && callState.mode === "group") {
+    groupGridRenderSignature = "";
+    renderGroupCallGrid();
+  } else {
+    syncDirectMediaElements();
+  }
 }
 
 async function toggleCamera() {
@@ -1954,23 +2287,33 @@ async function toggleCamera() {
       const vTrack = camStream.getVideoTracks()[0];
       if (!vTrack || !callState) return;
 
+      stopLocalVideoTracksCompletely();
       if (!localStream) {
         localStream = new MediaStream([vTrack]);
       } else {
-        localStream.getVideoTracks().forEach(t => {
-          try { t.stop(); } catch (e) {}
-          localStream.removeTrack(t);
-        });
         localStream.addTrack(vTrack);
       }
 
-      const locVid = document.getElementById("localVideoEl");
-      if (locVid) {
-        locVid.srcObject = localStream;
-        locVid.play().catch(() => {});
-      }
-
-      if (pc) {
+      if (callState.mode === "group") {
+        for (const [peerNick, entry] of groupPeers.entries()) {
+          const sender = entry.pc.getSenders().find(s => s.track && s.track.kind === "video");
+          if (sender) {
+            await sender.replaceTrack(vTrack).catch(() => {});
+          } else {
+            entry.pc.addTrack(vTrack, localStream);
+          }
+          if (entry.pc.signalingState === "stable") {
+            const offer = await entry.pc.createOffer();
+            await entry.pc.setLocalDescription(offer);
+            await sendGroupSignal(callState.groupId, me.username, peerNick, "offer", entry.pc.localDescription);
+          }
+        }
+        await api("/api/group-call/media", {
+          groupId: callState.groupId,
+          user: me.username,
+          camOn: true
+        }).catch(() => {});
+      } else if (pc) {
         const videoTransceiver = pc.getTransceivers().find(tr => tr.receiver && tr.receiver.track && tr.receiver.track.kind === "video");
         if (videoTransceiver && videoTransceiver.sender) {
           videoTransceiver.direction = "sendrecv";
@@ -1988,7 +2331,12 @@ async function toggleCamera() {
 
       cameraEnabled = true;
       updateCamButtonUi();
-      syncRemoteMediaElements();
+      if (callState.mode === "group") {
+        groupGridRenderSignature = "";
+        renderGroupCallGrid();
+      } else {
+        syncDirectMediaElements();
+      }
     } catch (err) {
       alert("Не удалось включить камеру. Разреши доступ к камере и проверь HTTPS.");
     }
@@ -2028,8 +2376,8 @@ function attachTrackToRemoteStream(track) {
   if (!remoteStream) {
     remoteStream = new MediaStream();
   }
-  const sameKindTracks = remoteStream.getTracks().filter(t => t.kind === track.kind && t.id !== track.id);
-  sameKindTracks.forEach(t => remoteStream.removeTrack(t));
+  const sameKind = remoteStream.getTracks().filter(t => t.kind === track.kind && t.id !== track.id);
+  sameKind.forEach(t => remoteStream.removeTrack(t));
 
   if (!remoteStream.getTracks().some(t => t.id === track.id)) {
     remoteStream.addTrack(track);
@@ -2037,15 +2385,16 @@ function attachTrackToRemoteStream(track) {
   if (track.kind === "audio") {
     track.enabled = true;
   }
-  track.onunmute = () => syncRemoteMediaElements();
-  track.onmute = () => syncRemoteMediaElements();
-  track.onended = () => {
-    if (track.kind === "video" && remoteStream) {
-      remoteStream.removeTrack(track);
-    }
-    syncRemoteMediaElements();
+  track.onunmute = () => syncDirectMediaElements();
+  track.onmute = () => {
+    if (track.kind === "video") stopRemoteVideoTracksCompletely();
+    syncDirectMediaElements();
   };
-  syncRemoteMediaElements();
+  track.onended = () => {
+    if (track.kind === "video") stopRemoteVideoTracksCompletely();
+    syncDirectMediaElements();
+  };
+  syncDirectMediaElements();
 }
 
 function createPeerConnectionForCall(cid) {
@@ -2086,7 +2435,7 @@ function createPeerConnectionForCall(cid) {
     if (event.streams && event.streams[0]) {
       event.streams[0].getTracks().forEach(t => attachTrackToRemoteStream(t));
     }
-    syncRemoteMediaElements();
+    syncDirectMediaElements();
   };
 
   conn.onicecandidate = (event) => {
@@ -2108,7 +2457,7 @@ function createPeerConnectionForCall(cid) {
     if (st === "connected" || st === "completed") {
       callState.iceNote = "Связь установлена";
       setCallStatusNote("Связь установлена");
-      syncRemoteMediaElements();
+      syncDirectMediaElements();
     } else if (st === "checking") {
       callState.iceNote = "Установка соединения...";
       setCallStatusNote("Установка соединения...");
@@ -2118,6 +2467,213 @@ function createPeerConnectionForCall(cid) {
   };
 
   return conn;
+}
+
+/* Групповой звонок (Mesh WebRTC) */
+async function sendGroupSignal(groupId, fromUser, toUser, kind, payload) {
+  await api("/api/group-call/signal", {
+    groupId,
+    from: fromUser,
+    to: toUser,
+    kind,
+    payload
+  });
+}
+
+function ensureGroupPeer(peerNick, shouldCreateOffer) {
+  if (groupPeers.has(peerNick)) {
+    return groupPeers.get(peerNick);
+  }
+  const peerConn = new RTCPeerConnection(RTC_CONFIG);
+  const stream = new MediaStream();
+  const sink = document.getElementById("groupAudioSink");
+  const audioEl = document.createElement("audio");
+  audioEl.autoplay = true;
+  audioEl.playsInline = true;
+  audioEl.muted = false;
+  audioEl.volume = 1.0;
+  audioEl.srcObject = stream;
+  if (sink) sink.appendChild(audioEl);
+
+  const entry = {
+    pc: peerConn,
+    stream,
+    audioEl,
+    videoTrack: null,
+    pendingCands: [],
+    appliedCands: new Set(),
+    sentCands: new Set(),
+    makingOffer: false,
+    camOff: false
+  };
+  groupPeers.set(peerNick, entry);
+
+  if (localStream) {
+    localStream.getTracks().forEach(track => {
+      if (track.kind === "video" && !cameraEnabled) return;
+      if (track.kind === "audio") track.enabled = !micMuted;
+      peerConn.addTrack(track, localStream);
+    });
+  }
+
+  peerConn.ontrack = (event) => {
+    const tr = event.track;
+    if (!tr) return;
+    if (tr.kind === "audio") {
+      stream.getAudioTracks().filter(t => t.id !== tr.id).forEach(t => stream.removeTrack(t));
+      stream.addTrack(tr);
+      tr.enabled = true;
+      audioEl.srcObject = stream;
+      audioEl.play().catch(() => {});
+    } else if (tr.kind === "video") {
+      stream.getVideoTracks().filter(t => t.id !== tr.id).forEach(t => stream.removeTrack(t));
+      stream.addTrack(tr);
+      entry.videoTrack = tr;
+      entry.camOff = false;
+      tr.onended = () => {
+        entry.videoTrack = null;
+        entry.camOff = true;
+        groupGridRenderSignature = "";
+        renderGroupCallGrid();
+      };
+      groupGridRenderSignature = "";
+      renderGroupCallGrid();
+    }
+  };
+
+  peerConn.onicecandidate = (event) => {
+    if (!event.candidate || !callState || callState.mode !== "group") return;
+    const candJson = event.candidate.toJSON ? event.candidate.toJSON() : event.candidate;
+    const key = JSON.stringify(candJson);
+    if (entry.sentCands.has(key)) return;
+    entry.sentCands.add(key);
+    sendGroupSignal(callState.groupId, me.username, peerNick, "candidate", candJson).catch(() => {});
+  };
+
+  if (shouldCreateOffer) {
+    (async () => {
+      try {
+        entry.makingOffer = true;
+        const offer = await peerConn.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+        await peerConn.setLocalDescription(offer);
+        if (callState && callState.mode === "group") {
+          await sendGroupSignal(callState.groupId, me.username, peerNick, "offer", peerConn.localDescription);
+        }
+      } catch (e) {} finally {
+        entry.makingOffer = false;
+      }
+    })();
+  }
+
+  return entry;
+}
+
+async function handleGroupSignalItem(sigItem) {
+  if (!callState || callState.mode !== "group" || !sigItem) return;
+  const peerNick = sigItem.from;
+  if (!peerNick || peerNick === me.username) return;
+
+  const shouldOffer = me.username.localeCompare(peerNick) < 0;
+  const entry = ensureGroupPeer(peerNick, false);
+
+  if (sigItem.kind === "offer" && sigItem.payload) {
+    const offerDesc = new RTCSessionDescription(sigItem.payload);
+    const offerCollision = entry.makingOffer || entry.pc.signalingState !== "stable";
+    const polite = !shouldOffer;
+    if (offerCollision && !polite) {
+      return;
+    }
+    try {
+      await entry.pc.setRemoteDescription(offerDesc);
+      for (const c of entry.pendingCands) {
+        await entry.pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+      }
+      entry.pendingCands = [];
+      const ans = await entry.pc.createAnswer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+      await entry.pc.setLocalDescription(ans);
+      await sendGroupSignal(callState.groupId, me.username, peerNick, "answer", entry.pc.localDescription);
+    } catch (e) {}
+  } else if (sigItem.kind === "answer" && sigItem.payload) {
+    if (entry.pc.signalingState === "have-local-offer") {
+      try {
+        await entry.pc.setRemoteDescription(new RTCSessionDescription(sigItem.payload));
+        for (const c of entry.pendingCands) {
+          await entry.pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {});
+        }
+        entry.pendingCands = [];
+      } catch (e) {}
+    }
+  } else if (sigItem.kind === "candidate" && sigItem.payload) {
+    const key = JSON.stringify(sigItem.payload);
+    if (entry.appliedCands.has(key)) return;
+    entry.appliedCands.add(key);
+    if (entry.pc.remoteDescription) {
+      await entry.pc.addIceCandidate(new RTCIceCandidate(sigItem.payload)).catch(() => {});
+    } else {
+      entry.pendingCands.push(sigItem.payload);
+    }
+  }
+}
+
+async function startOrJoinGroupCall(groupId, groupTitle) {
+  if (!me || !groupId) return;
+  if (callState) return;
+  playSound("join");
+  requestPageFullscreen();
+  cameraEnabled = false;
+  micMuted = false;
+
+  try {
+    await ensureLocalAudioStream();
+  } catch (err) {
+    alert("Не удалось включить микрофон. Проверь разрешение микрофона и HTTPS.");
+    return;
+  }
+
+  const res = await api("/api/group-call/join", {
+    groupId,
+    user: me.username,
+    emoji: sanitizeAvatarEmoji(me.emoji),
+    camOn: false
+  });
+  if (!res.ok) {
+    forceResetCallUi();
+    alert(res.error || "Не удалось войти в групповой звонок");
+    return;
+  }
+
+  callState = {
+    mode: "group",
+    groupId,
+    groupTitle: groupTitle || activeChat?.username || "Группа",
+    status: "active",
+    connectedAt: res.startedAt ? Number(res.startedAt) : Date.now(),
+    participants: res.participants || []
+  };
+
+  showCallModalUi();
+  startCallDurationTicker();
+
+  (callState.participants || []).forEach(p => {
+    if (p.username && p.username !== me.username) {
+      const shouldOffer = me.username.localeCompare(p.username) < 0;
+      ensureGroupPeer(p.username, shouldOffer);
+    }
+  });
+}
+
+async function joinActiveGroupCall() {
+  if (!activeChat || activeChat.type !== "group") return;
+  await startOrJoinGroupCall(activeChat.id, activeChat.username);
+}
+
+async function startRoomCall() {
+  if (!me || !activeChat || callState) return;
+  if (activeChat.type === "group") {
+    await startOrJoinGroupCall(activeChat.id, activeChat.username);
+    return;
+  }
+  await startDirectCall();
 }
 
 async function startDirectCall() {
@@ -2146,6 +2702,7 @@ async function startDirectCall() {
 
   const cid = createRes.callId;
   callState = {
+    mode: "direct",
     callId: cid,
     peer,
     peerEmoji,
@@ -2171,7 +2728,7 @@ async function startDirectCall() {
 }
 
 async function acceptIncomingCall() {
-  if (!me || !callState || callState.isCaller) return;
+  if (!me || !callState || callState.mode !== "direct" || callState.isCaller) return;
   const cid = callState.callId;
   playSound("join");
   requestPageFullscreen();
@@ -2215,7 +2772,7 @@ async function acceptIncomingCall() {
   }
   showCallModalUi();
   startCallDurationTicker();
-  syncRemoteMediaElements();
+  syncDirectMediaElements();
 }
 
 function toggleMicMute() {
@@ -2232,6 +2789,13 @@ function toggleMicMute() {
       }
     });
   }
+  groupPeers.forEach(entry => {
+    entry.pc.getSenders().forEach(sender => {
+      if (sender.track && sender.track.kind === "audio") {
+        sender.track.enabled = !micMuted;
+      }
+    });
+  });
   playSound("click");
   const btn = document.getElementById("btnToggleMic");
   if (btn) {
@@ -2250,22 +2814,126 @@ function toggleMicMute() {
 async function hangupCall(notifyServer = true) {
   if (endingCallInProgress) return;
   endingCallInProgress = true;
-  const cid = callState ? callState.callId : "";
+
+  const snap = callState ? { ...callState } : null;
+  const durationStr = snap && snap.connectedAt ? formatCallDuration(getCurrentCallDurationSeconds()) : "00:00";
   const actorNick = me ? me.username : "";
+
   playSound("leave");
   forceResetCallUi();
+
   try {
-    if (notifyServer && cid && actorNick) {
-      await api("/api/call/end", { callId: cid, from: actorNick });
+    if (notifyServer && snap && actorNick) {
+      if (snap.mode === "group") {
+        await api("/api/group-call/leave", {
+          groupId: snap.groupId,
+          user: actorNick,
+          duration: durationStr,
+          wasConnected: Boolean(snap.connectedAt)
+        });
+        if (activeChat && activeChat.type === "group" && activeChat.id === snap.groupId) {
+          await refreshMessages(true);
+          await refreshChats();
+        }
+      } else if (snap.callId) {
+        await api("/api/call/end", {
+          callId: snap.callId,
+          from: actorNick,
+          duration: durationStr,
+          wasConnected: Boolean(snap.connectedAt)
+        });
+        if (activeChat && activeChat.type === "direct" && activeChat.username === snap.peer) {
+          await refreshMessages(true);
+          await refreshChats();
+        }
+      }
     }
   } catch (e) {} finally {
     endingCallInProgress = false;
   }
 }
 
+function updateGroupCallBannerUi() {
+  const banner = document.getElementById("groupCallBanner");
+  const txt = document.getElementById("groupCallBannerText");
+  if (!banner || !txt) return;
+
+  if (!activeChat || activeChat.type !== "group" || (callState && callState.mode === "group" && callState.groupId === activeChat.id)) {
+    banner.classList.add("hidden");
+    return;
+  }
+
+  if (activeGroupCallInfo && Array.isArray(activeGroupCallInfo.participants) && activeGroupCallInfo.participants.length > 0) {
+    const names = activeGroupCallInfo.participants.map(p => `@${p.username}`).join(", ");
+    txt.textContent = `📞 Идёт звонок (${names})`;
+    banner.classList.remove("hidden");
+  } else {
+    banner.classList.add("hidden");
+  }
+}
+
 async function pollCallStatus() {
   if (!me || endingCallInProgress) return;
-  const activeId = callState ? callState.callId : "";
+
+  // Опрос группового звонка, если находимся в группе или уже в групповом звонке
+  const watchGroupId = (callState && callState.mode === "group")
+    ? callState.groupId
+    : ((activeChat && activeChat.type === "group") ? activeChat.id : "");
+
+  if (watchGroupId) {
+    const gRes = await api(`/api/group-call/poll?groupId=${encodeURIComponent(watchGroupId)}&user=${encodeURIComponent(me.username)}`);
+    if (gRes && gRes.ok) {
+      activeGroupCallInfo = gRes.call || null;
+      updateGroupCallBannerUi();
+
+      if (callState && callState.mode === "group" && callState.groupId === watchGroupId) {
+        if (!gRes.call || !Array.isArray(gRes.call.participants) || gRes.call.participants.length === 0) {
+          playSound("leave");
+          forceResetCallUi();
+          return;
+        }
+        callState.participants = gRes.call.participants;
+        if (!callState.connectedAt && gRes.call.startedAt) {
+          callState.connectedAt = Number(gRes.call.startedAt);
+          startCallDurationTicker();
+        }
+
+        const activeNicks = new Set(callState.participants.map(p => p.username));
+        Array.from(groupPeers.keys()).forEach(peerNick => {
+          if (!activeNicks.has(peerNick)) {
+            const old = groupPeers.get(peerNick);
+            try { old.pc.close(); } catch (e) {}
+            try { old.audioEl.remove(); } catch (e) {}
+            groupPeers.delete(peerNick);
+          }
+        });
+
+        callState.participants.forEach(p => {
+          if (p.username && p.username !== me.username) {
+            const shouldOffer = me.username.localeCompare(p.username) < 0;
+            ensureGroupPeer(p.username, shouldOffer);
+          }
+        });
+
+        const signals = Array.isArray(gRes.signals) ? gRes.signals : [];
+        for (const sigItem of signals) {
+          await handleGroupSignalItem(sigItem);
+        }
+
+        showCallModalUi();
+      }
+    }
+  } else {
+    activeGroupCallInfo = null;
+    updateGroupCallBannerUi();
+  }
+
+  if (callState && callState.mode === "group") {
+    return;
+  }
+
+  // Опрос звонков 1-на-1
+  const activeId = (callState && callState.mode === "direct") ? callState.callId : "";
   const res = await api(`/api/call/poll?user=${encodeURIComponent(me.username)}&callId=${encodeURIComponent(activeId)}`);
   if (!res || !res.ok) return;
 
@@ -2302,6 +2970,7 @@ async function pollCallStatus() {
       const peerUser = c.caller;
       playSound("receive");
       callState = {
+        mode: "direct",
         callId: c.callId,
         peer: peerUser,
         peerEmoji: sanitizeAvatarEmoji(c.callerEmoji || "🙂"),
@@ -2331,12 +3000,8 @@ async function pollCallStatus() {
     const isNewOfferFromPeer = c.offerBy && c.offerBy !== me.username && offerJson !== callState.lastAppliedOfferJson;
     if (isNewOfferFromPeer) {
       const hasVideoInOffer = typeof c.offer.sdp === "string" && /m=video\s+\d+/.test(c.offer.sdp) && !/a=inactive/.test((c.offer.sdp.split("m=video")[1] || "").split("m=")[0] || "");
-      if (!hasVideoInOffer && remoteStream) {
-        remoteStream.getVideoTracks().forEach(t => {
-          try { t.stop(); } catch (e) {}
-          remoteStream.removeTrack(t);
-        });
-        syncRemoteMediaElements();
+      if (!hasVideoInOffer) {
+        stopRemoteVideoTracksCompletely();
       }
       if (pc && pc.signalingState === "stable") {
         try {
@@ -2352,7 +3017,7 @@ async function pollCallStatus() {
             from: me.username,
             answer: pc.localDescription
           });
-          syncRemoteMediaElements();
+          syncDirectMediaElements();
         } catch (e) {}
       } else if (!callState.isCaller && (!pc || !pc.remoteDescription)) {
         pendingOfferToApply = c.offer;
@@ -2368,7 +3033,7 @@ async function pollCallStatus() {
         callState.lastAppliedAnswerJson = remoteJson;
         await flushPendingCandidates();
         flushRenegotiateIfReady();
-        syncRemoteMediaElements();
+        syncDirectMediaElements();
       } catch (e) {}
     }
     if (callState.isCaller && callState.status !== "active") {
@@ -2379,7 +3044,7 @@ async function pollCallStatus() {
       playSound("join");
       showCallModalUi();
       startCallDurationTicker();
-      syncRemoteMediaElements();
+      syncDirectMediaElements();
     }
   }
 
@@ -2390,7 +3055,7 @@ async function pollCallStatus() {
     }
     showCallModalUi();
     startCallDurationTicker();
-    syncRemoteMediaElements();
+    syncDirectMediaElements();
   }
 
   const incomingCands = Array.isArray(c.candidates) ? c.candidates : [];
@@ -2402,7 +3067,7 @@ async function pollCallStatus() {
   flushRenegotiateIfReady();
 
   if (callState && callState.status === "active") {
-    syncRemoteMediaElements();
+    syncDirectMediaElements();
   }
 }
 
@@ -2672,7 +3337,7 @@ function isFullscreenNow() {
 async function toggleFullscreenByTap(e) {
   if (!e.target.closest) return;
   const interactive = e.target.closest(
-    "button, input, textarea, select, a, .chat-card, .member-pick, .group-member-row, .group-edit-card, .room-header-main, .m, .msg-img, .em-btn, .clip-btn, .attach-preview, .reply-bar, .msg-menu-card, .reaction-chip, .call-overlay, .top, .bottom-dock, .custom-box, .fab-create"
+    "button, input, textarea, select, a, .chat-card, .member-pick, .group-member-row, .group-edit-card, .room-header-main, .m, .msg-img, .em-btn, .clip-btn, .attach-preview, .reply-bar, .msg-menu-card, .reaction-chip, .call-overlay, .top, .bottom-dock, .custom-box, .fab-create, .group-call-banner"
   );
   if (interactive) return;
 
@@ -2752,6 +3417,7 @@ async function doAuth() {
 
 function enterChats() {
   activeChat = null;
+  activeGroupCallInfo = null;
   currentGroupOwner = "";
   replyTarget = null;
   roomHistoryInitialized = false;
@@ -2767,11 +3433,13 @@ function enterChats() {
 function backToChats() {
   playSound("click");
   activeChat = null;
+  activeGroupCallInfo = null;
   currentGroupOwner = "";
   replyTarget = null;
   roomHistoryInitialized = false;
   clearAttachment();
   lastRenderedMsgsJson = "";
+  updateGroupCallBannerUi();
   showScreen("chatsScreen");
   refreshChats();
 }
@@ -3536,6 +4204,7 @@ async function openDirectChat(username, emoji, isOwner = false) {
   playSound("click");
   const cleanAva = sanitizeAvatarEmoji(emoji);
   activeChat = { type: "direct", id: username, username, emoji: cleanAva, isOwner, tripleBadge: false };
+  activeGroupCallInfo = null;
   currentGroupOwner = "";
   replyTarget = null;
   roomHistoryInitialized = false;
@@ -3544,9 +4213,10 @@ async function openDirectChat(username, emoji, isOwner = false) {
   clearAttachment();
   lastRenderedMsgsJson = "";
   syncRoomComposerLock(false);
+  updateGroupCallBannerUi();
   const headerMain = document.getElementById("roomHeaderMain");
   if (headerMain) headerMain.classList.add("clickable-header");
-  const callBtn = document.getElementById("btnCallDirect");
+  const callBtn = document.getElementById("btnCallRoom");
   if (callBtn) callBtn.classList.remove("hidden");
   document.getElementById("peerAva").textContent = cleanAva;
   document.getElementById("peerNick").innerHTML = nickLabelHtml(username, isOwner);
@@ -3564,6 +4234,7 @@ async function openGroupChat(groupId, title, emoji, tripleBadge = false) {
   const badgeFlag = Boolean(tripleBadge) || isTripleBadgeGroupTitle(title);
   const gAva = sanitizeAvatarEmoji(emoji || "🦜");
   activeChat = { type: "group", id: groupId, username: title, emoji: gAva, isOwner: false, tripleBadge: badgeFlag };
+  activeGroupCallInfo = null;
   currentGroupOwner = "";
   replyTarget = null;
   roomHistoryInitialized = false;
@@ -3572,10 +4243,11 @@ async function openGroupChat(groupId, title, emoji, tripleBadge = false) {
   clearAttachment();
   lastRenderedMsgsJson = "";
   syncRoomComposerLock(false);
+  updateGroupCallBannerUi();
   const headerMain = document.getElementById("roomHeaderMain");
   if (headerMain) headerMain.classList.add("clickable-header");
-  const callBtn = document.getElementById("btnCallDirect");
-  if (callBtn) callBtn.classList.add("hidden");
+  const callBtn = document.getElementById("btnCallRoom");
+  if (callBtn) callBtn.classList.remove("hidden");
   document.getElementById("peerAva").textContent = gAva;
   document.getElementById("peerNick").innerHTML = groupTitleHtml(title, badgeFlag);
   document.getElementById("peerStatus").textContent = "";
@@ -3585,6 +4257,7 @@ async function openGroupChat(groupId, title, emoji, tripleBadge = false) {
   showScreen("roomScreen");
   await refreshMessages(true);
   await refreshChats();
+  await pollCallStatus();
 }
 
 function formatTextWithEmojis(rawText) {
@@ -4094,6 +4767,7 @@ def call_start():
         "updatedAt": now,
         "connectedAt": None,
         "endedBy": "",
+        "summarySent": False,
     }
     return jsonify({"ok": True, "callId": cid})
 
@@ -4154,13 +4828,27 @@ def call_end():
     d = request.get_json(force=True) or {}
     cid = (d.get("callId") or "").strip()
     from_u = (d.get("from") or "").strip()
+    client_dur = (d.get("duration") or "").strip()
+    was_connected = bool(d.get("wasConnected"))
     now = int(time.time() * 1000)
+
     if cid and cid in ACTIVE_CALLS:
         c = ACTIVE_CALLS[cid]
         if not from_u or from_u in (c.get("caller"), c.get("callee")):
+            already_ended = c.get("status") == "ended"
             c["status"] = "ended"
             c["endedBy"] = from_u
             c["updatedAt"] = now
+
+            if not already_ended and not c.get("summarySent") and from_u and (was_connected or c.get("connectedAt")):
+                c["summarySent"] = True
+                if c.get("connectedAt"):
+                    sec = max(0, (now - int(c["connectedAt"])) // 1000)
+                    dur_text = format_duration_mmss(sec)
+                else:
+                    dur_text = client_dur or "00:00"
+                peer = c["callee"] if from_u == c["caller"] else c["caller"]
+                append_direct_message(from_u, peer, f"Звонок окончен, длился {dur_text}")
     elif from_u:
         end_user_calls(from_u, now)
     return jsonify({"ok": True})
@@ -4186,6 +4874,155 @@ def call_poll():
             return jsonify({"ok": True, "call": c})
 
     return jsonify({"ok": True, "call": None})
+
+
+@app.post("/api/group-call/join")
+def group_call_join():
+    cleanup_stale_calls()
+    d = request.get_json(force=True) or {}
+    gid = (d.get("groupId") or "").strip()
+    user = (d.get("user") or "").strip()
+    cam_on = bool(d.get("camOn"))
+
+    g = get_group_by_id(gid)
+    if not g or user not in (g.get("members") or []):
+        return jsonify({"ok": False, "error": "Вы не состоите в этой группе."})
+
+    u_row = get_user(user) or {}
+    emoji = sanitize_user_emoji(d.get("emoji") or u_row.get("emoji"))
+    now = int(time.time() * 1000)
+
+    gc = GROUP_CALLS.get(gid)
+    if not gc:
+        gc = {
+            "groupId": gid,
+            "startedAt": now,
+            "updatedAt": now,
+            "participants": {},
+            "signals": [],
+            "summarySent": False,
+        }
+        GROUP_CALLS[gid] = gc
+
+    gc["participants"][user] = {
+        "username": user,
+        "emoji": emoji,
+        "camOn": cam_on,
+        "updatedAt": now,
+    }
+    gc["updatedAt"] = now
+
+    part_list = list(gc["participants"].values())
+    return jsonify({
+        "ok": True,
+        "startedAt": gc["startedAt"],
+        "participants": part_list,
+    })
+
+
+@app.post("/api/group-call/media")
+def group_call_media():
+    cleanup_stale_calls()
+    d = request.get_json(force=True) or {}
+    gid = (d.get("groupId") or "").strip()
+    user = (d.get("user") or "").strip()
+    cam_on = bool(d.get("camOn"))
+    gc = GROUP_CALLS.get(gid)
+    if not gc or user not in gc.get("participants", {}):
+        return jsonify({"ok": False})
+    now = int(time.time() * 1000)
+    gc["participants"][user]["camOn"] = cam_on
+    gc["participants"][user]["updatedAt"] = now
+    gc["updatedAt"] = now
+    return jsonify({"ok": True})
+
+
+@app.post("/api/group-call/signal")
+def group_call_signal():
+    cleanup_stale_calls()
+    d = request.get_json(force=True) or {}
+    gid = (d.get("groupId") or "").strip()
+    from_u = (d.get("from") or "").strip()
+    to_u = (d.get("to") or "").strip()
+    kind = (d.get("kind") or "").strip()
+    payload = d.get("payload")
+    gc = GROUP_CALLS.get(gid)
+    if not gc or not from_u or not to_u or not kind:
+        return jsonify({"ok": False})
+    gc.setdefault("signals", []).append({
+        "id": uuid.uuid4().hex[:10],
+        "from": from_u,
+        "to": to_u,
+        "kind": kind,
+        "payload": payload,
+    })
+    if len(gc["signals"]) > 300:
+        gc["signals"] = gc["signals"][-300:]
+    gc["updatedAt"] = int(time.time() * 1000)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/group-call/leave")
+def group_call_leave():
+    d = request.get_json(force=True) or {}
+    gid = (d.get("groupId") or "").strip()
+    user = (d.get("user") or "").strip()
+    client_dur = (d.get("duration") or "").strip()
+    was_connected = bool(d.get("wasConnected"))
+    now = int(time.time() * 1000)
+
+    gc = GROUP_CALLS.get(gid)
+    if not gc:
+        return jsonify({"ok": True})
+
+    gc.get("participants", {}).pop(user, None)
+    gc["updatedAt"] = now
+
+    if not gc.get("participants"):
+        if not gc.get("summarySent") and user and (was_connected or gc.get("startedAt")):
+            gc["summarySent"] = True
+            if gc.get("startedAt"):
+                sec = max(0, (now - int(gc["startedAt"])) // 1000)
+                dur_text = format_duration_mmss(sec)
+            else:
+                dur_text = client_dur or "00:00"
+            append_group_user_message(gid, user, f"Звонок окончен, длился {dur_text}")
+        GROUP_CALLS.pop(gid, None)
+
+    return jsonify({"ok": True})
+
+
+@app.get("/api/group-call/poll")
+def group_call_poll():
+    cleanup_stale_calls()
+    gid = (request.args.get("groupId") or "").strip()
+    user = (request.args.get("user") or "").strip()
+    if not gid or not user:
+        return jsonify({"ok": False})
+
+    gc = GROUP_CALLS.get(gid)
+    if not gc or not gc.get("participants"):
+        return jsonify({"ok": True, "call": None, "signals": []})
+
+    my_signals = []
+    remaining_signals = []
+    for s in gc.get("signals") or []:
+        if s.get("to") == user:
+            my_signals.append(s)
+        else:
+            remaining_signals.append(s)
+    gc["signals"] = remaining_signals
+
+    part_list = list((gc.get("participants") or {}).values())
+    return jsonify({
+        "ok": True,
+        "call": {
+            "groupId": gid,
+            "startedAt": gc.get("startedAt"),
+            "participants": part_list,
+        },
+        "signals": my_signals,
+    })
 
 
 @app.post("/api/typing")
