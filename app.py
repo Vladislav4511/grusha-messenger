@@ -19,6 +19,7 @@ USE_PG = bool(DATABASE_URL and psycopg2 is not None)
 
 SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
 TYPING_TTL_MS = 4500
+CALL_TTL_MS = 45_000
 OWNER_NICK = "владислав"
 TRIPLE_BADGE_GROUP_TITLE = "ырка сквад"
 MAX_IMAGE_LEN = 1_500_000
@@ -26,12 +27,15 @@ DEFAULT_GROUP_ICON = "🦜"
 DEFAULT_USER_EMOJI = "🍐"
 
 TYPING_STATUS = {}
+ACTIVE_CALLS = {}  # call_id -> dict
 
 
 def sanitize_user_emoji(em):
     val = (em or "").strip()
-    if not val or val == "👑":
-        return "💩" if val == "👑" else DEFAULT_USER_EMOJI
+    if not val:
+        return DEFAULT_USER_EMOJI
+    if val in ("👑", "💩"):
+        return "🙂"
     return val
 
 
@@ -52,7 +56,8 @@ def init_db():
                         last_nick_change_at BIGINT NOT NULL
                     )
                 """)
-                cur.execute("UPDATE users SET emoji = '💩' WHERE emoji = '👑'")
+                cur.execute("UPDATE users SET emoji = '🙂' WHERE emoji IN ('👑', '💩')")
+                cur.execute("UPDATE groups SET emoji = '🙂' WHERE emoji IN ('👑', '💩')")
 
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS messages (
@@ -103,9 +108,13 @@ def init_db():
         else:
             db = load_json_db()
             changed = False
-            for u_name, u_obj in db.get("users", {}).items():
-                if isinstance(u_obj, dict) and u_obj.get("emoji") == "👑":
-                    u_obj["emoji"] = "💩"
+            for _, u_obj in db.get("users", {}).items():
+                if isinstance(u_obj, dict) and u_obj.get("emoji") in ("👑", "💩"):
+                    u_obj["emoji"] = "🙂"
+                    changed = True
+            for _, g_obj in db.get("groups", {}).items():
+                if isinstance(g_obj, dict) and g_obj.get("emoji") in ("👑", "💩"):
+                    g_obj["emoji"] = "🙂"
                     changed = True
             if changed:
                 save_json_db(db)
@@ -151,8 +160,8 @@ def normalize_group_emoji(em):
     val = (em or "").strip()
     if not val or val == "👥":
         return DEFAULT_GROUP_ICON
-    if val == "👑":
-        return "💩"
+    if val in ("👑", "💩"):
+        return "🙂"
     return val
 
 
@@ -169,6 +178,19 @@ def get_group_typing_users(group_id, exclude_nick):
         if room_id == target and sender != exclude_nick and (now - ts) <= TYPING_TTL_MS:
             active.append(sender)
     return active
+
+
+def cleanup_stale_calls():
+    now = int(time.time() * 1000)
+    expired = []
+    for cid, call in ACTIVE_CALLS.items():
+        updated = int(call.get("updatedAt") or call.get("createdAt") or now)
+        if call.get("status") == "ended" and (now - updated) > 8000:
+            expired.append(cid)
+        elif (now - updated) > CALL_TTL_MS:
+            expired.append(cid)
+    for cid in expired:
+        ACTIVE_CALLS.pop(cid, None)
 
 
 def format_user(row):
@@ -192,14 +214,14 @@ def get_user(username):
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT * FROM users WHERE username = %s", (username,))
                 row = cur.fetchone()
-                if row and row.get("emoji") == "👑":
-                    cur.execute("UPDATE users SET emoji = '💩' WHERE username = %s", (username,))
-                    row["emoji"] = "💩"
+                if row and row.get("emoji") in ("👑", "💩"):
+                    cur.execute("UPDATE users SET emoji = '🙂' WHERE username = %s", (username,))
+                    row["emoji"] = "🙂"
                 return row
     db = load_json_db()
     u = db["users"].get(username)
-    if u and u.get("emoji") == "👑":
-        u["emoji"] = "💩"
+    if u and u.get("emoji") in ("👑", "💩"):
+        u["emoji"] = "🙂"
         save_json_db(db)
     return u
 
@@ -259,7 +281,7 @@ def normalize_reactions(raw):
     return out
 
 
-def append_group_system_message(gid, text):
+def append_group_system_message(gid, text, event_kind=""):
     ts = int(time.time() * 1000)
     if USE_PG:
         with get_pg_conn() as conn:
@@ -270,13 +292,16 @@ def append_group_system_message(gid, text):
                 )
         return
     db = load_json_db()
-    db["group_msgs"].setdefault(gid, []).append({
+    item = {
         "id": f"g_{uuid.uuid4().hex[:10]}",
         "from": "system",
         "text": text,
         "ts": ts,
         "reactions": {},
-    })
+    }
+    if event_kind:
+        item["eventKind"] = event_kind
+    db["group_msgs"].setdefault(gid, []).append(item)
     save_json_db(db)
 
 
@@ -344,13 +369,22 @@ def is_group_title_taken(title, exclude_group_id=None):
 
 
 def format_message_record(msg_id, sender, text, image, ts, reply_to_raw=None, reactions_raw=None):
+    txt_val = text or ""
+    event_kind = ""
+    if sender == "system":
+        if txt_val.endswith("зашел"):
+            event_kind = "join"
+        elif txt_val.endswith("вышел"):
+            event_kind = "leave"
     item = {
         "id": msg_id,
         "from": sender,
-        "text": text or "",
+        "text": txt_val,
         "ts": int(ts or 0),
         "reactions": normalize_reactions(reactions_raw),
     }
+    if event_kind:
+        item["eventKind"] = event_kind
     if image:
         item["image"] = image
     rep = sanitize_reply_to(reply_to_raw)
@@ -373,6 +407,9 @@ HTML_PAGE = """<!DOCTYPE html>
     --app-top: 0px;
     --app-height: 100dvh;
     --kb-lift: 0px;
+    --accent: #9be15d;
+    --accent-contrast: #101511;
+    --accent-soft: rgba(155, 225, 93, 0.18);
   }
   * { box-sizing: border-box; }
   html, body {
@@ -437,18 +474,18 @@ HTML_PAGE = """<!DOCTYPE html>
     font-family: inherit;
     outline: none;
   }
-  input:focus, textarea:focus { border-color: #9be15d; }
+  input:focus, textarea:focus { border-color: var(--accent); }
   input[type="range"] {
     width: 100%;
-    accent-color: #9be15d;
+    accent-color: var(--accent);
     cursor: pointer;
   }
   button {
     padding: 10px 14px;
     border-radius: 10px;
     border: none;
-    background: #9be15d;
-    color: #101511;
+    background: var(--accent);
+    color: var(--accent-contrast);
     font-weight: 700;
     font-size: 14px;
     cursor: pointer;
@@ -462,11 +499,11 @@ HTML_PAGE = """<!DOCTYPE html>
   .mt-8 { margin-top: 8px; }
   .mt-12 { margin-top: 12px; }
   .err { color: #ff7b7b; font-size: 13px; margin-top: 8px; min-height: 18px; }
-  .ok { color: #9be15d; font-size: 13px; margin-top: 8px; }
+  .ok { color: var(--accent); font-size: 13px; margin-top: 8px; }
   .muted { color: #96a598; font-size: 13px; }
   .typing-line {
     font-size: 12px;
-    color: #9be15d;
+    color: var(--accent);
     min-height: 16px;
     line-height: 1.2;
   }
@@ -496,7 +533,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .chat-info { min-width: 0; flex: 1; }
   .chat-name { font-weight: 700; font-size: 15px; display: inline-flex; align-items: center; gap: 5px; }
   .chat-last { color: #9aa89c; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
-  .chat-last.typing-active { color: #9be15d; font-weight: 600; }
+  .chat-last.typing-active { color: var(--accent); font-weight: 600; }
   .verified-badge {
     display: inline-flex;
     align-items: center;
@@ -518,7 +555,6 @@ HTML_PAGE = """<!DOCTYPE html>
     flex-shrink: 0;
   }
 
-  /* Плавающий голубой кружок с карандашом */
   .fab-create {
     position: fixed;
     right: max(18px, calc(50% - 220px));
@@ -541,7 +577,6 @@ HTML_PAGE = """<!DOCTYPE html>
     pointer-events: none;
   }
 
-  /* Выбор участников для группы */
   .member-pick {
     display: flex;
     align-items: center;
@@ -554,18 +589,17 @@ HTML_PAGE = """<!DOCTYPE html>
     border: 1px solid transparent;
   }
   .member-pick.selected {
-    border-color: #2da9ff;
-    background: #1c2b36;
+    border-color: var(--accent);
+    background: var(--accent-soft);
   }
   .member-pick input[type="checkbox"] {
     width: 18px;
     height: 18px;
-    accent-color: #2da9ff;
+    accent-color: var(--accent);
     cursor: pointer;
     flex-shrink: 0;
   }
 
-  /* Настройки группы */
   .group-edit-card {
     padding: 14px;
     border-radius: 14px;
@@ -714,7 +748,7 @@ HTML_PAGE = """<!DOCTYPE html>
     -webkit-user-select: none;
     -webkit-touch-callout: none;
   }
-  .me { align-self: flex-end; background: #9be15d; color: #101511; font-weight: 500; }
+  .me { align-self: flex-end; background: var(--accent); color: var(--accent-contrast); font-weight: 500; }
   .them { align-self: flex-start; background: #243026; color: #f3f7f3; }
   .msg-img {
     display: block;
@@ -762,7 +796,6 @@ HTML_PAGE = """<!DOCTYPE html>
     color: #ffffff;
   }
 
-  /* Меню долгого нажатия на сообщение */
   .msg-menu-backdrop {
     position: fixed;
     inset: 0;
@@ -808,6 +841,66 @@ HTML_PAGE = """<!DOCTYPE html>
     border-radius: 10px;
   }
 
+  /* Окно звонка */
+  .call-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(12, 17, 13, 0.94);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    z-index: 80;
+  }
+  .call-card {
+    width: 100%;
+    max-width: 360px;
+    background: #1e2820;
+    border: 1px solid #314133;
+    border-radius: 20px;
+    padding: 22px 18px;
+    text-align: center;
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.65);
+  }
+  .call-timer-pill {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--accent);
+    font-weight: 800;
+    font-size: 15px;
+    letter-spacing: 0.5px;
+    margin-bottom: 14px;
+  }
+  .call-peer-ava {
+    width: 74px;
+    height: 74px;
+    border-radius: 50%;
+    background: #131914;
+    display: grid;
+    place-items: center;
+    font-size: 38px;
+    margin: 0 auto 10px;
+  }
+  .call-peer-name {
+    font-size: 19px;
+    font-weight: 800;
+  }
+  .call-status-text {
+    font-size: 13px;
+    color: #aab9ac;
+    margin-top: 6px;
+    min-height: 20px;
+  }
+  .call-actions-row {
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+    margin-top: 20px;
+    flex-wrap: wrap;
+  }
+
   .reply-bar {
     display: flex;
     align-items: center;
@@ -821,12 +914,12 @@ HTML_PAGE = """<!DOCTYPE html>
   .reply-bar-info {
     min-width: 0;
     flex: 1;
-    border-left: 3px solid #2da9ff;
+    border-left: 3px solid var(--accent);
     padding-left: 8px;
   }
   .reply-bar-title {
     font-weight: 700;
-    color: #5bc0ff;
+    color: var(--accent);
   }
   .reply-bar-text {
     color: #c2d0c3;
@@ -913,6 +1006,35 @@ HTML_PAGE = """<!DOCTYPE html>
     border-radius: 14px;
     background: #202a21;
     border: 1px solid #2d3b2f;
+  }
+  .theme-swatches {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .theme-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 9px 11px;
+    border-radius: 10px;
+    background: #161d17;
+    color: #eef5ee;
+    border: 1px solid #2e3d30;
+    font-size: 13px;
+    font-weight: 700;
+  }
+  .theme-btn.active-theme {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .swatch-dot {
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    flex-shrink: 0;
   }
   .slider-row { margin-top: 12px; }
   .slider-head {
@@ -1017,7 +1139,10 @@ HTML_PAGE = """<!DOCTYPE html>
           <div class="typing-line" id="peerStatus"></div>
         </div>
       </div>
-      <button type="button" id="btnDeleteDirectChat" class="mini-btn del hidden" title="Удалить чат" onclick="deleteDirectChat()">Удалить чат</button>
+      <div class="top-actions">
+        <button type="button" id="btnCallDirect" class="mini-btn blue-btn hidden" title="Позвонить" onclick="startDirectCall()">📞</button>
+        <button type="button" id="btnDeleteDirectChat" class="mini-btn del hidden" title="Удалить чат" onclick="deleteDirectChat()">Удалить</button>
+      </div>
     </div>
     <div id="msgsBox" class="msgs"></div>
     <div class="bottom-dock" id="bottomDock">
@@ -1065,6 +1190,24 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div id="callOverlay" class="call-overlay hidden">
+    <div class="call-card">
+      <div class="call-timer-pill" id="callTimerLabel">00:00</div>
+      <div class="call-peer-ava" id="callPeerAva">🙂</div>
+      <div class="call-peer-name" id="callPeerName">@peer</div>
+      <div class="call-status-text" id="callStatusText">Вызов...</div>
+      <div class="call-actions-row" id="callIncomingControls">
+        <button type="button" class="blue-btn" onclick="acceptIncomingCall()">Принять</button>
+        <button type="button" class="del" onclick="hangupCall(true)">Отклонить</button>
+      </div>
+      <div class="call-actions-row hidden" id="callActiveControls">
+        <button type="button" id="btnToggleMic" class="sec" onclick="toggleMicMute()">🎤 Микрофон вкл</button>
+        <button type="button" class="del" onclick="hangupCall(true)">Выйти</button>
+      </div>
+      <audio id="remoteAudioEl" autoplay playsinline></audio>
+    </div>
+  </div>
+
   <div id="settingsScreen" class="hidden" style="flex:1; display:flex; flex-direction:column; min-height:0;">
     <div class="top">
       <button class="sec" onclick="backToChats()">← Назад</button>
@@ -1088,7 +1231,23 @@ HTML_PAGE = """<!DOCTYPE html>
 
       <div class="custom-box" id="customizationTab">
         <div style="font-weight:800; font-size:15px;">🎨 Кастомизация</div>
-        <div class="muted mt-8">Настрой размер элементов под себя</div>
+        <div class="muted mt-8">Настрой цвет сайта и размер элементов</div>
+
+        <div class="mt-12" style="font-size:13px; font-weight:700;">Цвет сайта</div>
+        <div class="theme-swatches" id="themePicker">
+          <button type="button" class="theme-btn" data-theme="green" onclick="setSiteTheme('green')">
+            <span class="swatch-dot" style="background:#9be15d;"></span>Зелёный
+          </button>
+          <button type="button" class="theme-btn" data-theme="red" onclick="setSiteTheme('red')">
+            <span class="swatch-dot" style="background:#ff5c5c;"></span>Красный
+          </button>
+          <button type="button" class="theme-btn" data-theme="yellow" onclick="setSiteTheme('yellow')">
+            <span class="swatch-dot" style="background:#ffd43b;"></span>Жёлтый
+          </button>
+          <button type="button" class="theme-btn" data-theme="blue" onclick="setSiteTheme('blue')">
+            <span class="swatch-dot" style="background:#38a9ff;"></span>Синий
+          </button>
+        </div>
 
         <div class="slider-row">
           <div class="slider-head">
@@ -1127,23 +1286,38 @@ const AVATAR_EMOJIS = [
   "🍐", "😎", "🐱", "🐸", "🔥", "👾",
   "⚡", "🍕", "🦊", "🐼", "🤖", "👻",
   "🦄", "🐉", "🌙", "⭐", "💎", "🎮",
-  "🎧", "🚀", "🌵", "🍀", "🍓", "💩",
+  "🎧", "🚀", "🌵", "🍀", "🍓", "🙂",
   "🐄", "🐗", "🔶"
 ];
 
 const GROUP_ICONS = [
   "🦜", "🍐", "🔥", "⚡", "🎮", "🚀",
-  "🍕", "💩", "💎", "🐗", "🐄", "🔶"
+  "🍕", "🙂", "💎", "🐗", "🐄", "🔶"
 ];
 
 const REACTION_EMOJIS = [
-  "😀", "😂", "❤️", "🔥", "👍", "🍐", "🎉", "😭"
+  "😀", "😂", "❤️", "🔥", "👍", "🍐", "🎉", "😭", "💩", "🤣"
 ];
+
+const SITE_THEMES = {
+  green:  { accent: "#9be15d", contrast: "#101511", soft: "rgba(155, 225, 93, 0.18)" },
+  red:    { accent: "#ff5c5c", contrast: "#ffffff", soft: "rgba(255, 92, 92, 0.18)" },
+  yellow: { accent: "#ffd43b", contrast: "#141208", soft: "rgba(255, 212, 59, 0.18)" },
+  blue:   { accent: "#38a9ff", contrast: "#091521", soft: "rgba(56, 169, 255, 0.18)" }
+};
 
 const DEFAULT_CUSTOM = {
   msgSize: 15,
   emojiSize: 24,
-  photoSize: 240
+  photoSize: 240,
+  theme: "green"
+};
+
+const RTC_CONFIG = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" }
+  ]
 };
 
 const EMOJI_ONLY_RE = /^(?:[\p{Emoji_Presentation}\p{Extended_Pictographic}]\uFE0F?(?:\u200D[\p{Emoji_Presentation}\p{Extended_Pictographic}]\uFE0F?)*|\s)+$/u;
@@ -1151,9 +1325,9 @@ const SINGLE_EMOJI_RE = /([\p{Emoji_Presentation}\p{Extended_Pictographic}]\uFE0
 
 let me = null;
 let authTab = "login";
-let activeChat = null; // { type: 'direct' | 'group', id, username, emoji, isOwner, tripleBadge }
+let activeChat = null;
 let pendingImageData = "";
-let replyTarget = null; // { from, text, hasImage }
+let replyTarget = null;
 let currentRoomMsgs = [];
 let selectedMsgForAction = null;
 let suppressNextBubbleClick = false;
@@ -1165,6 +1339,9 @@ let lastTypingPingTs = 0;
 let pollTimer = null;
 let fabPulseTimer = null;
 let lastChatsScrollTop = 0;
+let seenGroupMsgIds = new Set();
+let seenDirectMsgIds = new Set();
+let roomHistoryInitialized = false;
 
 let selectedGroupEmoji = "🦜";
 let selectedGroupMembers = new Set();
@@ -1173,11 +1350,91 @@ let inviteGroupMembers = new Set();
 
 let composerFocused = false;
 let baselineViewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+let audioCtx = null;
+
+/* Состояние голосового звонка 1 на 1 */
+let callState = null; // { callId, peer, peerEmoji, isCaller, status, connectedAt }
+let pc = null;
+let localStream = null;
+let micMuted = false;
+let callTimerInterval = null;
+let pendingOfferToApply = null;
+let sentCandidateKeys = new Set();
+let appliedCandidateKeys = new Set();
+let answerSent = false;
+
+function getAudioContext() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    if (!audioCtx) audioCtx = new Ctx();
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => {});
+    }
+    return audioCtx;
+  } catch (e) {
+    return null;
+  }
+}
+
+function playTone(freq, duration = 0.09, type = "sine", delay = 0, gainPeak = 0.11, endFreq = null) {
+  const ctx = getAudioContext();
+  if (!ctx) return;
+  try {
+    const start = ctx.currentTime + delay;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, start);
+    if (endFreq !== null) {
+      osc.frequency.exponentialRampToValueAtTime(Math.max(40, endFreq), start + duration);
+    }
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.linearRampToValueAtTime(gainPeak, start + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(start);
+    osc.stop(start + duration + 0.02);
+  } catch (e) {}
+}
+
+function playSound(kind) {
+  switch (kind) {
+    case "send":
+      playTone(540, 0.075, "triangle", 0, 0.11, 780);
+      break;
+    case "receive":
+      playTone(620, 0.08, "sine", 0, 0.11, 820);
+      playTone(840, 0.1, "sine", 0.08, 0.11, 1020);
+      break;
+    case "react":
+      playTone(700, 0.06, "sine", 0, 0.1, 980);
+      break;
+    case "join":
+      playTone(440, 0.08, "triangle", 0, 0.11, 587);
+      playTone(659, 0.11, "triangle", 0.08, 0.11, 880);
+      break;
+    case "leave":
+      playTone(620, 0.09, "triangle", 0, 0.11, 440);
+      playTone(420, 0.12, "sine", 0.08, 0.1, 310);
+      break;
+    case "click":
+      playTone(480, 0.035, "sine", 0, 0.05, 560);
+      break;
+    default:
+      break;
+  }
+}
+
+document.addEventListener("pointerdown", () => {
+  getAudioContext();
+}, { passive: true });
 
 function sanitizeAvatarEmoji(em) {
   const s = String(em || "").trim();
   if (!s) return "🍐";
-  if (s === "👑") return "💩";
+  if (s === "👑" || s === "💩") return "🙂";
   return s;
 }
 
@@ -1193,6 +1450,332 @@ function groupTitleHtml(title, tripleBadge = false) {
   const showTriple = Boolean(tripleBadge) || isTripleBadgeGroupTitle(title);
   if (!showTriple) return esc(title);
   return `${esc(title)} <span class="triple-badges" title="Подтверждённая группа"><span class="verified-badge">✓</span><span class="verified-badge">✓</span><span class="verified-badge">✓</span></span>`;
+}
+
+function formatCallDuration(sec) {
+  const s = Math.max(0, Math.floor(sec));
+  const mins = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${String(mins).padStart(2, "0")}:${String(rem).padStart(2, "0")}`;
+}
+
+function startCallDurationTicker() {
+  stopCallDurationTicker();
+  updateCallDurationLabel();
+  callTimerInterval = setInterval(updateCallDurationLabel, 1000);
+}
+
+function stopCallDurationTicker() {
+  if (callTimerInterval) {
+    clearInterval(callTimerInterval);
+    callTimerInterval = null;
+  }
+}
+
+function updateCallDurationLabel() {
+  const el = document.getElementById("callTimerLabel");
+  if (!el) return;
+  if (!callState || !callState.connectedAt) {
+    el.textContent = "00:00";
+    return;
+  }
+  const elapsedSec = Math.floor((Date.now() - callState.connectedAt) / 1000);
+  el.textContent = formatCallDuration(elapsedSec);
+}
+
+function showCallModalUi() {
+  const overlay = document.getElementById("callOverlay");
+  if (!overlay || !callState) return;
+  overlay.classList.remove("hidden");
+  document.getElementById("callPeerAva").textContent = sanitizeAvatarEmoji(callState.peerEmoji || "🙂");
+  document.getElementById("callPeerName").textContent = `@${callState.peer}`;
+
+  const incBox = document.getElementById("callIncomingControls");
+  const actBox = document.getElementById("callActiveControls");
+  const statusEl = document.getElementById("callStatusText");
+
+  if (callState.status === "ringing" && !callState.isCaller) {
+    incBox.classList.remove("hidden");
+    actBox.classList.add("hidden");
+    statusEl.textContent = `Входящий звонок от @${callState.peer}`;
+  } else if (callState.status === "ringing" && callState.isCaller) {
+    incBox.classList.add("hidden");
+    actBox.classList.remove("hidden");
+    statusEl.textContent = `Звоним @${callState.peer}...`;
+  } else {
+    incBox.classList.add("hidden");
+    actBox.classList.remove("hidden");
+    statusEl.textContent = "В звонке";
+  }
+  updateCallDurationLabel();
+}
+
+function hideCallModalUi() {
+  const overlay = document.getElementById("callOverlay");
+  if (overlay) overlay.classList.add("hidden");
+}
+
+function cleanupLocalCallResources() {
+  stopCallDurationTicker();
+  if (pc) {
+    try { pc.close(); } catch (e) {}
+    pc = null;
+  }
+  if (localStream) {
+    try {
+      localStream.getTracks().forEach(t => t.stop());
+    } catch (e) {}
+    localStream = null;
+  }
+  const audioEl = document.getElementById("remoteAudioEl");
+  if (audioEl) {
+    audioEl.srcObject = null;
+  }
+  micMuted = false;
+  const micBtn = document.getElementById("btnToggleMic");
+  if (micBtn) {
+    micBtn.textContent = "🎤 Микрофон вкл";
+    micBtn.classList.remove("warn");
+    micBtn.classList.add("sec");
+  }
+  callState = null;
+  pendingOfferToApply = null;
+  sentCandidateKeys = new Set();
+  appliedCandidateKeys = new Set();
+  answerSent = false;
+  hideCallModalUi();
+}
+
+async function ensureLocalAudioStream() {
+  if (localStream) return localStream;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    throw new Error("Браузер не поддерживает доступ к микрофону");
+  }
+  localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+  return localStream;
+}
+
+function createPeerConnectionForCall(cid) {
+  const conn = new RTCPeerConnection(RTC_CONFIG);
+  if (localStream) {
+    localStream.getTracks().forEach(track => {
+      conn.addTrack(track, localStream);
+    });
+  }
+  conn.ontrack = (event) => {
+    const audioEl = document.getElementById("remoteAudioEl");
+    if (audioEl && event.streams && event.streams[0]) {
+      audioEl.srcObject = event.streams[0];
+      audioEl.play().catch(() => {});
+    }
+  };
+  conn.onicecandidate = (event) => {
+    if (!event.candidate || !callState || callState.callId !== cid) return;
+    const candJson = event.candidate.toJSON ? event.candidate.toJSON() : event.candidate;
+    const key = JSON.stringify(candJson);
+    if (sentCandidateKeys.has(key)) return;
+    sentCandidateKeys.add(key);
+    api("/api/call/candidate", {
+      callId: cid,
+      from: me.username,
+      candidate: candJson
+    }).catch(() => {});
+  };
+  return conn;
+}
+
+async function startDirectCall() {
+  if (!me || !activeChat || activeChat.type !== "direct") return;
+  if (callState) return;
+  playSound("click");
+
+  try {
+    await ensureLocalAudioStream();
+  } catch (err) {
+    alert("Не удалось включить микрофон. Проверь разрешение микрофона и HTTPS.");
+    return;
+  }
+
+  const peer = activeChat.username;
+  const peerEmoji = activeChat.emoji || "🙂";
+  const createRes = await api("/api/call/start", { caller: me.username, callee: peer });
+  if (!createRes.ok || !createRes.callId) {
+    cleanupLocalCallResources();
+    alert(createRes.error || "Не удалось начать звонок");
+    return;
+  }
+
+  const cid = createRes.callId;
+  callState = {
+    callId: cid,
+    peer,
+    peerEmoji,
+    isCaller: true,
+    status: "ringing",
+    connectedAt: null
+  };
+  showCallModalUi();
+
+  pc = createPeerConnectionForCall(cid);
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  await api("/api/call/offer", {
+    callId: cid,
+    from: me.username,
+    offer: pc.localDescription
+  });
+}
+
+async function acceptIncomingCall() {
+  if (!me || !callState || callState.isCaller) return;
+  playSound("join");
+
+  try {
+    await ensureLocalAudioStream();
+  } catch (err) {
+    alert("Не удалось включить микрофон. Проверь разрешение микрофона и HTTPS.");
+    await hangupCall(true);
+    return;
+  }
+
+  const cid = callState.callId;
+  pc = createPeerConnectionForCall(cid);
+
+  if (pendingOfferToApply) {
+    await pc.setRemoteDescription(new RTCSessionDescription(pendingOfferToApply));
+    pendingOfferToApply = null;
+  }
+
+  if (!answerSent && pc.remoteDescription) {
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    answerSent = true;
+    await api("/api/call/answer", {
+      callId: cid,
+      from: me.username,
+      answer: pc.localDescription
+    });
+  }
+
+  callState.status = "active";
+  if (!callState.connectedAt) {
+    callState.connectedAt = Date.now();
+  }
+  showCallModalUi();
+  startCallDurationTicker();
+}
+
+function toggleMicMute() {
+  if (!localStream) return;
+  micMuted = !micMuted;
+  localStream.getAudioTracks().forEach(track => {
+    track.enabled = !micMuted;
+  });
+  playSound("click");
+  const btn = document.getElementById("btnToggleMic");
+  if (btn) {
+    if (micMuted) {
+      btn.textContent = "🔇 Микрофон выкл";
+      btn.classList.remove("sec");
+      btn.classList.add("warn");
+    } else {
+      btn.textContent = "🎤 Микрофон вкл";
+      btn.classList.remove("warn");
+      btn.classList.add("sec");
+    }
+  }
+}
+
+async function hangupCall(notifyServer = true) {
+  const cid = callState ? callState.callId : null;
+  playSound("leave");
+  cleanupLocalCallResources();
+  if (notifyServer && cid && me) {
+    api("/api/call/end", { callId: cid, from: me.username }).catch(() => {});
+  }
+}
+
+async function pollCallStatus() {
+  if (!me) return;
+  const activeId = callState ? callState.callId : "";
+  const res = await api(`/api/call/poll?user=${encodeURIComponent(me.username)}&callId=${encodeURIComponent(activeId)}`);
+  if (!res || !res.ok) return;
+
+  if (res.ended) {
+    if (callState) {
+      playSound("leave");
+      cleanupLocalCallResources();
+    }
+    return;
+  }
+
+  const c = res.call;
+  if (!c) return;
+
+  if (!callState) {
+    if (c.status === "ringing" && c.callee === me.username) {
+      const peerUser = c.caller;
+      playSound("receive");
+      callState = {
+        callId: c.callId,
+        peer: peerUser,
+        peerEmoji: sanitizeAvatarEmoji(c.callerEmoji || "🙂"),
+        isCaller: false,
+        status: "ringing",
+        connectedAt: null
+      };
+      if (c.offer) {
+        pendingOfferToApply = c.offer;
+      }
+      showCallModalUi();
+    }
+    return;
+  }
+
+  if (c.callId !== callState.callId) return;
+
+  if (callState.isCaller && c.offer && !pc) {
+    pc = createPeerConnectionForCall(c.callId);
+  }
+
+  if (!callState.isCaller && c.offer && !pendingOfferToApply && (!pc || !pc.remoteDescription)) {
+    pendingOfferToApply = c.offer;
+  }
+
+  if (callState.isCaller && c.answer && pc && !pc.remoteDescription) {
+    await pc.setRemoteDescription(new RTCSessionDescription(c.answer));
+    if (callState.status !== "active") {
+      callState.status = "active";
+      if (!callState.connectedAt) {
+        callState.connectedAt = c.connectedAt ? Number(c.connectedAt) : Date.now();
+      }
+      playSound("join");
+      showCallModalUi();
+      startCallDurationTicker();
+    }
+  }
+
+  if (!callState.isCaller && c.status === "active" && callState.status !== "active") {
+    callState.status = "active";
+    if (!callState.connectedAt) {
+      callState.connectedAt = c.connectedAt ? Number(c.connectedAt) : Date.now();
+    }
+    showCallModalUi();
+    startCallDurationTicker();
+  }
+
+  const incomingCands = Array.isArray(c.candidates) ? c.candidates : [];
+  for (const item of incomingCands) {
+    if (!item || item.from === me.username || !item.candidate) continue;
+    const key = JSON.stringify(item.candidate);
+    if (appliedCandidateKeys.has(key)) continue;
+    appliedCandidateKeys.add(key);
+    if (pc && pc.remoteDescription) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(item.candidate));
+      } catch (e) {}
+    }
+  }
 }
 
 function setKeyboardLift(px) {
@@ -1350,20 +1933,35 @@ function onComposerKeydown(event) {
 function loadCustom() {
   try {
     const raw = JSON.parse(localStorage.getItem("grusha_custom") || "{}");
+    const themeKey = SITE_THEMES[raw.theme] ? raw.theme : DEFAULT_CUSTOM.theme;
     return {
       msgSize: Number(raw.msgSize) || DEFAULT_CUSTOM.msgSize,
       emojiSize: Number(raw.emojiSize) || DEFAULT_CUSTOM.emojiSize,
-      photoSize: Number(raw.photoSize) || DEFAULT_CUSTOM.photoSize
+      photoSize: Number(raw.photoSize) || DEFAULT_CUSTOM.photoSize,
+      theme: themeKey
     };
   } catch (e) {
     return { ...DEFAULT_CUSTOM };
   }
 }
 
+function applyThemeButtonsState(themeKey) {
+  document.querySelectorAll("#themePicker .theme-btn").forEach(btn => {
+    btn.classList.toggle("active-theme", btn.getAttribute("data-theme") === themeKey);
+  });
+}
+
 function applyCustom(cfg) {
+  const themeKey = SITE_THEMES[cfg.theme] ? cfg.theme : DEFAULT_CUSTOM.theme;
+  const palette = SITE_THEMES[themeKey];
+  document.documentElement.style.setProperty("--accent", palette.accent);
+  document.documentElement.style.setProperty("--accent-contrast", palette.contrast);
+  document.documentElement.style.setProperty("--accent-soft", palette.soft);
   document.documentElement.style.setProperty("--msg-font-size", `${cfg.msgSize}px`);
   document.documentElement.style.setProperty("--emoji-size", `${cfg.emojiSize}px`);
   document.documentElement.style.setProperty("--photo-max-size", `${cfg.photoSize}px`);
+
+  applyThemeButtonsState(themeKey);
 
   const rMsg = document.getElementById("msgSizeRange");
   const rEm = document.getElementById("emojiSizeRange");
@@ -1380,11 +1978,22 @@ function applyCustom(cfg) {
   if (vPh) vPh.textContent = `${cfg.photoSize}px`;
 }
 
+function setSiteTheme(themeKey) {
+  if (!SITE_THEMES[themeKey]) return;
+  const cur = loadCustom();
+  const next = { ...cur, theme: themeKey };
+  try { localStorage.setItem("grusha_custom", JSON.stringify(next)); } catch (e) {}
+  applyCustom(next);
+  playSound("click");
+}
+
 function updateCustomization() {
+  const cur = loadCustom();
   const cfg = {
     msgSize: Number(document.getElementById("msgSizeRange").value) || DEFAULT_CUSTOM.msgSize,
     emojiSize: Number(document.getElementById("emojiSizeRange").value) || DEFAULT_CUSTOM.emojiSize,
-    photoSize: Number(document.getElementById("photoSizeRange").value) || DEFAULT_CUSTOM.photoSize
+    photoSize: Number(document.getElementById("photoSizeRange").value) || DEFAULT_CUSTOM.photoSize,
+    theme: cur.theme || DEFAULT_CUSTOM.theme
   };
   try { localStorage.setItem("grusha_custom", JSON.stringify(cfg)); } catch (e) {}
   applyCustom(cfg);
@@ -1397,6 +2006,7 @@ function updateCustomization() {
 function resetCustomization() {
   try { localStorage.setItem("grusha_custom", JSON.stringify(DEFAULT_CUSTOM)); } catch (e) {}
   applyCustom(DEFAULT_CUSTOM);
+  playSound("click");
   if (activeChat) {
     lastRenderedMsgsJson = "";
     refreshMessages(false);
@@ -1418,7 +2028,7 @@ function isFullscreenNow() {
 async function toggleFullscreenByTap(e) {
   if (!e.target.closest) return;
   const interactive = e.target.closest(
-    "button, input, textarea, select, a, .chat-card, .member-pick, .group-member-row, .group-edit-card, .room-header-main, .m, .msg-img, .em-btn, .clip-btn, .attach-preview, .reply-bar, .msg-menu-card, .reaction-chip, .top, .bottom-dock, .custom-box, .fab-create"
+    "button, input, textarea, select, a, .chat-card, .member-pick, .group-member-row, .group-edit-card, .room-header-main, .m, .msg-img, .em-btn, .clip-btn, .attach-preview, .reply-bar, .msg-menu-card, .reaction-chip, .call-card, .top, .bottom-dock, .custom-box, .fab-create"
   );
   if (interactive) return;
 
@@ -1492,12 +2102,14 @@ async function doAuth() {
   }
   saveLocalUser(res.user);
   document.getElementById("authErr").textContent = "";
+  playSound("join");
   enterChats();
 }
 
 function enterChats() {
   activeChat = null;
   replyTarget = null;
+  roomHistoryInitialized = false;
   clearAttachment();
   lastRenderedMsgsJson = "";
   document.getElementById("myAva").textContent = sanitizeAvatarEmoji(me.emoji);
@@ -1508,8 +2120,10 @@ function enterChats() {
 }
 
 function backToChats() {
+  playSound("click");
   activeChat = null;
   replyTarget = null;
+  roomHistoryInitialized = false;
   clearAttachment();
   lastRenderedMsgsJson = "";
   showScreen("chatsScreen");
@@ -1517,6 +2131,7 @@ function backToChats() {
 }
 
 function backToRoomFromGroupSettings() {
+  playSound("click");
   if (!activeChat) {
     backToChats();
     return;
@@ -1527,8 +2142,9 @@ function backToRoomFromGroupSettings() {
 
 /* Создание группы */
 function selectGroupEmoji(em) {
-  selectedGroupEmoji = em;
-  document.getElementById("selectedGroupIconLabel").textContent = em;
+  selectedGroupEmoji = sanitizeAvatarEmoji(em);
+  document.getElementById("selectedGroupIconLabel").textContent = selectedGroupEmoji;
+  playSound("click");
   renderGroupIconPicker();
 }
 
@@ -1537,13 +2153,14 @@ function renderGroupIconPicker() {
   if (!box) return;
   box.innerHTML = GROUP_ICONS.map(em => {
     const cls = em === selectedGroupEmoji ? "em-btn" : "em-btn sec";
-    return `<button type="button" class="${cls}" style="${em === selectedGroupEmoji ? 'outline:2px solid #2da9ff;' : ''}" onclick="selectGroupEmoji('${em}')">${em}</button>`;
+    return `<button type="button" class="${cls}" style="${em === selectedGroupEmoji ? 'outline:2px solid var(--accent);' : ''}" onclick="selectGroupEmoji('${em}')">${em}</button>`;
   }).join("");
 }
 
 function toggleGroupMember(nick) {
   if (selectedGroupMembers.has(nick)) selectedGroupMembers.delete(nick);
   else selectedGroupMembers.add(nick);
+  playSound("click");
   renderGroupCandidates();
 }
 
@@ -1575,6 +2192,7 @@ function renderGroupCandidates(candidates = null) {
 }
 
 async function openCreateGroup() {
+  playSound("click");
   selectedGroupEmoji = "🦜";
   selectedGroupMembers = new Set();
   document.getElementById("groupTitleInput").value = "";
@@ -1609,6 +2227,7 @@ async function submitCreateGroup() {
     errEl.textContent = res.error || "Не удалось создать группу";
     return;
   }
+  playSound("join");
   await openGroupChat(res.group.id, res.group.title, res.group.emoji, res.group.tripleBadge);
 }
 
@@ -1620,15 +2239,17 @@ function onRoomTitleClick() {
 
 async function openGroupSettings() {
   if (!activeChat || activeChat.type !== "group") return;
+  playSound("click");
   inviteGroupMembers = new Set();
   showScreen("groupSettingsScreen");
   await renderGroupSettings();
 }
 
 function selectEditGroupEmoji(em) {
-  editGroupEmoji = em;
+  editGroupEmoji = sanitizeAvatarEmoji(em);
   const lbl = document.getElementById("editGroupIconLabel");
-  if (lbl) lbl.textContent = em;
+  if (lbl) lbl.textContent = editGroupEmoji;
+  playSound("click");
   renderEditGroupIconPicker();
 }
 
@@ -1637,7 +2258,7 @@ function renderEditGroupIconPicker() {
   if (!box) return;
   box.innerHTML = GROUP_ICONS.map(em => {
     const cls = em === editGroupEmoji ? "em-btn" : "em-btn sec";
-    return `<button type="button" class="${cls}" style="${em === editGroupEmoji ? 'outline:2px solid #2da9ff;' : ''}" onclick="selectEditGroupEmoji('${em}')">${em}</button>`;
+    return `<button type="button" class="${cls}" style="${em === editGroupEmoji ? 'outline:2px solid var(--accent);' : ''}" onclick="selectEditGroupEmoji('${em}')">${em}</button>`;
   }).join("");
 }
 
@@ -1663,10 +2284,11 @@ async function saveGroupMeta() {
     if (okEl) okEl.textContent = "";
     return;
   }
+  playSound("react");
   activeChat.username = res.group.title;
-  activeChat.emoji = res.group.emoji;
+  activeChat.emoji = sanitizeAvatarEmoji(res.group.emoji);
   activeChat.tripleBadge = Boolean(res.group.tripleBadge);
-  document.getElementById("peerAva").textContent = res.group.emoji || "🦜";
+  document.getElementById("peerAva").textContent = activeChat.emoji;
   document.getElementById("peerNick").innerHTML = groupTitleHtml(res.group.title, activeChat.tripleBadge);
   await renderGroupSettings();
   const okAfter = document.getElementById("editGroupOk");
@@ -1677,6 +2299,7 @@ async function saveGroupMeta() {
 function toggleInviteCandidate(nick) {
   if (inviteGroupMembers.has(nick)) inviteGroupMembers.delete(nick);
   else inviteGroupMembers.add(nick);
+  playSound("click");
   const el = document.querySelector(`.invite-pick[data-nick="${CSS.escape(nick)}"]`);
   if (el) {
     const checked = inviteGroupMembers.has(nick);
@@ -1704,6 +2327,7 @@ async function submitInviteMembers() {
     if (errEl) errEl.textContent = res.error || "Не удалось добавить участников";
     return;
   }
+  playSound("join");
   inviteGroupMembers = new Set();
   await renderGroupSettings();
   await refreshMessages(false);
@@ -1726,7 +2350,7 @@ async function renderGroupSettings() {
   const isGroupOwner = g.owner === me.username;
   const membersSet = new Set(g.members || []);
   const mutedSet = new Set(g.muted || []);
-  editGroupEmoji = g.emoji || "🦜";
+  editGroupEmoji = sanitizeAvatarEmoji(g.emoji || "🦜");
 
   activeChat.username = g.title;
   activeChat.emoji = editGroupEmoji;
@@ -1856,6 +2480,7 @@ async function leaveCurrentGroup() {
     groupId: activeChat.id
   });
   if (res.ok) {
+    playSound("leave");
     backToChats();
   }
 }
@@ -1868,6 +2493,7 @@ async function toggleMuteMember(targetNick) {
     target: targetNick
   });
   if (res.ok) {
+    playSound("click");
     await renderGroupSettings();
     await refreshMessages(false);
   }
@@ -1881,6 +2507,7 @@ async function kickGroupMember(targetNick) {
     target: targetNick
   });
   if (res.ok) {
+    playSound("leave");
     await renderGroupSettings();
     await refreshMessages(false);
     await refreshChats();
@@ -1894,6 +2521,7 @@ async function deleteCurrentGroup() {
     groupId: activeChat.id
   });
   if (res.ok) {
+    playSound("leave");
     backToChats();
   }
 }
@@ -1905,6 +2533,7 @@ async function deleteDirectChat() {
     b: activeChat.username
   });
   if (res.ok) {
+    playSound("leave");
     backToChats();
   }
 }
@@ -1926,6 +2555,7 @@ function getNickCooldownInfo(userObj) {
 }
 
 function openSettings() {
+  playSound("click");
   renderAvatarChoices();
   applyCustom(loadCustom());
   document.getElementById("setErr").textContent = "";
@@ -1942,6 +2572,7 @@ function openSettings() {
 }
 
 function openSearch() {
+  playSound("click");
   const inp = document.getElementById("searchInput");
   inp.value = "";
   document.getElementById("searchResults").innerHTML = "";
@@ -1999,9 +2630,9 @@ async function refreshChats() {
         return;
       }
       activeChat.username = matchedGroup.title;
-      activeChat.emoji = matchedGroup.emoji;
+      activeChat.emoji = sanitizeAvatarEmoji(matchedGroup.emoji);
       activeChat.tripleBadge = Boolean(matchedGroup.tripleBadge);
-      document.getElementById("peerAva").textContent = matchedGroup.emoji || "🦜";
+      document.getElementById("peerAva").textContent = activeChat.emoji;
       document.getElementById("peerNick").innerHTML = groupTitleHtml(matchedGroup.title, activeChat.tripleBadge);
     }
   }
@@ -2012,10 +2643,11 @@ async function refreshChats() {
   }
   list.innerHTML = res.chats.map(c => {
     if (c.type === "group") {
+      const gAva = sanitizeAvatarEmoji(c.emoji || "🦜");
       const typingLabel = c.typingText ? `${esc(c.typingText)} печатает...` : "";
       return `
-        <div class="chat-card" onclick="openGroupChat('${esc(c.groupId)}', '${esc(c.title)}', '${esc(c.emoji || '🦜')}', ${c.tripleBadge ? 'true' : 'false'})">
-          <div class="ava">${c.emoji || '🦜'}</div>
+        <div class="chat-card" onclick="openGroupChat('${esc(c.groupId)}', '${esc(c.title)}', '${esc(gAva)}', ${c.tripleBadge ? 'true' : 'false'})">
+          <div class="ava">${gAva}</div>
           <div class="chat-info">
             <div class="chat-name">${groupTitleHtml(c.title, c.tripleBadge)} <span class="muted" style="font-weight:500; font-size:12px;">• группа</span></div>
             <div class="chat-last ${typingLabel ? 'typing-active' : ''}">${typingLabel || esc(c.last || 'Сообщений пока нет')}</div>
@@ -2051,19 +2683,30 @@ function clearReplyTarget() {
 
 function setReplyTarget(msg) {
   if (!msg || msg.from === "system") return;
+  const cleanText = (msg.text || "").trim();
+  const hasImg = Boolean(msg.image);
   replyTarget = {
     from: msg.from,
-    text: (msg.text || "").trim(),
-    hasImage: Boolean(msg.image)
+    text: cleanText,
+    hasImage: hasImg
   };
   const bar = document.getElementById("replyBar");
   const authorEl = document.getElementById("replyBarAuthor");
   const txtEl = document.getElementById("replyBarText");
   if (bar && authorEl && txtEl) {
     authorEl.textContent = `Ответ @${replyTarget.from}`;
-    txtEl.textContent = replyTarget.text || (replyTarget.hasImage ? "📷 Картинка" : "Сообщение");
+    if (cleanText && hasImg) {
+      txtEl.textContent = `📷 ${cleanText}`;
+    } else if (cleanText) {
+      txtEl.textContent = cleanText;
+    } else if (hasImg) {
+      txtEl.textContent = "📷 Фотография";
+    } else {
+      txtEl.textContent = "Сообщение";
+    }
     bar.classList.remove("hidden");
   }
+  playSound("click");
   const inp = document.getElementById("msgInput");
   if (inp) inp.focus();
 }
@@ -2072,8 +2715,10 @@ function openMsgActionModal(msgIndex) {
   const msg = currentRoomMsgs[msgIndex];
   if (!msg || msg.from === "system") return;
   selectedMsgForAction = msg;
+  playSound("click");
   const prev = document.getElementById("msgActionPreview");
-  const snippet = (msg.text || "").trim() || (msg.image ? "📷 Картинка" : "Сообщение");
+  const cleanText = (msg.text || "").trim();
+  const snippet = cleanText || (msg.image ? "📷 Фотография" : "Сообщение");
   if (prev) prev.textContent = `@${msg.from}: ${snippet}`;
 
   const grid = document.getElementById("msgReactionChoices");
@@ -2082,7 +2727,7 @@ function openMsgActionModal(msgIndex) {
     grid.innerHTML = REACTION_EMOJIS.map(em => {
       const users = myReactions[em] || [];
       const active = users.includes(me.username);
-      return `<button type="button" class="reaction-pick-btn" style="${active ? 'outline:2px solid #2da9ff; background:#1c3242;' : ''}" onclick="pickReactionForSelected('${em}')">${em}</button>`;
+      return `<button type="button" class="reaction-pick-btn" style="${active ? 'outline:2px solid var(--accent); background:#1c3242;' : ''}" onclick="pickReactionForSelected('${em}')">${em}</button>`;
     }).join("");
   }
 
@@ -2125,6 +2770,7 @@ async function toggleMessageReaction(msgId, emoji) {
   }
   const res = await api("/api/react", payload);
   if (res.ok) {
+    playSound("react");
     lastRenderedMsgsJson = "";
     await refreshMessages(false);
   }
@@ -2160,15 +2806,20 @@ function bindLongPressToBubble(el, msgIndex) {
 }
 
 async function openDirectChat(username, emoji, isOwner = false) {
+  playSound("click");
   const cleanAva = sanitizeAvatarEmoji(emoji);
   activeChat = { type: "direct", id: username, username, emoji: cleanAva, isOwner, tripleBadge: false };
   replyTarget = null;
+  roomHistoryInitialized = false;
+  seenDirectMsgIds = new Set();
   clearReplyTarget();
   clearAttachment();
   lastRenderedMsgsJson = "";
   syncRoomComposerLock(false);
   const headerMain = document.getElementById("roomHeaderMain");
   if (headerMain) headerMain.classList.remove("clickable-header");
+  const callBtn = document.getElementById("btnCallDirect");
+  if (callBtn) callBtn.classList.remove("hidden");
   const delBtn = document.getElementById("btnDeleteDirectChat");
   if (delBtn) delBtn.classList.remove("hidden");
   document.getElementById("peerAva").textContent = cleanAva;
@@ -2183,18 +2834,24 @@ async function openDirectChat(username, emoji, isOwner = false) {
 }
 
 async function openGroupChat(groupId, title, emoji, tripleBadge = false) {
+  playSound("click");
   const badgeFlag = Boolean(tripleBadge) || isTripleBadgeGroupTitle(title);
-  activeChat = { type: "group", id: groupId, username: title, emoji: emoji || "🦜", isOwner: false, tripleBadge: badgeFlag };
+  const gAva = sanitizeAvatarEmoji(emoji || "🦜");
+  activeChat = { type: "group", id: groupId, username: title, emoji: gAva, isOwner: false, tripleBadge: badgeFlag };
   replyTarget = null;
+  roomHistoryInitialized = false;
+  seenGroupMsgIds = new Set();
   clearReplyTarget();
   clearAttachment();
   lastRenderedMsgsJson = "";
   syncRoomComposerLock(false);
   const headerMain = document.getElementById("roomHeaderMain");
   if (headerMain) headerMain.classList.add("clickable-header");
+  const callBtn = document.getElementById("btnCallDirect");
+  if (callBtn) callBtn.classList.add("hidden");
   const delBtn = document.getElementById("btnDeleteDirectChat");
   if (delBtn) delBtn.classList.add("hidden");
-  document.getElementById("peerAva").textContent = emoji || "🦜";
+  document.getElementById("peerAva").textContent = gAva;
   document.getElementById("peerNick").innerHTML = groupTitleHtml(title, badgeFlag);
   document.getElementById("peerStatus").textContent = "";
   const inp = document.getElementById("msgInput");
@@ -2208,6 +2865,15 @@ async function openGroupChat(groupId, title, emoji, tripleBadge = false) {
 function formatTextWithEmojis(rawText) {
   const safe = esc(rawText);
   return safe.replace(SINGLE_EMOJI_RE, match => `<span class="inline-emoji">${match}</span>`);
+}
+
+function formatReplyPreviewText(rep) {
+  if (!rep) return "Сообщение";
+  const t = (rep.text || "").trim();
+  if (t && rep.hasImage) return `📷 ${t}`;
+  if (t) return t;
+  if (rep.hasImage) return "📷 Фотография";
+  return "Сообщение";
 }
 
 function renderMsgItem(m, index) {
@@ -2230,7 +2896,7 @@ function renderMsgItem(m, index) {
     : "";
 
   const replyHtml = m.replyTo
-    ? `<div class="reply-quote"><div class="reply-quote-author">@${esc(m.replyTo.from || "пользователь")}</div><div class="reply-quote-txt">${esc(m.replyTo.text || (m.replyTo.hasImage ? "📷 Картинка" : "Сообщение"))}</div></div>`
+    ? `<div class="reply-quote"><div class="reply-quote-author">@${esc(m.replyTo.from || "пользователь")}</div><div class="reply-quote-txt">${esc(formatReplyPreviewText(m.replyTo))}</div></div>`
     : "";
 
   const imgHtml = m.image
@@ -2261,6 +2927,40 @@ function attachMessageInteractions() {
   });
 }
 
+function handleIncomingSounds(msgsList, isGroup) {
+  const seenSet = isGroup ? seenGroupMsgIds : seenDirectMsgIds;
+  const currentIds = new Set(msgsList.map(m => String(m.id)));
+
+  if (!roomHistoryInitialized) {
+    roomHistoryInitialized = true;
+    seenSet.clear();
+    currentIds.forEach(id => seenSet.add(id));
+    return;
+  }
+
+  let playedSound = false;
+  for (const m of msgsList) {
+    const mid = String(m.id);
+    if (!seenSet.has(mid)) {
+      seenSet.add(mid);
+      if (playedSound) continue;
+      if (m.from === "system") {
+        const txt = String(m.text || "");
+        if (m.eventKind === "join" || txt.endsWith("зашел")) {
+          playSound("join");
+          playedSound = true;
+        } else if (m.eventKind === "leave" || txt.endsWith("вышел")) {
+          playSound("leave");
+          playedSound = true;
+        }
+      } else if (m.from && m.from !== me.username) {
+        playSound("receive");
+        playedSound = true;
+      }
+    }
+  }
+}
+
 async function refreshMessages(forceScroll = false) {
   if (!me || !activeChat) return;
 
@@ -2272,9 +2972,9 @@ async function refreshMessages(forceScroll = false) {
     }
     syncRoomComposerLock(Boolean(res.isMuted));
     activeChat.username = res.title || activeChat.username;
-    activeChat.emoji = res.emoji || activeChat.emoji;
+    activeChat.emoji = sanitizeAvatarEmoji(res.emoji || activeChat.emoji);
     activeChat.tripleBadge = Boolean(res.tripleBadge) || isTripleBadgeGroupTitle(activeChat.username);
-    document.getElementById("peerAva").textContent = activeChat.emoji || "🦜";
+    document.getElementById("peerAva").textContent = activeChat.emoji;
     document.getElementById("peerNick").innerHTML = groupTitleHtml(activeChat.username, activeChat.tripleBadge);
 
     const statusEl = document.getElementById("peerStatus");
@@ -2289,6 +2989,8 @@ async function refreshMessages(forceScroll = false) {
     }
 
     currentRoomMsgs = res.msgs || [];
+    handleIncomingSounds(currentRoomMsgs, true);
+
     const customStamp = JSON.stringify(loadCustom());
     const json = JSON.stringify(currentRoomMsgs);
     if (json === lastRenderedMsgsJson && customStamp === lastRenderedCustomJson && !forceScroll) return;
@@ -2325,6 +3027,8 @@ async function refreshMessages(forceScroll = false) {
   }
 
   currentRoomMsgs = res.msgs || [];
+  handleIncomingSounds(currentRoomMsgs, false);
+
   const customStamp = JSON.stringify(loadCustom());
   const json = JSON.stringify(currentRoomMsgs);
   if (json === lastRenderedMsgsJson && customStamp === lastRenderedCustomJson && !forceScroll) return;
@@ -2348,6 +3052,7 @@ function insertEmoji(em) {
   const end = inp.selectionEnd ?? inp.value.length;
   inp.value = inp.value.slice(0, start) + em + inp.value.slice(end);
   const pos = start + em.length;
+  playSound("click");
   inp.focus();
   inp.setSelectionRange(pos, pos);
   autoResizeComposer();
@@ -2406,6 +3111,7 @@ async function onFileSelected(event) {
     document.getElementById("attachThumb").src = dataUrl;
     document.getElementById("attachName").textContent = file.name || "Картинка прикреплена";
     document.getElementById("attachPreview").classList.remove("hidden");
+    playSound("click");
     document.getElementById("msgInput").focus();
   } catch (e) {
     clearAttachment();
@@ -2432,6 +3138,7 @@ async function sendMsg() {
       if (res.muted) syncRoomComposerLock(true);
       return;
     }
+    playSound("send");
     inp.value = "";
     autoResizeComposer();
     clearReplyTarget();
@@ -2442,6 +3149,7 @@ async function sendMsg() {
     return;
   }
 
+  playSound("send");
   inp.value = "";
   autoResizeComposer();
   clearReplyTarget();
@@ -2457,6 +3165,7 @@ async function setEmoji(em) {
   const cleanEm = sanitizeAvatarEmoji(em);
   const res = await api("/api/emoji", { username: me.username, emoji: cleanEm });
   if (res.ok) {
+    playSound("react");
     me.emoji = cleanEm;
     document.getElementById("myAva").textContent = cleanEm;
     document.getElementById("setOk").textContent = `Аватарка обновлена на ${cleanEm}`;
@@ -2473,6 +3182,7 @@ async function changeNick() {
     document.getElementById("setOk").textContent = "";
     return;
   }
+  playSound("react");
   saveLocalUser(res.user);
   document.getElementById("myNick").innerHTML = nickLabelHtml(me.username, me.isOwner);
   document.getElementById("setErr").textContent = "";
@@ -2485,20 +3195,26 @@ async function changeNick() {
 }
 
 async function logout() {
+  playSound("leave");
+  await hangupCall(true);
   await api("/api/logout", {});
   saveLocalUser(null);
   activeChat = null;
   replyTarget = null;
+  roomHistoryInitialized = false;
   clearAttachment();
   showScreen("authScreen");
 }
 
 async function deleteAccount() {
   if (!me) return;
+  playSound("leave");
+  await hangupCall(true);
   await api("/api/delete", { username: me.username });
   saveLocalUser(null);
   activeChat = null;
   replyTarget = null;
+  roomHistoryInitialized = false;
   clearAttachment();
   showScreen("authScreen");
 }
@@ -2509,7 +3225,8 @@ function startPolling() {
     if (!me) return;
     refreshChats();
     if (activeChat) refreshMessages(false);
-  }, 1800);
+    pollCallStatus();
+  }, 1400);
 }
 
 function esc(s) {
@@ -2613,6 +3330,122 @@ def logout_api():
     resp = make_response(jsonify({"ok": True}))
     resp.delete_cookie("grusha_user")
     return resp
+
+
+@app.post("/api/call/start")
+def call_start():
+    cleanup_stale_calls()
+    d = request.get_json(force=True) or {}
+    caller = (d.get("caller") or "").strip()
+    callee = (d.get("callee") or "").strip()
+    if not caller or not callee or caller == callee:
+        return jsonify({"ok": False, "error": "Некорректный собеседник."})
+
+    for cid, c in ACTIVE_CALLS.items():
+        if c.get("status") != "ended" and (callee in (c.get("caller"), c.get("callee")) or caller in (c.get("caller"), c.get("callee"))):
+            return jsonify({"ok": False, "error": "Пользователь сейчас занят или уже в звонке."})
+
+    caller_user = get_user(caller) or {}
+    caller_emoji = sanitize_user_emoji(caller_user.get("emoji"))
+    now = int(time.time() * 1000)
+    cid = f"call_{uuid.uuid4().hex[:12]}"
+    ACTIVE_CALLS[cid] = {
+        "callId": cid,
+        "caller": caller,
+        "callee": callee,
+        "callerEmoji": caller_emoji,
+        "status": "ringing",
+        "offer": None,
+        "answer": None,
+        "candidates": [],
+        "createdAt": now,
+        "updatedAt": now,
+        "connectedAt": None,
+    }
+    return jsonify({"ok": True, "callId": cid})
+
+
+@app.post("/api/call/offer")
+def call_offer():
+    cleanup_stale_calls()
+    d = request.get_json(force=True) or {}
+    cid = (d.get("callId") or "").strip()
+    from_u = (d.get("from") or "").strip()
+    offer = d.get("offer")
+    c = ACTIVE_CALLS.get(cid)
+    if not c or from_u not in (c.get("caller"), c.get("callee")):
+        return jsonify({"ok": False})
+    c["offer"] = offer
+    c["updatedAt"] = int(time.time() * 1000)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/call/answer")
+def call_answer():
+    cleanup_stale_calls()
+    d = request.get_json(force=True) or {}
+    cid = (d.get("callId") or "").strip()
+    from_u = (d.get("from") or "").strip()
+    answer = d.get("answer")
+    c = ACTIVE_CALLS.get(cid)
+    if not c or from_u not in (c.get("caller"), c.get("callee")):
+        return jsonify({"ok": False})
+    now = int(time.time() * 1000)
+    c["answer"] = answer
+    c["status"] = "active"
+    if not c.get("connectedAt"):
+        c["connectedAt"] = now
+    c["updatedAt"] = now
+    return jsonify({"ok": True, "connectedAt": c["connectedAt"]})
+
+
+@app.post("/api/call/candidate")
+def call_candidate():
+    cleanup_stale_calls()
+    d = request.get_json(force=True) or {}
+    cid = (d.get("callId") or "").strip()
+    from_u = (d.get("from") or "").strip()
+    cand = d.get("candidate")
+    c = ACTIVE_CALLS.get(cid)
+    if not c or from_u not in (c.get("caller"), c.get("callee")) or not cand:
+        return jsonify({"ok": False})
+    c.setdefault("candidates", []).append({"from": from_u, "candidate": cand})
+    c["updatedAt"] = int(time.time() * 1000)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/call/end")
+def call_end():
+    d = request.get_json(force=True) or {}
+    cid = (d.get("callId") or "").strip()
+    from_u = (d.get("from") or "").strip()
+    c = ACTIVE_CALLS.get(cid)
+    if c and (not from_u or from_u in (c.get("caller"), c.get("callee"))):
+        c["status"] = "ended"
+        c["updatedAt"] = int(time.time() * 1000)
+    return jsonify({"ok": True})
+
+
+@app.get("/api/call/poll")
+def call_poll():
+    cleanup_stale_calls()
+    user = (request.args.get("user") or "").strip()
+    active_cid = (request.args.get("callId") or "").strip()
+    if not user:
+        return jsonify({"ok": False})
+
+    if active_cid:
+        c = ACTIVE_CALLS.get(active_cid)
+        if not c or c.get("status") == "ended":
+            return jsonify({"ok": True, "ended": True})
+        c["updatedAt"] = int(time.time() * 1000)
+        return jsonify({"ok": True, "call": c})
+
+    for cid, c in ACTIVE_CALLS.items():
+        if c.get("status") == "ringing" and c.get("callee") == user:
+            return jsonify({"ok": True, "call": c})
+
+    return jsonify({"ok": True, "call": None})
 
 
 @app.post("/api/typing")
@@ -3107,7 +3940,7 @@ def group_add_members():
             save_json_db(db)
 
     for nick in added:
-        append_group_system_message(gid, f'"{nick}" зашел')
+        append_group_system_message(gid, f'"{nick}" зашел', "join")
 
     return jsonify({"ok": True, "added": added, "group": get_group_by_id(gid)})
 
@@ -3141,7 +3974,7 @@ def group_leave():
             db["groups"][gid]["muted"] = muted
             save_json_db(db)
 
-    append_group_system_message(gid, f'"{actor}" вышел')
+    append_group_system_message(gid, f'"{actor}" вышел', "leave")
     return jsonify({"ok": True})
 
 
@@ -3331,7 +4164,7 @@ def group_kick():
             db["groups"][gid]["muted"] = muted
             save_json_db(db)
 
-    append_group_system_message(gid, f'"{target}" вышел')
+    append_group_system_message(gid, f'"{target}" вышел', "leave")
     return jsonify({"ok": True})
 
 
