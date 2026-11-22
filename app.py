@@ -21,7 +21,6 @@ TYPING_TTL_MS = 4500
 OWNER_NICK = "владислав"
 MAX_IMAGE_LEN = 1_500_000
 
-# In-memory карта статусов набора: {(sender, recipient): timestamp_ms}
 TYPING_STATUS = {}
 
 
@@ -121,6 +120,7 @@ HTML_PAGE = """<!DOCTYPE html>
     --msg-font-size: 15px;
     --emoji-size: 24px;
     --photo-max-size: 240px;
+    --app-top: 0px;
     --app-height: 100dvh;
   }
   * { box-sizing: border-box; }
@@ -130,13 +130,19 @@ HTML_PAGE = """<!DOCTYPE html>
     background: #101511;
     color: #f3f7f3;
     font-family: system-ui, -apple-system, sans-serif;
-    height: var(--app-height);
+    width: 100%;
+    height: 100%;
     overflow: hidden;
+    overscroll-behavior: none;
   }
   .wrap {
+    position: fixed;
+    left: 0;
+    right: 0;
+    top: var(--app-top);
+    height: var(--app-height);
     max-width: 480px;
     margin: 0 auto;
-    height: var(--app-height);
     background: #171e18;
     display: flex;
     flex-direction: column;
@@ -149,6 +155,12 @@ HTML_PAGE = """<!DOCTYPE html>
     padding: 10px 14px;
     background: #1f2920;
     border-bottom: 1px solid #2b382d;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .top-actions {
+    display: flex;
+    align-items: center;
     gap: 8px;
     flex-shrink: 0;
   }
@@ -294,6 +306,7 @@ HTML_PAGE = """<!DOCTYPE html>
     flex-shrink: 0;
     background: #1b231c;
     border-top: 1px solid #28342a;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
   }
   .em-row {
     display: flex;
@@ -397,13 +410,27 @@ HTML_PAGE = """<!DOCTYPE html>
         <div class="ava" id="myAva">🍐</div>
         <div class="chat-name" id="myNick">@user</div>
       </div>
-      <button class="sec" onclick="openSettings()">⚙️</button>
+      <div class="top-actions">
+        <button class="sec" title="Поиск пользователей" onclick="openSearch()">🔍</button>
+        <button class="sec" title="Настройки" onclick="openSettings()">⚙️</button>
+      </div>
     </div>
     <div class="pad">
-      <input id="searchInput" placeholder="Найти человека по никнейму..." autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" oninput="onSearchInput()">
-      <div id="searchResults"></div>
-      <div class="muted mt-12" style="font-weight:700;">Чаты</div>
+      <div class="muted" style="font-weight:700;">Чаты</div>
       <div id="chatList"></div>
+    </div>
+  </div>
+
+  <div id="searchScreen" class="hidden" style="flex:1; display:flex; flex-direction:column; min-height:0;">
+    <div class="top">
+      <button class="sec" onclick="backToChats()">← Назад</button>
+      <strong>🔍 Поиск людей</strong>
+      <span style="width:52px;"></span>
+    </div>
+    <div class="pad">
+      <input id="searchInput" placeholder="Введи первые буквы никнейма..." autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" oninput="onSearchInput()">
+      <div id="searchHint" class="muted mt-8">Показываются пользователи, чей ник начинается с введённых букв</div>
+      <div id="searchResults" class="mt-8"></div>
     </div>
   </div>
 
@@ -419,7 +446,7 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
     </div>
     <div id="msgsBox" class="msgs"></div>
-    <div class="bottom-dock">
+    <div class="bottom-dock" id="bottomDock">
       <div class="em-row">
         <button type="button" class="em-btn" onclick="insertEmoji('😀')">😀</button>
         <button type="button" class="em-btn" onclick="insertEmoji('😂')">😂</button>
@@ -438,7 +465,7 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="composer">
         <input id="fileInput" type="file" accept="image/*" class="hidden" onchange="onFileSelected(event)">
         <button type="button" class="clip-btn" title="Прикрепить картинку" onclick="document.getElementById('fileInput').click()">📎</button>
-        <textarea id="msgInput" rows="1" placeholder="Сообщение..." autocomplete="off" spellcheck="false" oninput="onComposerInput()" onkeydown="onComposerKeydown(event)"></textarea>
+        <textarea id="msgInput" rows="1" placeholder="Сообщение..." autocomplete="off" spellcheck="false" onfocus="onComposerFocus()" oninput="onComposerInput()" onkeydown="onComposerKeydown(event)"></textarea>
         <button type="button" onclick="sendMsg()">➤</button>
       </div>
     </div>
@@ -504,7 +531,8 @@ const AVATAR_EMOJIS = [
   "🍐", "😎", "🐱", "🐸", "🔥", "👾",
   "⚡", "🍕", "🦊", "🐼", "🤖", "👻",
   "🦄", "🐉", "🌙", "⭐", "💎", "🎮",
-  "🎧", "🚀", "🌵", "🍀", "🍓", "👑"
+  "🎧", "🚀", "🌵", "🍀", "🍓", "👑",
+  "🐄", "🐗", "🔶"
 ];
 
 const DEFAULT_CUSTOM = {
@@ -525,12 +553,16 @@ let lastRenderedCustomJson = "";
 let lastTypingPingTs = 0;
 let pollTimer = null;
 
-/* Подгоняем высоту под видимую область экрана при открытии экранной клавиатуры на телефоне */
 function syncViewportHeight() {
   const vv = window.visualViewport;
-  const h = vv ? vv.height : window.innerHeight;
-  document.documentElement.style.setProperty("--app-height", `${Math.round(h)}px`);
-  if (vv && vv.offsetTop > 0) {
+  if (vv) {
+    document.documentElement.style.setProperty("--app-top", `${Math.max(0, Math.round(vv.offsetTop))}px`);
+    document.documentElement.style.setProperty("--app-height", `${Math.round(vv.height)}px`);
+  } else {
+    document.documentElement.style.setProperty("--app-top", "0px");
+    document.documentElement.style.setProperty("--app-height", `${window.innerHeight}px`);
+  }
+  if (window.scrollY !== 0) {
     window.scrollTo(0, 0);
   }
   const box = document.getElementById("msgsBox");
@@ -539,11 +571,24 @@ function syncViewportHeight() {
   }
 }
 
+function onComposerFocus() {
+  [40, 140, 320, 550].forEach(delay => {
+    setTimeout(() => {
+      syncViewportHeight();
+      const dock = document.getElementById("bottomDock");
+      if (dock && dock.scrollIntoView) {
+        dock.scrollIntoView({ block: "end", behavior: "instant" });
+      }
+    }, delay);
+  });
+}
+
 if (window.visualViewport) {
   window.visualViewport.addEventListener("resize", syncViewportHeight);
   window.visualViewport.addEventListener("scroll", syncViewportHeight);
 }
 window.addEventListener("resize", syncViewportHeight);
+window.addEventListener("orientationchange", () => setTimeout(syncViewportHeight, 150));
 syncViewportHeight();
 
 function autoResizeComposer() {
@@ -689,7 +734,7 @@ function saveLocalUser(user) {
 }
 
 function showScreen(id) {
-  ["loadingScreen", "authScreen", "chatsScreen", "roomScreen", "settingsScreen"].forEach(s => {
+  ["loadingScreen", "authScreen", "chatsScreen", "searchScreen", "roomScreen", "settingsScreen"].forEach(s => {
     document.getElementById(s).classList.toggle("hidden", s !== id);
   });
   syncViewportHeight();
@@ -722,11 +767,17 @@ function enterChats() {
   lastRenderedMsgsJson = "";
   document.getElementById("myAva").textContent = me.emoji || "🍐";
   document.getElementById("myNick").innerHTML = nickLabelHtml(me.username, me.isOwner);
-  document.getElementById("searchInput").value = "";
-  document.getElementById("searchResults").innerHTML = "";
   showScreen("chatsScreen");
   refreshChats();
   startPolling();
+}
+
+function openSearch() {
+  const inp = document.getElementById("searchInput");
+  inp.value = "";
+  document.getElementById("searchResults").innerHTML = "";
+  showScreen("searchScreen");
+  setTimeout(() => inp.focus(), 60);
 }
 
 function backToChats() {
@@ -764,7 +815,7 @@ async function onSearchInput() {
   }
   const res = await api(`/api/search?q=${encodeURIComponent(q)}&exclude=${encodeURIComponent(me.username)}`);
   if (!res.users || !res.users.length) {
-    box.innerHTML = `<div class="muted mt-8">Пользователь не найден</div>`;
+    box.innerHTML = `<div class="muted mt-8">Никого не найдено на «${esc(q)}»</div>`;
     return;
   }
   box.innerHTML = res.users.map(u => `
@@ -794,7 +845,7 @@ async function refreshChats() {
   }
 
   if (!res.chats.length) {
-    list.innerHTML = `<div class="muted mt-12">Чатов пока нет. Введи никнейм в поиске выше и открой диалог.</div>`;
+    list.innerHTML = `<div class="muted mt-12">Чатов пока нет. Нажми на 🔍 в правом верхнем углу, чтобы найти человека.</div>`;
     return;
   }
   list.innerHTML = res.chats.map(c => `
@@ -1132,12 +1183,17 @@ def typing_api():
 def search():
     q = (request.args.get("q") or "").strip().lower()
     ex = request.args.get("exclude") or ""
+    if not q:
+        return jsonify({"ok": True, "users": []})
+
+    escaped_q = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT username, emoji FROM users WHERE username <> %s AND LOWER(username) LIKE %s",
-                    (ex, f"%{q}%"),
+                    "SELECT username, emoji FROM users WHERE username <> %s AND LOWER(username) LIKE %s ESCAPE '\\' ORDER BY username ASC",
+                    (ex, f"{escaped_q}%"),
                 )
                 rows = cur.fetchall()
         res = [{"username": r["username"], "emoji": r.get("emoji") or "🍐", "isOwner": is_owner_nick(r["username"])} for r in rows]
@@ -1146,8 +1202,8 @@ def search():
     db = load_json_db()
     res = [
         {"username": k, "emoji": v.get("emoji", "🍐"), "isOwner": is_owner_nick(k)}
-        for k, v in db["users"].items()
-        if k != ex and q in k.lower()
+        for k, v in sorted(db["users"].items(), key=lambda x: x[0].lower())
+        if k != ex and k.lower().startswith(q)
     ]
     return jsonify({"ok": True, "users": res})
 
