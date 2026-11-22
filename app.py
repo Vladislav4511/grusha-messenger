@@ -3,17 +3,60 @@ import os
 import time
 from flask import Flask, request, jsonify, render_template_string, make_response
 
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    psycopg2 = None
+    RealDictCursor = None
+
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "db.json")
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
+USE_PG = bool(DATABASE_URL and psycopg2 is not None)
+
 SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
 OWNER_NICK = "владислав"
 MAX_IMAGE_LEN = 1_500_000
 
 
-def load_db():
-    if not os.path.exists(DB_FILE):
-        return {"users": {}, "chats": {}}
+def get_pg_conn():
+    conn = psycopg2.connect(DATABASE_URL)
+    return conn
+
+
+def init_db():
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        username TEXT PRIMARY KEY,
+                        password TEXT NOT NULL,
+                        emoji TEXT NOT NULL DEFAULT '🍐',
+                        created_at BIGINT NOT NULL,
+                        last_nick_change_at BIGINT NOT NULL
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS messages (
+                        id SERIAL PRIMARY KEY,
+                        chat_key TEXT NOT NULL,
+                        sender TEXT NOT NULL,
+                        text TEXT NOT NULL DEFAULT '',
+                        image TEXT NOT NULL DEFAULT '',
+                        ts BIGINT NOT NULL
+                    )
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_key ON messages(chat_key)")
+    else:
+        if not os.path.exists(DB_FILE):
+            with open(DB_FILE, "w", encoding="utf-8") as f:
+                json.dump({"users": {}, "chats": {}}, f, ensure_ascii=False, indent=2)
+
+
+def load_json_db():
     try:
         with open(DB_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -21,7 +64,7 @@ def load_db():
         return {"users": {}, "chats": {}}
 
 
-def save_db(db):
+def save_json_db(db):
     tmp_file = DB_FILE + ".tmp"
     with open(tmp_file, "w", encoding="utf-8") as f:
         json.dump(db, f, ensure_ascii=False, indent=2)
@@ -36,10 +79,27 @@ def is_owner_nick(username):
     return (username or "").strip().lower() == OWNER_NICK
 
 
-def safe_user(u):
-    data = {k: v for k, v in u.items() if k != "password"}
-    data["isOwner"] = is_owner_nick(data.get("username"))
-    return data
+def format_user(row):
+    username = row["username"]
+    return {
+        "username": username,
+        "emoji": row.get("emoji") or "🍐",
+        "createdAt": int(row.get("createdAt", row.get("created_at", 0)) or 0),
+        "lastNickChangeAt": int(row.get("lastNickChangeAt", row.get("last_nick_change_at", 0)) or 0),
+        "isOwner": is_owner_nick(username),
+    }
+
+
+def get_user(username):
+    if not username:
+        return None
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+                return cur.fetchone()
+    db = load_json_db()
+    return db["users"].get(username)
 
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -554,9 +614,12 @@ renderAvatarChoices();
 
 
 def auth_response(user_dict):
-    resp = make_response(jsonify({"ok": True, "user": safe_user(user_dict)}))
+    resp = make_response(jsonify({"ok": True, "user": format_user(user_dict)}))
     resp.set_cookie("grusha_user", user_dict["username"], max_age=30 * 24 * 3600, samesite="Lax")
     return resp
+
+
+init_db()
 
 
 @app.get("/")
@@ -569,8 +632,7 @@ def get_me():
     nick = request.cookies.get("grusha_user") or (request.args.get("nick") or "").strip()
     if not nick:
         return jsonify({"ok": False})
-    db = load_db()
-    user = db["users"].get(nick)
+    user = get_user(nick)
     if not user:
         return jsonify({"ok": False})
     return auth_response(user)
@@ -583,12 +645,30 @@ def reg():
     p = d.get("password") or ""
     if len(u) < 2 or len(p) < 4:
         return jsonify({"ok": False, "error": "Ник от 2 символов, пароль от 4."})
-    db = load_db()
+    now = int(time.time() * 1000)
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT username FROM users WHERE username = %s", (u,))
+                if cur.fetchone():
+                    return jsonify({"ok": False, "error": "Ник уже занят!"})
+                cur.execute(
+                    """
+                    INSERT INTO users (username, password, emoji, created_at, last_nick_change_at)
+                    VALUES (%s, %s, '🍐', %s, %s)
+                    RETURNING *
+                    """,
+                    (u, p, now, now),
+                )
+                created = cur.fetchone()
+        return auth_response(created)
+
+    db = load_json_db()
     if u in db["users"]:
         return jsonify({"ok": False, "error": "Ник уже занят!"})
-    now = int(time.time() * 1000)
     db["users"][u] = {"username": u, "password": p, "emoji": "🍐", "createdAt": now, "lastNickChangeAt": now}
-    save_db(db)
+    save_json_db(db)
     return auth_response(db["users"][u])
 
 
@@ -597,8 +677,7 @@ def login():
     d = request.get_json(force=True) or {}
     u = (d.get("username") or "").strip()
     p = d.get("password") or ""
-    db = load_db()
-    user = db["users"].get(u)
+    user = get_user(u)
     if not user or user["password"] != p:
         return jsonify({"ok": False, "error": "Неверный ник или пароль."})
     return auth_response(user)
@@ -615,13 +694,20 @@ def logout_api():
 def search():
     q = (request.args.get("q") or "").strip().lower()
     ex = request.args.get("exclude") or ""
-    db = load_db()
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT username, emoji FROM users WHERE username <> %s AND LOWER(username) LIKE %s",
+                    (ex, f"%{q}%"),
+                )
+                rows = cur.fetchall()
+        res = [{"username": r["username"], "emoji": r.get("emoji") or "🍐", "isOwner": is_owner_nick(r["username"])} for r in rows]
+        return jsonify({"ok": True, "users": res})
+
+    db = load_json_db()
     res = [
-        {
-            "username": k,
-            "emoji": v.get("emoji", "🍐"),
-            "isOwner": is_owner_nick(k),
-        }
+        {"username": k, "emoji": v.get("emoji", "🍐"), "isOwner": is_owner_nick(k)}
         for k, v in db["users"].items()
         if k != ex and q in k.lower()
     ]
@@ -631,7 +717,40 @@ def search():
 @app.get("/api/chats")
 def chats():
     u = request.args.get("user") or ""
-    db = load_db()
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT username, emoji FROM users")
+                users_map = {r["username"]: (r.get("emoji") or "🍐") for r in cur.fetchall()}
+
+                cur.execute(
+                    """
+                    SELECT DISTINCT ON (chat_key) chat_key, text, image, ts
+                    FROM messages
+                    WHERE chat_key LIKE %s OR chat_key LIKE %s
+                    ORDER BY chat_key, id DESC
+                    """,
+                    (f"{u}::%", f"%::{u}"),
+                )
+                last_rows = cur.fetchall()
+
+        out = []
+        for r in last_rows:
+            a, b = r["chat_key"].split("::")
+            peer = b if a == u else (a if b == u else None)
+            if peer and peer in users_map:
+                preview_text = r.get("text") or ("📷 Картинка" if r.get("image") else "Сообщений пока нет")
+                out.append({
+                    "username": peer,
+                    "emoji": users_map[peer],
+                    "isOwner": is_owner_nick(peer),
+                    "last": preview_text,
+                    "ts": int(r.get("ts") or 0),
+                })
+        out.sort(key=lambda x: x["ts"], reverse=True)
+        return jsonify({"ok": True, "chats": out})
+
+    db = load_json_db()
     out = []
     for k, m in db["chats"].items():
         if not m:
@@ -656,8 +775,25 @@ def chats():
 def msgs():
     a = request.args.get("a") or ""
     b = request.args.get("b") or ""
-    db = load_db()
-    return jsonify({"ok": True, "msgs": db["chats"].get(chat_key(a, b), [])})
+    ck = chat_key(a, b)
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT sender AS \"from\", text, image, ts FROM messages WHERE chat_key = %s ORDER BY id ASC",
+                    (ck,),
+                )
+                rows = cur.fetchall()
+        formatted = []
+        for r in rows:
+            item = {"from": r["from"], "text": r.get("text") or "", "ts": int(r.get("ts") or 0)}
+            if r.get("image"):
+                item["image"] = r["image"]
+            formatted.append(item)
+        return jsonify({"ok": True, "msgs": formatted})
+
+    db = load_json_db()
+    return jsonify({"ok": True, "msgs": db["chats"].get(ck, [])})
 
 
 @app.post("/api/send")
@@ -669,25 +805,42 @@ def send():
     img = d.get("image") or ""
     if img and not (img.startswith("data:image/") and len(img) <= MAX_IMAGE_LEN):
         img = ""
-    if not txt and not img:
+    if not f or not t or (not txt and not img):
         return jsonify({"ok": False})
-    msg_item = {"from": f, "text": txt, "ts": int(time.time() * 1000)}
+    ts = int(time.time() * 1000)
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO messages (chat_key, sender, text, image, ts) VALUES (%s, %s, %s, %s, %s)",
+                    (chat_key(f, t), f, txt, img, ts),
+                )
+        return jsonify({"ok": True})
+
+    msg_item = {"from": f, "text": txt, "ts": ts}
     if img:
         msg_item["image"] = img
-    db = load_db()
+    db = load_json_db()
     db["chats"].setdefault(chat_key(f, t), []).append(msg_item)
-    save_db(db)
+    save_json_db(db)
     return jsonify({"ok": True})
 
 
 @app.post("/api/emoji")
 def emoji():
     d = request.get_json(force=True) or {}
-    u, em = d.get("username") or "", d.get("emoji") or "🍐"
-    db = load_db()
+    u, em = (d.get("username") or "").strip(), d.get("emoji") or "🍐"
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET emoji = %s WHERE username = %s", (em, u))
+        return jsonify({"ok": True})
+
+    db = load_json_db()
     if u in db["users"]:
         db["users"][u]["emoji"] = em
-        save_db(db)
+        save_json_db(db)
     return jsonify({"ok": True})
 
 
@@ -695,15 +848,42 @@ def emoji():
 def nick():
     d = request.get_json(force=True) or {}
     old_n, new_n = (d.get("oldNick") or "").strip(), (d.get("newNick") or "").strip()
-    db = load_db()
-    user = db["users"].get(old_n)
+    user = get_user(old_n)
     if not user:
         return jsonify({"ok": False, "error": "Аккаунт не найден."})
     now = int(time.time() * 1000)
-    if now - (user.get("lastNickChangeAt") or user.get("createdAt") or now) > SEVEN_DAYS_MS:
+    created_at = int(user.get("createdAt", user.get("created_at", now)) or now)
+    last_change = int(user.get("lastNickChangeAt", user.get("last_nick_change_at", created_at)) or created_at)
+    if now - last_change > SEVEN_DAYS_MS:
         return jsonify({"ok": False, "error": "7 дней прошло, сменить ник нельзя."})
     if len(new_n) < 2:
         return jsonify({"ok": False, "error": "Ник слишком короткий."})
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT username FROM users WHERE username = %s", (new_n,))
+                if cur.fetchone():
+                    return jsonify({"ok": False, "error": "Ник уже занят!"})
+                cur.execute(
+                    """
+                    INSERT INTO users (username, password, emoji, created_at, last_nick_change_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (new_n, user["password"], user.get("emoji") or "🍐", created_at, now),
+                )
+                cur.execute("SELECT chat_key FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{old_n}::%", f"%::{old_n}"))
+                keys = [r["chat_key"] for r in cur.fetchall()]
+                for k in set(keys):
+                    parts = [new_n if x == old_n else x for x in k.split("::")]
+                    cur.execute("UPDATE messages SET chat_key = %s WHERE chat_key = %s", (chat_key(parts[0], parts[1]), k))
+                cur.execute("UPDATE messages SET sender = %s WHERE sender = %s", (new_n, old_n))
+                cur.execute("DELETE FROM users WHERE username = %s", (old_n,))
+                cur.execute("SELECT * FROM users WHERE username = %s", (new_n,))
+                updated = cur.fetchone()
+        return auth_response(updated)
+
+    db = load_json_db()
     if new_n in db["users"]:
         return jsonify({"ok": False, "error": "Ник уже занят!"})
     db["users"][new_n] = {**user, "username": new_n, "lastNickChangeAt": now}
@@ -713,18 +893,27 @@ def nick():
         parts = [new_n if x == old_n else x for x in k.split("::")]
         new_chats[chat_key(parts[0], parts[1])] = [{**x, "from": new_n if x["from"] == old_n else x["from"]} for x in m]
     db["chats"] = new_chats
-    save_db(db)
+    save_json_db(db)
     return auth_response(db["users"][new_n])
 
 
 @app.post("/api/delete")
 def delete():
     d = request.get_json(force=True) or {}
-    u = d.get("username") or ""
-    db = load_db()
+    u = (d.get("username") or "").strip()
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{u}::%", f"%::{u}"))
+                cur.execute("DELETE FROM users WHERE username = %s", (u,))
+        resp = make_response(jsonify({"ok": True}))
+        resp.delete_cookie("grusha_user")
+        return resp
+
+    db = load_json_db()
     db["users"].pop(u, None)
     db["chats"] = {k: v for k, v in db["chats"].items() if u not in k.split("::")}
-    save_db(db)
+    save_json_db(db)
     resp = make_response(jsonify({"ok": True}))
     resp.delete_cookie("grusha_user")
     return resp
