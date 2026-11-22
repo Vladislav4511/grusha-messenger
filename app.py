@@ -40,20 +40,43 @@ def sanitize_user_emoji(em):
     return val
 
 
-def push_user_alert(username, kind, title, body):
+def push_user_alert(username, kind, title, body, group_id="", actor_nick="", action_text="", peer=""):
     u = (username or "").strip()
     if not u:
         return
     now = int(time.time() * 1000)
+    clean_actor = str(actor_nick or "").strip().lstrip("@")
     USER_ALERTS.setdefault(u, []).append({
         "id": f"al_{uuid.uuid4().hex[:10]}",
         "kind": kind,
         "title": title,
         "body": body,
+        "groupId": group_id,
+        "actorNick": clean_actor,
+        "actionText": action_text or body,
+        "peer": peer,
         "ts": now,
     })
-    if len(USER_ALERTS[u]) > 50:
-        USER_ALERTS[u] = USER_ALERTS[u][-50:]
+    if len(USER_ALERTS[u]) > 80:
+        USER_ALERTS[u] = USER_ALERTS[u][-80:]
+
+
+def push_action_alert(target_username, actor_nick, action_text, kind="action", group_id="", peer=""):
+    u = (target_username or "").strip()
+    actor = (actor_nick or "").strip().lstrip("@")
+    if not u or not actor or u == actor:
+        return
+    title = f'Груша: "@{actor}"'
+    push_user_alert(
+        u,
+        kind=kind,
+        title=title,
+        body=action_text,
+        group_id=group_id,
+        actor_nick=actor,
+        action_text=action_text,
+        peer=peer,
+    )
 
 
 def get_pg_conn():
@@ -440,6 +463,8 @@ HTML_PAGE = """<!DOCTYPE html>
     --accent: #9be15d;
     --accent-contrast: #101511;
     --accent-soft: rgba(155, 225, 93, 0.18);
+    --check-blue: #2196f3;
+    --check-ink: #ffffff;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -585,8 +610,8 @@ HTML_PAGE = """<!DOCTYPE html>
     width: 17px;
     height: 17px;
     border-radius: 50%;
-    background: var(--accent);
-    color: var(--accent-contrast);
+    background: var(--check-blue) !important;
+    color: var(--check-ink) !important;
     font-size: 11px;
     font-weight: 900;
     line-height: 1;
@@ -1536,8 +1561,6 @@ let lastChatsScrollTop = 0;
 let seenGroupMsgIds = new Set();
 let seenDirectMsgIds = new Set();
 let roomHistoryInitialized = false;
-let notifiedDirectMsgIds = new Set();
-let directNotifInitDone = false;
 let seenAlertIds = new Set();
 let autoPermPromptTried = false;
 
@@ -1562,7 +1585,6 @@ let pendingOfferToApply = null;
 let pendingRemoteCandidates = [];
 let sentCandidateKeys = new Set();
 let appliedCandidateKeys = new Set();
-let answerSent = false;
 let announcedIncomingCallId = "";
 let renegotiating = false;
 let needsRenegotiate = false;
@@ -1614,13 +1636,13 @@ function refreshNotificationUiStatus() {
   }
   const perm = Notification.permission;
   if (perm === "granted") {
-    txt.textContent = "Уведомления разрешены: придут для личных сообщений, звонков и групп.";
+    txt.textContent = 'Уведомления браузера включены: приходят в виде Груша: "@ник" и действие.';
     btn.classList.add("hidden");
   } else if (perm === "denied") {
     txt.textContent = "Уведомления запрещены в настройках браузера для этого сайта. Разреши их в значке 🔒 в адресной строке.";
     btn.classList.remove("hidden");
   } else {
-    txt.textContent = "Нажми кнопку ниже, чтобы браузер спросил разрешение на уведомления.";
+    txt.textContent = "Нажми кнопку ниже, чтобы браузер разрешил присылать уведомления.";
     btn.classList.remove("hidden");
   }
 }
@@ -1635,7 +1657,7 @@ async function requestNotificationPermissionFromUser() {
     refreshNotificationUiStatus();
     if (perm === "granted") {
       playSound("react");
-      showBrowserNativeNotification("🍐 Груша", "Уведомления включены!");
+      emitGrushaBrowserAction(me ? me.username : "Система", "включил уведомления браузера");
     } else if (perm === "denied") {
       showInAppAlert("Уведомления заблокированы", "Включи уведомления для сайта в настройках браузера (иконка замочка/настроек в адресной строке).");
     }
@@ -1688,6 +1710,15 @@ function showBrowserNativeNotification(title, body) {
   } catch (e) {}
 }
 
+function emitGrushaBrowserAction(nickname, actionText, { isDirectMessage = false, peer = "" } = {}) {
+  if (isDirectMessage && peer && isDirectPeerMuted(peer)) {
+    return;
+  }
+  const cleanNick = String(nickname || "пользователь").trim().replace(/^@+/, "") || "пользователь";
+  const title = `Груша: "@${cleanNick}"`;
+  showBrowserNativeNotification(title, actionText || "совершил действие");
+}
+
 function showInAppAlert(title, body) {
   const box = document.getElementById("inAppToastBox");
   if (!box) return;
@@ -1702,14 +1733,18 @@ function showInAppAlert(title, body) {
   `;
 }
 
-function triggerSystemNotification(title, body, { allowInApp = true, isDirectMessage = false, peer = "" } = {}) {
+function triggerSystemNotification(title, body, { allowInApp = true, isDirectMessage = false, peer = "", actorNick = "", actionText = "" } = {}) {
   if (isDirectMessage && peer && isDirectPeerMuted(peer)) {
     return;
   }
   if (allowInApp) {
     showInAppAlert(title, body);
   }
-  showBrowserNativeNotification(title, body);
+  if (actorNick || actionText) {
+    emitGrushaBrowserAction(actorNick || title, actionText || body, { isDirectMessage, peer });
+  } else {
+    showBrowserNativeNotification(title, body);
+  }
 }
 
 function getAudioContext() {
@@ -1973,11 +2008,11 @@ function cleanupLocalCallResources() {
   pendingRemoteCandidates = [];
   sentCandidateKeys = new Set();
   appliedCandidateKeys = new Set();
-  answerSent = false;
   announcedIncomingCallId = "";
   hideCallModalUi();
 }
 
+/* Камера НИКОГДА не включается здесь — только микрофон (audio: true, video: false) */
 async function ensureLocalAudioStream() {
   if (localStream && localStream.getAudioTracks().length > 0) {
     localStream.getAudioTracks().forEach(t => { t.enabled = !micMuted; });
@@ -1994,6 +2029,7 @@ async function ensureLocalAudioStream() {
     },
     video: false
   });
+  audioOnly.getAudioTracks().forEach(t => { t.enabled = !micMuted; });
   if (!localStream) {
     localStream = audioOnly;
   } else {
@@ -2012,6 +2048,7 @@ async function flushRenegotiateIfReady() {
   try {
     const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
     await pc.setLocalDescription(offer);
+    callState.lastAppliedOfferJson = JSON.stringify(pc.localDescription);
     await api("/api/call/offer", {
       callId: callState.callId,
       from: me.username,
@@ -2133,17 +2170,20 @@ async function enqueueOrAddRemoteCandidate(candObj) {
   }
 }
 
+/* Привязываем входящие треки по kind (аудио и видео отдельно), чтобы каждый говорящий слышался и ничего не затиралось */
 function attachTrackToRemoteStream(track) {
   if (!track) return;
   if (!remoteStream) {
     remoteStream = new MediaStream();
   }
-  const existing = remoteStream.getTracks().find(t => t.id === track.id || t.kind === track.kind);
-  if (existing && existing.id !== track.id) {
-    remoteStream.removeTrack(existing);
-  }
+  const sameKindTracks = remoteStream.getTracks().filter(t => t.kind === track.kind && t.id !== track.id);
+  sameKindTracks.forEach(t => remoteStream.removeTrack(t));
+
   if (!remoteStream.getTracks().some(t => t.id === track.id)) {
     remoteStream.addTrack(track);
+  }
+  if (track.kind === "audio") {
+    track.enabled = true;
   }
   track.onunmute = () => syncRemoteMediaElements();
   track.onmute = () => syncRemoteMediaElements();
@@ -2168,6 +2208,10 @@ function createPeerConnectionForCall(cid) {
 
   if (localStream) {
     localStream.getTracks().forEach(track => {
+      if (track.kind === "video" && !cameraEnabled) return;
+      if (track.kind === "audio") {
+        track.enabled = !micMuted;
+      }
       const existingSender = conn.getSenders().find(s => s.track && s.track.kind === track.kind);
       if (existingSender) {
         existingSender.replaceTrack(track).catch(() => {});
@@ -2227,6 +2271,8 @@ async function startDirectCall() {
   if (callState) return;
   playSound("click");
   requestPageFullscreen();
+  cameraEnabled = false;
+  micMuted = false;
 
   try {
     await ensureLocalAudioStream();
@@ -2273,6 +2319,8 @@ async function acceptIncomingCall() {
   if (!me || !callState || callState.isCaller) return;
   playSound("join");
   requestPageFullscreen();
+  cameraEnabled = false;
+  micMuted = false;
 
   try {
     await ensureLocalAudioStream();
@@ -2296,7 +2344,6 @@ async function acceptIncomingCall() {
     const answer = await pc.createAnswer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
     await pc.setLocalDescription(answer);
     callState.lastAppliedAnswerJson = JSON.stringify(pc.localDescription);
-    answerSent = true;
     await api("/api/call/answer", {
       callId: cid,
       from: me.username,
@@ -2314,11 +2361,19 @@ async function acceptIncomingCall() {
 }
 
 function toggleMicMute() {
-  if (!localStream) return;
   micMuted = !micMuted;
-  localStream.getAudioTracks().forEach(track => {
-    track.enabled = !micMuted;
-  });
+  if (localStream) {
+    localStream.getAudioTracks().forEach(track => {
+      track.enabled = !micMuted;
+    });
+  }
+  if (pc) {
+    pc.getSenders().forEach(sender => {
+      if (sender.track && sender.track.kind === "audio") {
+        sender.track.enabled = !micMuted;
+      }
+    });
+  }
   playSound("click");
   const btn = document.getElementById("btnToggleMic");
   if (btn) {
@@ -2382,9 +2437,9 @@ async function pollCallStatus() {
       if (announcedIncomingCallId !== c.callId) {
         announcedIncomingCallId = c.callId;
         triggerSystemNotification(
-          "Вас пригласили в звонок",
-          `@${peerUser} вызывает вас на звонок`,
-          { allowInApp: true, isDirectMessage: false }
+          `Груша: "@${peerUser}"`,
+          "вызывает вас на звонок",
+          { allowInApp: true, isDirectMessage: false, actorNick: peerUser, actionText: "вызывает вас на звонок" }
         );
       }
     }
@@ -2478,16 +2533,40 @@ async function pollUserAlerts() {
   for (const al of res.alerts) {
     if (!al || !al.id || seenAlertIds.has(al.id)) continue;
     seenAlertIds.add(al.id);
+    const actor = al.actorNick || "пользователь";
+    const actText = al.actionText || al.body || "совершил действие";
+
     if (al.kind === "kicked") {
       playSound("leave");
-      triggerSystemNotification("Вас удалили", al.body || "Вас удалили из группы", { allowInApp: true });
+      triggerSystemNotification(
+        `Груша: "@${actor}"`,
+        actText,
+        { allowInApp: true, actorNick: actor, actionText: actText }
+      );
       if (activeChat && activeChat.type === "group" && (!al.groupId || activeChat.id === al.groupId)) {
         backToChats();
       }
     } else if (al.kind === "added_to_group") {
       playSound("join");
-      triggerSystemNotification("Вас добавили в группу", al.body || "Вас добавили в новую группу", { allowInApp: true });
+      triggerSystemNotification(
+        `Груша: "@${actor}"`,
+        actText,
+        { allowInApp: true, actorNick: actor, actionText: actText }
+      );
       refreshChats();
+    } else if (al.kind === "direct_msg") {
+      const viewingThisChat = !document.hidden && activeChat && activeChat.type === "direct" && activeChat.username === (al.peer || actor);
+      if (!viewingThisChat) {
+        emitGrushaBrowserAction(actor, actText, { isDirectMessage: true, peer: al.peer || actor });
+      }
+    } else if (al.kind === "call_invite") {
+      emitGrushaBrowserAction(actor, actText, { isDirectMessage: false });
+    } else if (al.kind === "group_join") {
+      emitGrushaBrowserAction(actor, actText, { isDirectMessage: false });
+    } else if (al.kind === "group_leave") {
+      emitGrushaBrowserAction(actor, actText, { isDirectMessage: false });
+    } else {
+      emitGrushaBrowserAction(actor, actText, { isDirectMessage: false });
     }
   }
 }
@@ -2684,6 +2763,9 @@ function applyCustom(cfg) {
   rootStyle.setProperty("--accent", palette.accent);
   rootStyle.setProperty("--accent-contrast", palette.contrast);
   rootStyle.setProperty("--accent-soft", palette.soft);
+  /* Галочки всегда остаются голубыми в любой теме */
+  rootStyle.setProperty("--check-blue", "#2196f3");
+  rootStyle.setProperty("--check-ink", "#ffffff");
 
   rootStyle.setProperty("--msg-font-size", `${cfg.msgSize}px`);
   rootStyle.setProperty("--emoji-size", `${cfg.emojiSize}px`);
@@ -2844,7 +2926,7 @@ function enterChats() {
   document.getElementById("myNick").innerHTML = nickLabelHtml(me.username, me.isOwner);
   refreshNotificationUiStatus();
   if ("Notification" in window && Notification.permission === "default") {
-    showInAppAlert("Включить уведомления?", "Разреши уведомления для личных сообщений и звонков.");
+    showInAppAlert("Включить уведомления?", "Разреши уведомления в браузере или в Настройках.");
   }
   showScreen("chatsScreen");
   refreshChats();
@@ -3427,28 +3509,6 @@ async function refreshChats() {
       activeChat.tripleBadge = Boolean(matchedGroup.tripleBadge);
       document.getElementById("peerAva").textContent = activeChat.emoji;
       document.getElementById("peerNick").innerHTML = groupTitleHtml(matchedGroup.title, activeChat.tripleBadge);
-    }
-  }
-
-  /* Браузерные уведомления только о новых личных сообщениях (не в группах) */
-  const directItems = res.chats.filter(c => c.type !== "group" && c.lastMsgId && c.lastSender && c.lastSender !== me.username);
-  if (!directNotifInitDone) {
-    directNotifInitDone = true;
-    directItems.forEach(c => notifiedDirectMsgIds.add(String(c.lastMsgId)));
-  } else {
-    for (const c of directItems) {
-      const mid = String(c.lastMsgId);
-      if (!notifiedDirectMsgIds.has(mid)) {
-        notifiedDirectMsgIds.add(mid);
-        const viewingThisChat = !document.hidden && activeChat && activeChat.type === "direct" && activeChat.username === c.username;
-        if (!viewingThisChat) {
-          triggerSystemNotification(
-            `Сообщение от @${c.username}`,
-            c.last || "Новое сообщение",
-            { allowInApp: true, isDirectMessage: true, peer: c.username }
-          );
-        }
-      }
     }
   }
 
@@ -4188,6 +4248,7 @@ def call_start():
         "updatedAt": now,
         "connectedAt": None,
     }
+    push_action_alert(callee, caller, "позвонил вам", kind="call_invite", peer=caller)
     return jsonify({"ok": True, "callId": cid})
 
 
@@ -4251,6 +4312,9 @@ def call_end():
     if c and (not from_u or from_u in (c.get("caller"), c.get("callee"))):
         c["status"] = "ended"
         c["updatedAt"] = int(time.time() * 1000)
+        other = c.get("callee") if from_u == c.get("caller") else c.get("caller")
+        if other and from_u:
+            push_action_alert(other, from_u, "завершил звонок", kind="call_end", peer=from_u)
     return jsonify({"ok": True})
 
 
@@ -4549,22 +4613,24 @@ def send():
                     "INSERT INTO messages (chat_key, sender, text, image, ts, reply_to_json, reactions_json) VALUES (%s, %s, %s, %s, %s, %s, '{}')",
                     (chat_key(f, t), f, txt, img, ts, json.dumps(rep, ensure_ascii=False) if rep else ""),
                 )
-        return jsonify({"ok": True})
+    else:
+        msg_item = {
+            "id": f"d_{uuid.uuid4().hex[:10]}",
+            "from": f,
+            "text": txt,
+            "ts": ts,
+            "reactions": {},
+        }
+        if img:
+            msg_item["image"] = img
+        if rep:
+            msg_item["replyTo"] = rep
+        db = load_json_db()
+        db["chats"].setdefault(chat_key(f, t), []).append(msg_item)
+        save_json_db(db)
 
-    msg_item = {
-        "id": f"d_{uuid.uuid4().hex[:10]}",
-        "from": f,
-        "text": txt,
-        "ts": ts,
-        "reactions": {},
-    }
-    if img:
-        msg_item["image"] = img
-    if rep:
-        msg_item["replyTo"] = rep
-    db = load_json_db()
-    db["chats"].setdefault(chat_key(f, t), []).append(msg_item)
-    save_json_db(db)
+    action_label = f"написал: {txt}" if txt else "отправил картинку"
+    push_action_alert(t, f, action_label, kind="direct_msg", peer=f)
     return jsonify({"ok": True})
 
 
@@ -4682,7 +4748,7 @@ def create_group():
                 row = cur.fetchone()
         for m_nick in members_clean:
             if m_nick != owner:
-                push_user_alert(m_nick, "added_to_group", "Вас добавили в группу", f"@{owner} добавил вас в группу «{title}»")
+                push_action_alert(m_nick, owner, f'добавил вас в группу "{title}"', kind="added_to_group", group_id=gid)
         return jsonify({"ok": True, "group": format_group_row(row)})
 
     db = load_json_db()
@@ -4701,7 +4767,7 @@ def create_group():
     save_json_db(db)
     for m_nick in members_clean:
         if m_nick != owner:
-            push_user_alert(m_nick, "added_to_group", "Вас добавили в группу", f"@{owner} добавил вас в группу «{title}»")
+            push_action_alert(m_nick, owner, f'добавил вас в группу "{title}"', kind="added_to_group", group_id=gid)
     return jsonify({"ok": True, "group": group_obj})
 
 
@@ -4779,7 +4845,10 @@ def group_add_members():
 
     for nick in added:
         append_group_system_message(gid, f'"{nick}" зашел', "join")
-        push_user_alert(nick, "added_to_group", "Вас добавили в группу", f"@{actor} добавил вас в группу «{g['title']}»")
+        push_action_alert(nick, actor, f'добавил вас в группу "{g["title"]}"', kind="added_to_group", group_id=gid)
+        for m_nick in members:
+            if m_nick not in (actor, nick):
+                push_action_alert(m_nick, nick, f'зашел в группу "{g["title"]}"', kind="group_join", group_id=gid)
 
     return jsonify({"ok": True, "added": added, "group": get_group_by_id(gid)})
 
@@ -4814,6 +4883,9 @@ def group_leave():
             save_json_db(db)
 
     append_group_system_message(gid, f'"{actor}" вышел', "leave")
+    for m_nick in members:
+        if m_nick != actor:
+            push_action_alert(m_nick, actor, f'вышел из группы "{g["title"]}"', kind="group_leave", group_id=gid)
     return jsonify({"ok": True})
 
 
@@ -5004,7 +5076,7 @@ def group_kick():
             save_json_db(db)
 
     append_group_system_message(gid, f'"{target}" вышел', "leave")
-    push_user_alert(target, "kicked", "Вас удалили", f"Вас удалили из группы «{g['title']}»")
+    push_action_alert(target, actor, f'удалил вас из группы "{g["title"]}"', kind="kicked", group_id=gid)
     return jsonify({"ok": True})
 
 
