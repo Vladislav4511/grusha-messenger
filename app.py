@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import uuid
 from flask import Flask, request, jsonify, render_template_string, make_response
 
 try:
@@ -22,6 +23,9 @@ OWNER_NICK = "владислав"
 MAX_IMAGE_LEN = 1_500_000
 
 TYPING_STATUS = {}
+
+# Fallback JSON структура при запуске без DATABASE_URL:
+# {"users": {}, "chats": {}, "groups": {group_id: {...}}, "group_msgs": {group_id: [...]}}
 
 
 def get_pg_conn():
@@ -52,18 +56,46 @@ def init_db():
                     )
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_key ON messages(chat_key)")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS groups (
+                        id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        emoji TEXT NOT NULL DEFAULT '👥',
+                        owner TEXT NOT NULL,
+                        members_json TEXT NOT NULL DEFAULT '[]',
+                        muted_json TEXT NOT NULL DEFAULT '[]',
+                        created_at BIGINT NOT NULL
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS group_messages (
+                        id SERIAL PRIMARY KEY,
+                        group_id TEXT NOT NULL,
+                        sender TEXT NOT NULL,
+                        text TEXT NOT NULL DEFAULT '',
+                        image TEXT NOT NULL DEFAULT '',
+                        ts BIGINT NOT NULL
+                    )
+                """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_group_messages_gid ON group_messages(group_id)")
     else:
         if not os.path.exists(DB_FILE):
             with open(DB_FILE, "w", encoding="utf-8") as f:
-                json.dump({"users": {}, "chats": {}}, f, ensure_ascii=False, indent=2)
+                json.dump({"users": {}, "chats": {}, "groups": {}, "group_msgs": {}}, f, ensure_ascii=False, indent=2)
 
 
 def load_json_db():
     try:
         with open(DB_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            data.setdefault("users", {})
+            data.setdefault("chats", {})
+            data.setdefault("groups", {})
+            data.setdefault("group_msgs", {})
+            return data
     except Exception:
-        return {"users": {}, "chats": {}}
+        return {"users": {}, "chats": {}, "groups": {}, "group_msgs": {}}
 
 
 def save_json_db(db):
@@ -77,6 +109,10 @@ def chat_key(a, b):
     return "::".join(sorted([a, b]))
 
 
+def group_typing_key(group_id):
+    return f"grp::{group_id}"
+
+
 def is_owner_nick(username):
     return (username or "").strip().lower() == OWNER_NICK
 
@@ -84,6 +120,16 @@ def is_owner_nick(username):
 def is_peer_typing(peer, me_nick):
     ts = TYPING_STATUS.get((peer, me_nick), 0)
     return (int(time.time() * 1000) - ts) <= TYPING_TTL_MS
+
+
+def get_group_typing_users(group_id, exclude_nick):
+    now = int(time.time() * 1000)
+    target = group_typing_key(group_id)
+    active = []
+    for (sender, room_id), ts in TYPING_STATUS.items():
+        if room_id == target and sender != exclude_nick and (now - ts) <= TYPING_TTL_MS:
+            active.append(sender)
+    return active
 
 
 def format_user(row):
@@ -107,6 +153,54 @@ def get_user(username):
                 return cur.fetchone()
     db = load_json_db()
     return db["users"].get(username)
+
+
+def parse_json_list(val):
+    if isinstance(val, list):
+        return val
+    try:
+        parsed = json.loads(val or "[]")
+        return parsed if isinstance(parsed, list) else []
+    except Exception:
+        return []
+
+
+def format_group_row(row):
+    members = parse_json_list(row.get("members_json") if isinstance(row, dict) else getattr(row, "members_json", "[]"))
+    muted = parse_json_list(row.get("muted_json") if isinstance(row, dict) else getattr(row, "muted_json", "[]"))
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "emoji": row.get("emoji") or "👥",
+        "owner": row["owner"],
+        "members": members,
+        "muted": muted,
+        "createdAt": int(row.get("created_at", 0) or 0),
+    }
+
+
+def get_group_by_id(group_id):
+    if not group_id:
+        return None
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM groups WHERE id = %s", (group_id,))
+                row = cur.fetchone()
+                return format_group_row(row) if row else None
+    db = load_json_db()
+    g = db["groups"].get(group_id)
+    if not g:
+        return None
+    return {
+        "id": g["id"],
+        "title": g["title"],
+        "emoji": g.get("emoji") or "👥",
+        "owner": g["owner"],
+        "members": list(g.get("members") or []),
+        "muted": list(g.get("muted") or []),
+        "createdAt": int(g.get("createdAt") or 0),
+    }
 
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -206,6 +300,8 @@ HTML_PAGE = """<!DOCTYPE html>
   }
   button.sec { background: #263228; color: #eef5ee; }
   button.del { background: #b93838; color: #fff; }
+  button.warn { background: #c88a1e; color: #101511; }
+  button.blue-btn { background: #2da9ff; color: #ffffff; }
   .mt-8 { margin-top: 8px; }
   .mt-12 { margin-top: 12px; }
   .err { color: #ff7b7b; font-size: 13px; margin-top: 8px; min-height: 18px; }
@@ -256,12 +352,95 @@ HTML_PAGE = """<!DOCTYPE html>
     flex-shrink: 0;
   }
 
+  /* Плавающий голубой кружок с карандашом */
+  .fab-create {
+    position: fixed;
+    right: max(18px, calc(50% - 220px));
+    bottom: 22px;
+    width: 54px;
+    height: 54px;
+    border-radius: 50%;
+    background: #2da9ff;
+    color: #ffffff;
+    font-size: 22px;
+    display: grid;
+    place-items: center;
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45);
+    z-index: 25;
+    transition: transform 0.22s ease, opacity 0.22s ease;
+  }
+  .fab-create.fab-hidden {
+    transform: translateY(84px) scale(0.8);
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  /* Выбор участников для группы */
+  .member-pick {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: #202a21;
+    margin-top: 8px;
+    cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .member-pick.selected {
+    border-color: #2da9ff;
+    background: #1c2b36;
+  }
+  .member-pick input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    accent-color: #2da9ff;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  /* Строка участника в настройках группы */
+  .group-member-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px;
+    border-radius: 12px;
+    background: #202a21;
+    margin-top: 8px;
+  }
+  .group-member-btns {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+  }
+  .mini-btn {
+    padding: 6px 9px;
+    font-size: 12px;
+    border-radius: 8px;
+  }
+
   #roomScreen {
     flex: 1;
     display: flex;
     flex-direction: column;
     min-height: 0;
     overflow: hidden;
+  }
+  .room-title-btn {
+    background: transparent;
+    color: #f3f7f3;
+    padding: 2px 4px;
+    text-align: left;
+    font-size: 15px;
+    font-weight: 700;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .room-title-btn.clickable-title:hover {
+    text-decoration: underline;
   }
   .msgs {
     flex: 1;
@@ -271,6 +450,12 @@ HTML_PAGE = """<!DOCTYPE html>
     flex-direction: column;
     gap: 8px;
     padding: 12px 14px;
+  }
+  .msg-sender {
+    font-size: 11px;
+    font-weight: 700;
+    opacity: 0.78;
+    margin-bottom: 3px;
   }
   .m {
     padding: 9px 12px;
@@ -310,6 +495,14 @@ HTML_PAGE = """<!DOCTYPE html>
     background: #1b231c;
     border-top: 1px solid #28342a;
     padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .muted-banner {
+    padding: 10px 14px;
+    background: #2c2115;
+    color: #ffcf70;
+    font-size: 13px;
+    text-align: center;
+    border-top: 1px solid #47351d;
   }
   .em-row {
     display: flex;
@@ -418,10 +611,42 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="sec" title="Настройки" onclick="openSettings()">⚙️</button>
       </div>
     </div>
-    <div class="pad">
+    <div class="pad" id="chatsScrollArea" onscroll="onChatsScroll()">
       <div class="muted" style="font-weight:700;">Чаты</div>
-      <div id="chatList"></div>
+      <div id="chatList" style="padding-bottom:76px;"></div>
     </div>
+    <button type="button" id="fabCreateBtn" class="fab-create fab-hidden" title="Создать группу" onclick="openCreateGroup()">✏️</button>
+  </div>
+
+  <div id="createGroupScreen" class="hidden" style="flex:1; display:flex; flex-direction:column; min-height:0;">
+    <div class="top">
+      <button class="sec" onclick="backToChats()">← Назад</button>
+      <strong>Создать группу (скоро добавим больше)</strong>
+      <span style="width:44px;"></span>
+    </div>
+    <div class="pad">
+      <div style="font-weight:700;">Название группы</div>
+      <input id="groupTitleInput" class="mt-8" placeholder="Например: Свои люди" maxlength="40" autocomplete="off">
+
+      <div style="font-weight:700; margin-top:14px;">Иконка группы</div>
+      <div id="groupIconPicker" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;"></div>
+      <div class="muted mt-8">Выбрана иконка: <strong id="selectedGroupIconLabel">👥</strong></div>
+
+      <div style="font-weight:700; margin-top:16px;">Добавить участников (из тех, с кем был чат)</div>
+      <div id="groupCandidatesList" class="mt-8"></div>
+
+      <div id="createGroupErr" class="err"></div>
+      <button type="button" class="blue-btn mt-12" style="width:100%;" onclick="submitCreateGroup()">Создать группу</button>
+    </div>
+  </div>
+
+  <div id="groupSettingsScreen" class="hidden" style="flex:1; display:flex; flex-direction:column; min-height:0;">
+    <div class="top">
+      <button class="sec" onclick="backToRoomFromGroupSettings()">← В чат</button>
+      <strong>Настройки чата</strong>
+      <span style="width:52px;"></span>
+    </div>
+    <div class="pad" id="groupSettingsBody"></div>
   </div>
 
   <div id="searchScreen" class="hidden" style="flex:1; display:flex; flex-direction:column; min-height:0;">
@@ -443,33 +668,38 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="sec" onclick="backToChats()">← Чаты</button>
         <div class="ava" id="peerAva">🍐</div>
         <div style="min-width:0;">
-          <div class="chat-name" id="peerNick">@peer</div>
+          <button type="button" id="peerTitleBtn" class="room-title-btn" onclick="onRoomTitleClick()">
+            <span id="peerNick">@peer</span>
+          </button>
           <div class="typing-line" id="peerStatus"></div>
         </div>
       </div>
     </div>
     <div id="msgsBox" class="msgs"></div>
     <div class="bottom-dock" id="bottomDock">
-      <div class="em-row">
-        <button type="button" class="em-btn" onclick="insertEmoji('😀')">😀</button>
-        <button type="button" class="em-btn" onclick="insertEmoji('😂')">😂</button>
-        <button type="button" class="em-btn" onclick="insertEmoji('❤️')">❤️</button>
-        <button type="button" class="em-btn" onclick="insertEmoji('🔥')">🔥</button>
-        <button type="button" class="em-btn" onclick="insertEmoji('👍')">👍</button>
-        <button type="button" class="em-btn" onclick="insertEmoji('🍐')">🍐</button>
-        <button type="button" class="em-btn" onclick="insertEmoji('🎉')">🎉</button>
-        <button type="button" class="em-btn" onclick="insertEmoji('😭')">😭</button>
-      </div>
-      <div id="attachPreview" class="attach-preview hidden">
-        <img id="attachThumb" alt="Превью">
-        <div class="muted" id="attachName">Картинка прикреплена</div>
-        <button type="button" class="attach-remove" onclick="clearAttachment()">Убрать</button>
-      </div>
-      <div class="composer">
-        <input id="fileInput" type="file" accept="image/*" class="hidden" onchange="onFileSelected(event)">
-        <button type="button" class="clip-btn" title="Прикрепить картинку" onclick="document.getElementById('fileInput').click()">📎</button>
-        <textarea id="msgInput" rows="1" placeholder="Сообщение..." autocomplete="off" spellcheck="false" onfocus="onComposerFocus()" onblur="onComposerBlur()" oninput="onComposerInput()" onkeydown="onComposerKeydown(event)"></textarea>
-        <button type="button" onclick="sendMsg()">➤</button>
+      <div id="mutedBanner" class="muted-banner hidden">Владелец запретил вам писать сообщения в этой группе.</div>
+      <div id="activeInputControls">
+        <div class="em-row">
+          <button type="button" class="em-btn" onclick="insertEmoji('😀')">😀</button>
+          <button type="button" class="em-btn" onclick="insertEmoji('😂')">😂</button>
+          <button type="button" class="em-btn" onclick="insertEmoji('❤️')">❤️</button>
+          <button type="button" class="em-btn" onclick="insertEmoji('🔥')">🔥</button>
+          <button type="button" class="em-btn" onclick="insertEmoji('👍')">👍</button>
+          <button type="button" class="em-btn" onclick="insertEmoji('🍐')">🍐</button>
+          <button type="button" class="em-btn" onclick="insertEmoji('🎉')">🎉</button>
+          <button type="button" class="em-btn" onclick="insertEmoji('😭')">😭</button>
+        </div>
+        <div id="attachPreview" class="attach-preview hidden">
+          <img id="attachThumb" alt="Превью">
+          <div class="muted" id="attachName">Картинка прикреплена</div>
+          <button type="button" class="attach-remove" onclick="clearAttachment()">Убрать</button>
+        </div>
+        <div class="composer">
+          <input id="fileInput" type="file" accept="image/*" class="hidden" onchange="onFileSelected(event)">
+          <button type="button" class="clip-btn" title="Прикрепить картинку" onclick="document.getElementById('fileInput').click()">📎</button>
+          <textarea id="msgInput" rows="1" placeholder="Сообщение..." autocomplete="off" spellcheck="false" onfocus="onComposerFocus()" onblur="onComposerBlur()" oninput="onComposerInput()" onkeydown="onComposerKeydown(event)"></textarea>
+          <button type="button" onclick="sendMsg()">➤</button>
+        </div>
       </div>
     </div>
   </div>
@@ -538,6 +768,11 @@ const AVATAR_EMOJIS = [
   "🐄", "🐗", "🔶"
 ];
 
+const GROUP_ICONS = [
+  "👥", "🍐", "🔥", "⚡", "🎮", "🚀",
+  "🍕", "👑", "💎", "🐗", "🐄", "🔶"
+];
+
 const DEFAULT_CUSTOM = {
   msgSize: 15,
   emojiSize: 24,
@@ -549,12 +784,17 @@ const SINGLE_EMOJI_RE = /([\p{Emoji_Presentation}\p{Extended_Pictographic}]\uFE0
 
 let me = null;
 let authTab = "login";
-let activePeer = null;
+let activeChat = null; // { type: 'direct' | 'group', id, username, emoji, isOwner }
 let pendingImageData = "";
 let lastRenderedMsgsJson = "";
 let lastRenderedCustomJson = "";
 let lastTypingPingTs = 0;
 let pollTimer = null;
+let fabPulseTimer = null;
+let lastChatsScrollTop = 0;
+
+let selectedGroupEmoji = "👥";
+let selectedGroupMembers = new Set();
 
 let composerFocused = false;
 let baselineViewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
@@ -589,7 +829,7 @@ function syncViewportHeight() {
     window.scrollTo(0, 0);
   }
   const box = document.getElementById("msgsBox");
-  if (box && activePeer) {
+  if (box && activeChat) {
     box.scrollTop = box.scrollHeight;
   }
 }
@@ -641,6 +881,41 @@ window.addEventListener("resize", syncViewportHeight);
 window.addEventListener("orientationchange", () => setTimeout(syncViewportHeight, 150));
 syncViewportHeight();
 
+/* Поведение голубого кружка с карандашом: появляется и прячется при прокрутке/переключении */
+function setFabVisible(visible) {
+  const fab = document.getElementById("fabCreateBtn");
+  if (!fab) return;
+  fab.classList.toggle("fab-hidden", !visible);
+}
+
+function triggerFabAppearCycle() {
+  const chatsScreen = document.getElementById("chatsScreen");
+  if (!chatsScreen || chatsScreen.classList.contains("hidden")) {
+    setFabVisible(false);
+    return;
+  }
+  setFabVisible(true);
+  if (fabPulseTimer) clearTimeout(fabPulseTimer);
+  fabPulseTimer = setTimeout(() => {
+    const area = document.getElementById("chatsScrollArea");
+    if (area && area.scrollTop > 24) {
+      setFabVisible(false);
+    }
+  }, 3800);
+}
+
+function onChatsScroll() {
+  const area = document.getElementById("chatsScrollArea");
+  if (!area) return;
+  const cur = area.scrollTop;
+  if (cur > lastChatsScrollTop + 8) {
+    setFabVisible(false);
+  } else if (cur < lastChatsScrollTop - 8 || cur <= 10) {
+    triggerFabAppearCycle();
+  }
+  lastChatsScrollTop = cur;
+}
+
 function autoResizeComposer() {
   const inp = document.getElementById("msgInput");
   if (!inp) return;
@@ -650,11 +925,15 @@ function autoResizeComposer() {
 }
 
 function sendTypingSignal(force = false) {
-  if (!me || !activePeer) return;
+  if (!me || !activeChat) return;
   const now = Date.now();
   if (!force && now - lastTypingPingTs < 1500) return;
   lastTypingPingTs = now;
-  api("/api/typing", { from: me.username, to: activePeer.username }).catch(() => {});
+  if (activeChat.type === "group") {
+    api("/api/typing", { from: me.username, groupId: activeChat.id }).catch(() => {});
+  } else {
+    api("/api/typing", { from: me.username, to: activeChat.username }).catch(() => {});
+  }
 }
 
 function onComposerInput() {
@@ -714,7 +993,7 @@ function updateCustomization() {
   };
   try { localStorage.setItem("grusha_custom", JSON.stringify(cfg)); } catch (e) {}
   applyCustom(cfg);
-  if (activePeer) {
+  if (activeChat) {
     lastRenderedMsgsJson = "";
     refreshMessages(false);
   }
@@ -723,7 +1002,7 @@ function updateCustomization() {
 function resetCustomization() {
   try { localStorage.setItem("grusha_custom", JSON.stringify(DEFAULT_CUSTOM)); } catch (e) {}
   applyCustom(DEFAULT_CUSTOM);
-  if (activePeer) {
+  if (activeChat) {
     lastRenderedMsgsJson = "";
     refreshMessages(false);
   }
@@ -744,7 +1023,7 @@ function isFullscreenNow() {
 async function toggleFullscreenByTap(e) {
   if (!e.target.closest) return;
   const interactive = e.target.closest(
-    "button, input, textarea, select, a, .chat-card, .m, .msg-img, .em-btn, .clip-btn, .attach-preview, .top, .bottom-dock, .custom-box"
+    "button, input, textarea, select, a, .chat-card, .member-pick, .group-member-row, .m, .msg-img, .em-btn, .clip-btn, .attach-preview, .top, .bottom-dock, .custom-box, .fab-create"
   );
   if (interactive) return;
 
@@ -786,9 +1065,13 @@ function saveLocalUser(user) {
 function showScreen(id) {
   composerFocused = false;
   setKeyboardLift(0);
-  ["loadingScreen", "authScreen", "chatsScreen", "searchScreen", "roomScreen", "settingsScreen"].forEach(s => {
+  ["loadingScreen", "authScreen", "chatsScreen", "createGroupScreen", "groupSettingsScreen", "searchScreen", "roomScreen", "settingsScreen"].forEach(s => {
     document.getElementById(s).classList.toggle("hidden", s !== id);
   });
+  setFabVisible(id === "chatsScreen");
+  if (id === "chatsScreen") {
+    triggerFabAppearCycle();
+  }
   syncViewportHeight();
 }
 
@@ -814,7 +1097,7 @@ async function doAuth() {
 }
 
 function enterChats() {
-  activePeer = null;
+  activeChat = null;
   clearAttachment();
   lastRenderedMsgsJson = "";
   document.getElementById("myAva").textContent = me.emoji || "🍐";
@@ -824,20 +1107,227 @@ function enterChats() {
   startPolling();
 }
 
-function openSearch() {
-  const inp = document.getElementById("searchInput");
-  inp.value = "";
-  document.getElementById("searchResults").innerHTML = "";
-  showScreen("searchScreen");
-  setTimeout(() => inp.focus(), 60);
-}
-
 function backToChats() {
-  activePeer = null;
+  activeChat = null;
   clearAttachment();
   lastRenderedMsgsJson = "";
   showScreen("chatsScreen");
   refreshChats();
+}
+
+function backToRoomFromGroupSettings() {
+  if (!activeChat) {
+    backToChats();
+    return;
+  }
+  showScreen("roomScreen");
+  refreshMessages(false);
+}
+
+/* Создание группы */
+function selectGroupEmoji(em) {
+  selectedGroupEmoji = em;
+  document.getElementById("selectedGroupIconLabel").textContent = em;
+  renderGroupIconPicker();
+}
+
+function renderGroupIconPicker() {
+  const box = document.getElementById("groupIconPicker");
+  if (!box) return;
+  box.innerHTML = GROUP_ICONS.map(em => {
+    const cls = em === selectedGroupEmoji ? "em-btn" : "em-btn sec";
+    return `<button type="button" class="${cls}" style="${em === selectedGroupEmoji ? 'outline:2px solid #2da9ff;' : ''}" onclick="selectGroupEmoji('${em}')">${em}</button>`;
+  }).join("");
+}
+
+function toggleGroupMember(nick) {
+  if (selectedGroupMembers.has(nick)) selectedGroupMembers.delete(nick);
+  else selectedGroupMembers.add(nick);
+  renderGroupCandidates();
+}
+
+function renderGroupCandidates(candidates = null) {
+  const box = document.getElementById("groupCandidatesList");
+  if (!box) return;
+  if (candidates) {
+    box.dataset.candidates = JSON.stringify(candidates);
+  }
+  let list = candidates;
+  if (!list) {
+    try { list = JSON.parse(box.dataset.candidates || "[]"); } catch (e) { list = []; }
+  }
+  if (!list.length) {
+    box.innerHTML = `<div class="muted">Нет собеседников, с которыми уже был личный чат. Сначала напиши кому-нибудь в личку.</div>`;
+    return;
+  }
+  box.innerHTML = list.map(u => {
+    const checked = selectedGroupMembers.has(u.username);
+    return `
+      <div class="member-pick ${checked ? 'selected' : ''}" onclick="toggleGroupMember('${esc(u.username)}')">
+        <input type="checkbox" ${checked ? 'checked' : ''} onclick="event.stopPropagation(); toggleGroupMember('${esc(u.username)}')">
+        <div class="ava" style="width:36px; height:36px; font-size:18px;">${u.emoji || '🍐'}</div>
+        <div class="chat-name">${nickLabelHtml(u.username, u.isOwner)}</div>
+      </div>
+    `;
+  }).join("");
+}
+
+async function openCreateGroup() {
+  selectedGroupEmoji = "👥";
+  selectedGroupMembers = new Set();
+  document.getElementById("groupTitleInput").value = "";
+  document.getElementById("selectedGroupIconLabel").textContent = selectedGroupEmoji;
+  document.getElementById("createGroupErr").textContent = "";
+  renderGroupIconPicker();
+  renderGroupCandidates([]);
+  showScreen("createGroupScreen");
+
+  const res = await api(`/api/chats?user=${encodeURIComponent(me.username)}`);
+  const directPeers = (res.ok && Array.isArray(res.chats))
+    ? res.chats.filter(c => c.type !== "group")
+    : [];
+  renderGroupCandidates(directPeers);
+}
+
+async function submitCreateGroup() {
+  const title = document.getElementById("groupTitleInput").value.trim();
+  const errEl = document.getElementById("createGroupErr");
+  if (!title) {
+    errEl.textContent = "Введите название группы";
+    return;
+  }
+  errEl.textContent = "";
+  const res = await api("/api/groups/create", {
+    owner: me.username,
+    title,
+    emoji: selectedGroupEmoji,
+    members: Array.from(selectedGroupMembers)
+  });
+  if (!res.ok) {
+    errEl.textContent = res.error || "Не удалось создать группу";
+    return;
+  }
+  await openGroupChat(res.group.id, res.group.title, res.group.emoji);
+}
+
+/* Настройки группы при нажатии на название чата */
+function onRoomTitleClick() {
+  if (!activeChat || activeChat.type !== "group") return;
+  openGroupSettings();
+}
+
+async function openGroupSettings() {
+  if (!activeChat || activeChat.type !== "group") return;
+  showScreen("groupSettingsScreen");
+  await renderGroupSettings();
+}
+
+async function renderGroupSettings() {
+  const body = document.getElementById("groupSettingsBody");
+  if (!body || !activeChat || activeChat.type !== "group") return;
+
+  const res = await api(`/api/groups/info?groupId=${encodeURIComponent(activeChat.id)}&user=${encodeURIComponent(me.username)}`);
+  if (!res.ok || !res.group) {
+    body.innerHTML = `<div class="muted">Группа не найдена или была удалена.</div><button class="sec mt-12" onclick="backToChats()">← К чатам</button>`;
+    return;
+  }
+
+  const g = res.group;
+  const isGroupOwner = g.owner === me.username;
+  const mutedSet = new Set(g.muted || []);
+
+  activeChat.username = g.title;
+  activeChat.emoji = g.emoji;
+  document.getElementById("peerAva").textContent = g.emoji || "👥";
+  document.getElementById("peerNick").innerHTML = esc(g.title);
+
+  const membersHtml = (g.members || []).map(nick => {
+    const isMemberOwner = nick === g.owner;
+    const isMuted = mutedSet.has(nick);
+    const statusBadge = isMemberOwner
+      ? `<span class="muted">владелец</span>`
+      : (isMuted ? `<span style="color:#ffcf70; font-size:12px;">мут</span>` : `<span class="muted">участник</span>`);
+
+    const controlsHtml = (isGroupOwner && !isMemberOwner) ? `
+      <div class="group-member-btns">
+        <button type="button" class="mini-btn ${isMuted ? 'ok' : 'warn'}" onclick="toggleMuteMember('${esc(nick)}')">
+          ${isMuted ? 'Размутить' : 'Запретить писать'}
+        </button>
+        <button type="button" class="mini-btn del" onclick="kickGroupMember('${esc(nick)}')">Удалить</button>
+      </div>
+    ` : "";
+
+    return `
+      <div class="group-member-row">
+        <div style="min-width:0;">
+          <div class="chat-name">${nickLabelHtml(nick, isOwnerNick(nick))}</div>
+          <div>${statusBadge}</div>
+        </div>
+        ${controlsHtml}
+      </div>
+    `;
+  }).join("");
+
+  const ownerDeleteHtml = isGroupOwner ? `
+    <div style="margin-top:22px; padding-top:14px; border-top:1px solid #2b382d;">
+      <div style="font-weight:700; color:#ff8c8c;">Управление группой (только владелец)</div>
+      <button type="button" class="del mt-8" style="width:100%;" onclick="deleteCurrentGroup()">Удалить группу</button>
+    </div>
+  ` : `
+    <div class="muted mt-12">Только владелец группы может менять права участников или удалить группу.</div>
+  `;
+
+  body.innerHTML = `
+    <div style="display:flex; align-items:center; gap:12px;">
+      <div class="ava" style="width:52px; height:52px; font-size:26px;">${g.emoji || '👥'}</div>
+      <div>
+        <div style="font-size:18px; font-weight:800;">${esc(g.title)}</div>
+        <div class="muted">Владелец: ${nickLabelHtml(g.owner, isOwnerNick(g.owner))}</div>
+      </div>
+    </div>
+
+    <div style="font-weight:700; margin-top:18px;">Участники (${(g.members || []).length})</div>
+    <div id="groupMembersList">${membersHtml}</div>
+    ${ownerDeleteHtml}
+  `;
+}
+
+async function toggleMuteMember(targetNick) {
+  if (!activeChat || activeChat.type !== "group") return;
+  const res = await api("/api/groups/mute", {
+    actor: me.username,
+    groupId: activeChat.id,
+    target: targetNick
+  });
+  if (res.ok) {
+    await renderGroupSettings();
+    await refreshMessages(false);
+  }
+}
+
+async function kickGroupMember(targetNick) {
+  if (!activeChat || activeChat.type !== "group") return;
+  const res = await api("/api/groups/kick", {
+    actor: me.username,
+    groupId: activeChat.id,
+    target: targetNick
+  });
+  if (res.ok) {
+    await renderGroupSettings();
+    await refreshMessages(false);
+    await refreshChats();
+  }
+}
+
+async function deleteCurrentGroup() {
+  if (!activeChat || activeChat.type !== "group") return;
+  const res = await api("/api/groups/delete", {
+    actor: me.username,
+    groupId: activeChat.id
+  });
+  if (res.ok) {
+    backToChats();
+  }
 }
 
 function openSettings() {
@@ -858,6 +1348,14 @@ function openSettings() {
   showScreen("settingsScreen");
 }
 
+function openSearch() {
+  const inp = document.getElementById("searchInput");
+  inp.value = "";
+  document.getElementById("searchResults").innerHTML = "";
+  showScreen("searchScreen");
+  setTimeout(() => inp.focus(), 60);
+}
+
 async function onSearchInput() {
   const q = document.getElementById("searchInput").value.trim();
   const box = document.getElementById("searchResults");
@@ -871,7 +1369,7 @@ async function onSearchInput() {
     return;
   }
   box.innerHTML = res.users.map(u => `
-    <div class="chat-card" onclick="openChat('${esc(u.username)}', '${esc(u.emoji || '🍐')}', ${u.isOwner ? 'true' : 'false'})">
+    <div class="chat-card" onclick="openDirectChat('${esc(u.username)}', '${esc(u.emoji || '🍐')}', ${u.isOwner ? 'true' : 'false'})">
       <div class="ava">${u.emoji || '🍐'}</div>
       <div class="chat-info">
         <div class="chat-name">${nickLabelHtml(u.username, u.isOwner)}</div>
@@ -887,36 +1385,89 @@ async function refreshChats() {
   const list = document.getElementById("chatList");
   if (!list || !res.ok) return;
 
-  if (activePeer) {
-    const matched = res.chats.find(c => c.username === activePeer.username);
-    if (matched && matched.emoji && matched.emoji !== activePeer.emoji) {
-      activePeer.emoji = matched.emoji;
-      const peerAvaEl = document.getElementById("peerAva");
-      if (peerAvaEl) peerAvaEl.textContent = matched.emoji;
+  if (activeChat) {
+    if (activeChat.type === "direct") {
+      const matched = res.chats.find(c => c.type !== "group" && c.username === activeChat.username);
+      if (matched && matched.emoji && matched.emoji !== activeChat.emoji) {
+        activeChat.emoji = matched.emoji;
+        const peerAvaEl = document.getElementById("peerAva");
+        if (peerAvaEl) peerAvaEl.textContent = matched.emoji;
+      }
+    } else if (activeChat.type === "group") {
+      const matchedGroup = res.chats.find(c => c.type === "group" && c.groupId === activeChat.id);
+      if (!matchedGroup) {
+        backToChats();
+        return;
+      }
+      activeChat.username = matchedGroup.title;
+      activeChat.emoji = matchedGroup.emoji;
+      document.getElementById("peerAva").textContent = matchedGroup.emoji || "👥";
+      document.getElementById("peerNick").innerHTML = esc(matchedGroup.title);
     }
   }
 
   if (!res.chats.length) {
-    list.innerHTML = `<div class="muted mt-12">Чатов пока нет. Нажми на 🔍 в правом верхнем углу, чтобы найти человека.</div>`;
+    list.innerHTML = `<div class="muted mt-12">Чатов пока нет. Нажми на 🔍 в правом верхнем углу или на синий ✏️ внизу.</div>`;
     return;
   }
-  list.innerHTML = res.chats.map(c => `
-    <div class="chat-card" onclick="openChat('${esc(c.username)}', '${esc(c.emoji || '🍐')}', ${c.isOwner ? 'true' : 'false'})">
-      <div class="ava">${c.emoji || '🍐'}</div>
-      <div class="chat-info">
-        <div class="chat-name">${nickLabelHtml(c.username, c.isOwner)}</div>
-        <div class="chat-last ${c.typing ? 'typing-active' : ''}">${c.typing ? 'печатает...' : esc(c.last || 'Сообщений пока нет')}</div>
+  list.innerHTML = res.chats.map(c => {
+    if (c.type === "group") {
+      return `
+        <div class="chat-card" onclick="openGroupChat('${esc(c.groupId)}', '${esc(c.title)}', '${esc(c.emoji || '👥')}')">
+          <div class="ava">${c.emoji || '👥'}</div>
+          <div class="chat-info">
+            <div class="chat-name">${esc(c.title)} <span class="muted" style="font-weight:500; font-size:12px;">• группа</span></div>
+            <div class="chat-last ${c.typing ? 'typing-active' : ''}">${c.typing ? 'печатает...' : esc(c.last || 'Сообщений пока нет')}</div>
+          </div>
+        </div>
+      `;
+    }
+    return `
+      <div class="chat-card" onclick="openDirectChat('${esc(c.username)}', '${esc(c.emoji || '🍐')}', ${c.isOwner ? 'true' : 'false'})">
+        <div class="ava">${c.emoji || '🍐'}</div>
+        <div class="chat-info">
+          <div class="chat-name">${nickLabelHtml(c.username, c.isOwner)}</div>
+          <div class="chat-last ${c.typing ? 'typing-active' : ''}">${c.typing ? 'печатает...' : esc(c.last || 'Сообщений пока нет')}</div>
+        </div>
       </div>
-    </div>
-  `).join("");
+    `;
+  }).join("");
 }
 
-async function openChat(username, emoji, isOwner = false) {
-  activePeer = { username, emoji, isOwner };
+function syncRoomComposerLock(isMuted) {
+  const banner = document.getElementById("mutedBanner");
+  const controls = document.getElementById("activeInputControls");
+  if (banner) banner.classList.toggle("hidden", !isMuted);
+  if (controls) controls.classList.toggle("hidden", Boolean(isMuted));
+}
+
+async function openDirectChat(username, emoji, isOwner = false) {
+  activeChat = { type: "direct", id: username, username, emoji, isOwner };
   clearAttachment();
   lastRenderedMsgsJson = "";
+  syncRoomComposerLock(false);
+  const titleBtn = document.getElementById("peerTitleBtn");
+  if (titleBtn) titleBtn.classList.remove("clickable-title");
   document.getElementById("peerAva").textContent = emoji || "🍐";
   document.getElementById("peerNick").innerHTML = nickLabelHtml(username, isOwner);
+  document.getElementById("peerStatus").textContent = "";
+  const inp = document.getElementById("msgInput");
+  inp.value = "";
+  autoResizeComposer();
+  showScreen("roomScreen");
+  await refreshMessages(true);
+  await refreshChats();
+}
+
+async function openGroupChat(groupId, title, emoji) {
+  activeChat = { type: "group", id: groupId, username: title, emoji: emoji || "👥", isOwner: false };
+  clearAttachment();
+  lastRenderedMsgsJson = "";
+  syncRoomComposerLock(false);
+  const titleBtn = document.getElementById("peerTitleBtn");
+  if (titleBtn) titleBtn.classList.add("clickable-title");
+  document.getElementById("peerAva").textContent = emoji || "👥";
+  document.getElementById("peerNick").innerHTML = esc(title);
   document.getElementById("peerStatus").textContent = "";
   const inp = document.getElementById("msgInput");
   inp.value = "";
@@ -932,10 +1483,15 @@ function formatTextWithEmojis(rawText) {
 }
 
 function renderMsgItem(m) {
-  const cls = m.from === me.username ? "me" : "them";
+  const isMe = m.from === me.username;
+  const cls = isMe ? "me" : "them";
   const text = (m.text || "").trim();
   const isEmojiOnly = !m.image && text.length > 0 && EMOJI_ONLY_RE.test(text);
   const bubbleExtra = isEmojiOnly ? " emoji-only-bubble" : "";
+
+  const senderHtml = (activeChat && activeChat.type === "group" && !isMe)
+    ? `<div class="msg-sender">@${esc(m.from)}</div>`
+    : "";
 
   const imgHtml = m.image
     ? `<img class="msg-img" src="${m.image}" alt="Картинка" onclick="window.open('${m.image}', '_blank')">`
@@ -945,16 +1501,52 @@ function renderMsgItem(m) {
     ? `<div class="msg-txt">${formatTextWithEmojis(text)}</div>`
     : "";
 
-  return `<div class="m ${cls}${bubbleExtra}">${imgHtml}${txtHtml}</div>`;
+  return `<div class="m ${cls}${bubbleExtra}">${senderHtml}${imgHtml}${txtHtml}</div>`;
 }
 
 async function refreshMessages(forceScroll = false) {
-  if (!me || !activePeer) return;
-  const res = await api(`/api/msgs?a=${encodeURIComponent(me.username)}&b=${encodeURIComponent(activePeer.username)}`);
+  if (!me || !activeChat) return;
+
+  if (activeChat.type === "group") {
+    const res = await api(`/api/groups/msgs?groupId=${encodeURIComponent(activeChat.id)}&user=${encodeURIComponent(me.username)}`);
+    if (!res.ok) {
+      if (res.deleted || res.kicked) backToChats();
+      return;
+    }
+    syncRoomComposerLock(Boolean(res.isMuted));
+    activeChat.username = res.title || activeChat.username;
+    activeChat.emoji = res.emoji || activeChat.emoji;
+    document.getElementById("peerAva").textContent = activeChat.emoji || "👥";
+    document.getElementById("peerNick").innerHTML = esc(activeChat.username);
+
+    const statusEl = document.getElementById("peerStatus");
+    if (statusEl) {
+      const typers = res.typingUsers || [];
+      statusEl.textContent = typers.length ? `${typers.join(", ")} печатает...` : "";
+    }
+
+    const customStamp = JSON.stringify(loadCustom());
+    const json = JSON.stringify(res.msgs);
+    if (json === lastRenderedMsgsJson && customStamp === lastRenderedCustomJson && !forceScroll) return;
+    lastRenderedMsgsJson = json;
+    lastRenderedCustomJson = customStamp;
+
+    const box = document.getElementById("msgsBox");
+    if (!box) return;
+    if (!res.msgs.length) {
+      box.innerHTML = `<div class="muted" style="margin:auto;">Группа создана! Напишите первое сообщение.</div>`;
+      return;
+    }
+    box.innerHTML = res.msgs.map(renderMsgItem).join("");
+    box.scrollTop = box.scrollHeight;
+    return;
+  }
+
+  const res = await api(`/api/msgs?a=${encodeURIComponent(me.username)}&b=${encodeURIComponent(activeChat.username)}`);
   if (!res.ok) return;
 
-  if (res.peerEmoji && res.peerEmoji !== activePeer.emoji) {
-    activePeer.emoji = res.peerEmoji;
+  if (res.peerEmoji && res.peerEmoji !== activeChat.emoji) {
+    activeChat.emoji = res.peerEmoji;
     const peerAvaEl = document.getElementById("peerAva");
     if (peerAvaEl) peerAvaEl.textContent = res.peerEmoji;
   }
@@ -1051,18 +1643,38 @@ async function onFileSelected(event) {
 }
 
 async function sendMsg() {
-  if (!me || !activePeer) return;
+  if (!me || !activeChat) return;
   const inp = document.getElementById("msgInput");
   const text = inp.value.trim();
   const image = pendingImageData;
   if (!text && !image) return;
+
+  if (activeChat.type === "group") {
+    const res = await api("/api/groups/send", {
+      from: me.username,
+      groupId: activeChat.id,
+      text,
+      image
+    });
+    if (!res.ok) {
+      if (res.muted) syncRoomComposerLock(true);
+      return;
+    }
+    inp.value = "";
+    autoResizeComposer();
+    clearAttachment();
+    inp.focus();
+    await refreshMessages(true);
+    await refreshChats();
+    return;
+  }
 
   inp.value = "";
   autoResizeComposer();
   clearAttachment();
   inp.focus();
 
-  await api("/api/send", { from: me.username, to: activePeer.username, text, image });
+  await api("/api/send", { from: me.username, to: activeChat.username, text, image });
   await refreshMessages(true);
   await refreshChats();
 }
@@ -1095,7 +1707,7 @@ async function changeNick() {
 async function logout() {
   await api("/api/logout", {});
   saveLocalUser(null);
-  activePeer = null;
+  activeChat = null;
   clearAttachment();
   showScreen("authScreen");
 }
@@ -1104,7 +1716,7 @@ async function deleteAccount() {
   if (!me) return;
   await api("/api/delete", { username: me.username });
   saveLocalUser(null);
-  activePeer = null;
+  activeChat = null;
   clearAttachment();
   showScreen("authScreen");
 }
@@ -1114,7 +1726,7 @@ function startPolling() {
   pollTimer = setInterval(() => {
     if (!me) return;
     refreshChats();
-    if (activePeer) refreshMessages(false);
+    if (activeChat) refreshMessages(false);
   }, 1800);
 }
 
@@ -1226,7 +1838,10 @@ def typing_api():
     d = request.get_json(force=True) or {}
     f = (d.get("from") or "").strip()
     t = (d.get("to") or "").strip()
-    if f and t:
+    gid = (d.get("groupId") or "").strip()
+    if f and gid:
+        TYPING_STATUS[(f, group_typing_key(gid))] = int(time.time() * 1000)
+    elif f and t:
         TYPING_STATUS[(f, t)] = int(time.time() * 1000)
     return jsonify({"ok": True})
 
@@ -1280,6 +1895,18 @@ def chats():
                 )
                 last_rows = cur.fetchall()
 
+                cur.execute("SELECT * FROM groups ORDER BY created_at DESC")
+                group_rows = cur.fetchall()
+
+                group_last_map = {}
+                cur.execute("""
+                    SELECT DISTINCT ON (group_id) group_id, sender, text, image, ts
+                    FROM group_messages
+                    ORDER BY group_id, id DESC
+                """)
+                for gm in cur.fetchall():
+                    group_last_map[gm["group_id"]] = gm
+
         out = []
         for r in last_rows:
             a, b = r["chat_key"].split("::")
@@ -1287,6 +1914,7 @@ def chats():
             if peer and peer in users_map:
                 preview_text = r.get("text") or ("📷 Картинка" if r.get("image") else "Сообщений пока нет")
                 out.append({
+                    "type": "direct",
                     "username": peer,
                     "emoji": users_map[peer],
                     "isOwner": is_owner_nick(peer),
@@ -1294,6 +1922,28 @@ def chats():
                     "last": preview_text,
                     "ts": int(r.get("ts") or 0),
                 })
+
+        for gr in group_rows:
+            g = format_group_row(gr)
+            if u in g["members"]:
+                gm = group_last_map.get(g["id"])
+                if gm:
+                    base_txt = gm.get("text") or ("📷 Картинка" if gm.get("image") else "Сообщений пока нет")
+                    preview_text = f"@{gm['sender']}: {base_txt}"
+                    ts_val = int(gm.get("ts") or g["createdAt"])
+                else:
+                    preview_text = "Группа создана"
+                    ts_val = g["createdAt"]
+                out.append({
+                    "type": "group",
+                    "groupId": g["id"],
+                    "title": g["title"],
+                    "emoji": g["emoji"] or "👥",
+                    "typing": len(get_group_typing_users(g["id"], u)) > 0,
+                    "last": preview_text,
+                    "ts": ts_val,
+                })
+
         out.sort(key=lambda x: x["ts"], reverse=True)
         return jsonify({"ok": True, "chats": out})
 
@@ -1308,6 +1958,7 @@ def chats():
             last_msg = m[-1]
             preview_text = last_msg.get("text") or ("📷 Картинка" if last_msg.get("image") else "Сообщений пока нет")
             out.append({
+                "type": "direct",
                 "username": peer,
                 "emoji": db["users"][peer].get("emoji", "🍐"),
                 "isOwner": is_owner_nick(peer),
@@ -1315,6 +1966,29 @@ def chats():
                 "last": preview_text,
                 "ts": last_msg.get("ts", 0),
             })
+
+    for gid, g in db["groups"].items():
+        members = g.get("members") or []
+        if u in members:
+            g_msgs = db["group_msgs"].get(gid) or []
+            if g_msgs:
+                gm = g_msgs[-1]
+                base_txt = gm.get("text") or ("📷 Картинка" if gm.get("image") else "Сообщений пока нет")
+                preview_text = f"@{gm['from']}: {base_txt}"
+                ts_val = int(gm.get("ts") or g.get("createdAt") or 0)
+            else:
+                preview_text = "Группа создана"
+                ts_val = int(g.get("createdAt") or 0)
+            out.append({
+                "type": "group",
+                "groupId": gid,
+                "title": g["title"],
+                "emoji": g.get("emoji") or "👥",
+                "typing": len(get_group_typing_users(gid, u)) > 0,
+                "last": preview_text,
+                "ts": ts_val,
+            })
+
     out.sort(key=lambda x: x["ts"], reverse=True)
     return jsonify({"ok": True, "chats": out})
 
@@ -1386,6 +2060,236 @@ def send():
     return jsonify({"ok": True})
 
 
+@app.post("/api/groups/create")
+def create_group():
+    d = request.get_json(force=True) or {}
+    owner = (d.get("owner") or "").strip()
+    title = (d.get("title") or "").strip()
+    emoji = (d.get("emoji") or "👥").strip() or "👥"
+    raw_members = d.get("members") or []
+    if not owner or not title:
+        return jsonify({"ok": False, "error": "Укажите название группы."})
+
+    members_clean = []
+    seen = set()
+    for m in [owner] + [str(x).strip() for x in raw_members if isinstance(x, str)]:
+        if m and m not in seen:
+            seen.add(m)
+            members_clean.append(m)
+
+    gid = uuid.uuid4().hex[:12]
+    now = int(time.time() * 1000)
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    INSERT INTO groups (id, title, emoji, owner, members_json, muted_json, created_at)
+                    VALUES (%s, %s, %s, %s, %s, '[]', %s)
+                    RETURNING *
+                    """,
+                    (gid, title, emoji, owner, json.dumps(members_clean, ensure_ascii=False), now),
+                )
+                row = cur.fetchone()
+        return jsonify({"ok": True, "group": format_group_row(row)})
+
+    db = load_json_db()
+    group_obj = {
+        "id": gid,
+        "title": title,
+        "emoji": emoji,
+        "owner": owner,
+        "members": members_clean,
+        "muted": [],
+        "createdAt": now,
+    }
+    db["groups"][gid] = group_obj
+    db["group_msgs"].setdefault(gid, [])
+    save_json_db(db)
+    return jsonify({"ok": True, "group": group_obj})
+
+
+@app.get("/api/groups/info")
+def group_info():
+    gid = (request.args.get("groupId") or "").strip()
+    u = (request.args.get("user") or "").strip()
+    g = get_group_by_id(gid)
+    if not g:
+        return jsonify({"ok": False, "deleted": True})
+    if u and u not in g["members"]:
+        return jsonify({"ok": False, "kicked": True})
+    return jsonify({"ok": True, "group": g})
+
+
+@app.get("/api/groups/msgs")
+def group_msgs():
+    gid = (request.args.get("groupId") or "").strip()
+    u = (request.args.get("user") or "").strip()
+    g = get_group_by_id(gid)
+    if not g:
+        return jsonify({"ok": False, "deleted": True})
+    if u and u not in g["members"]:
+        return jsonify({"ok": False, "kicked": True})
+
+    is_muted = u in set(g.get("muted") or [])
+    typers = get_group_typing_users(gid, u)
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT sender AS \"from\", text, image, ts FROM group_messages WHERE group_id = %s ORDER BY id ASC",
+                    (gid,),
+                )
+                rows = cur.fetchall()
+        formatted = []
+        for r in rows:
+            item = {"from": r["from"], "text": r.get("text") or "", "ts": int(r.get("ts") or 0)}
+            if r.get("image"):
+                item["image"] = r["image"]
+            formatted.append(item)
+        return jsonify({
+            "ok": True,
+            "msgs": formatted,
+            "title": g["title"],
+            "emoji": g["emoji"],
+            "isMuted": is_muted,
+            "typingUsers": typers,
+        })
+
+    db = load_json_db()
+    return jsonify({
+        "ok": True,
+        "msgs": db["group_msgs"].get(gid, []),
+        "title": g["title"],
+        "emoji": g["emoji"],
+        "isMuted": is_muted,
+        "typingUsers": typers,
+    })
+
+
+@app.post("/api/groups/send")
+def group_send():
+    d = request.get_json(force=True) or {}
+    f = (d.get("from") or "").strip()
+    gid = (d.get("groupId") or "").strip()
+    txt = (d.get("text") or "").strip()
+    img = d.get("image") or ""
+    if img and not (img.startswith("data:image/") and len(img) <= MAX_IMAGE_LEN):
+        img = ""
+
+    g = get_group_by_id(gid)
+    if not g or f not in g["members"]:
+        return jsonify({"ok": False})
+    if f in set(g.get("muted") or []):
+        return jsonify({"ok": False, "muted": True})
+    if not txt and not img:
+        return jsonify({"ok": False})
+
+    ts = int(time.time() * 1000)
+    TYPING_STATUS.pop((f, group_typing_key(gid)), None)
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO group_messages (group_id, sender, text, image, ts) VALUES (%s, %s, %s, %s, %s)",
+                    (gid, f, txt, img, ts),
+                )
+        return jsonify({"ok": True})
+
+    msg_item = {"from": f, "text": txt, "ts": ts}
+    if img:
+        msg_item["image"] = img
+    db = load_json_db()
+    db["group_msgs"].setdefault(gid, []).append(msg_item)
+    save_json_db(db)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/groups/mute")
+def group_mute():
+    d = request.get_json(force=True) or {}
+    actor = (d.get("actor") or "").strip()
+    gid = (d.get("groupId") or "").strip()
+    target = (d.get("target") or "").strip()
+    g = get_group_by_id(gid)
+    if not g or g["owner"] != actor or target == actor:
+        return jsonify({"ok": False})
+
+    muted = list(g.get("muted") or [])
+    if target in muted:
+        muted.remove(target)
+    else:
+        muted.append(target)
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE groups SET muted_json = %s WHERE id = %s", (json.dumps(muted, ensure_ascii=False), gid))
+        return jsonify({"ok": True, "muted": muted})
+
+    db = load_json_db()
+    if gid in db["groups"]:
+        db["groups"][gid]["muted"] = muted
+        save_json_db(db)
+    return jsonify({"ok": True, "muted": muted})
+
+
+@app.post("/api/groups/kick")
+def group_kick():
+    d = request.get_json(force=True) or {}
+    actor = (d.get("actor") or "").strip()
+    gid = (d.get("groupId") or "").strip()
+    target = (d.get("target") or "").strip()
+    g = get_group_by_id(gid)
+    if not g or g["owner"] != actor or target == actor:
+        return jsonify({"ok": False})
+
+    members = [m for m in (g.get("members") or []) if m != target]
+    muted = [m for m in (g.get("muted") or []) if m != target]
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE groups SET members_json = %s, muted_json = %s WHERE id = %s",
+                    (json.dumps(members, ensure_ascii=False), json.dumps(muted, ensure_ascii=False), gid),
+                )
+        return jsonify({"ok": True})
+
+    db = load_json_db()
+    if gid in db["groups"]:
+        db["groups"][gid]["members"] = members
+        db["groups"][gid]["muted"] = muted
+        save_json_db(db)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/groups/delete")
+def group_delete():
+    d = request.get_json(force=True) or {}
+    actor = (d.get("actor") or "").strip()
+    gid = (d.get("groupId") or "").strip()
+    g = get_group_by_id(gid)
+    if not g or g["owner"] != actor:
+        return jsonify({"ok": False})
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM group_messages WHERE group_id = %s", (gid,))
+                cur.execute("DELETE FROM groups WHERE id = %s", (gid,))
+        return jsonify({"ok": True})
+
+    db = load_json_db()
+    db["groups"].pop(gid, None)
+    db["group_msgs"].pop(gid, None)
+    save_json_db(db)
+    return jsonify({"ok": True})
+
+
 @app.post("/api/emoji")
 def emoji():
     d = request.get_json(force=True) or {}
@@ -1437,6 +2341,7 @@ def nick():
                     parts = [new_n if x == old_n else x for x in k.split("::")]
                     cur.execute("UPDATE messages SET chat_key = %s WHERE chat_key = %s", (chat_key(parts[0], parts[1]), k))
                 cur.execute("UPDATE messages SET sender = %s WHERE sender = %s", (new_n, old_n))
+                cur.execute("UPDATE group_messages SET sender = %s WHERE sender = %s", (new_n, old_n))
                 cur.execute("DELETE FROM users WHERE username = %s", (old_n,))
                 cur.execute("SELECT * FROM users WHERE username = %s", (new_n,))
                 updated = cur.fetchone()
