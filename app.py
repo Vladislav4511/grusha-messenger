@@ -19,7 +19,7 @@ USE_PG = bool(DATABASE_URL and psycopg2 is not None)
 
 SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
 TYPING_TTL_MS = 4500
-CALL_TTL_MS = 45_000
+CALL_TTL_MS = 35_000
 OWNER_NICK = "владислав"
 TRIPLE_BADGE_GROUP_TITLE = "ырка сквад"
 MAX_IMAGE_LEN = 1_500_000
@@ -185,12 +185,23 @@ def cleanup_stale_calls():
     expired = []
     for cid, call in ACTIVE_CALLS.items():
         updated = int(call.get("updatedAt") or call.get("createdAt") or now)
-        if call.get("status") == "ended" and (now - updated) > 8000:
+        if call.get("status") == "ended" and (now - updated) > 5000:
             expired.append(cid)
-        elif (now - updated) > CALL_TTL_MS:
+        elif call.get("status") != "ended" and (now - updated) > CALL_TTL_MS:
             expired.append(cid)
     for cid in expired:
         ACTIVE_CALLS.pop(cid, None)
+
+
+def end_user_calls(username, now_ms=None):
+    if not username:
+        return
+    ts = now_ms if now_ms is not None else int(time.time() * 1000)
+    for cid, c in ACTIVE_CALLS.items():
+        if c.get("status") != "ended" and username in (c.get("caller"), c.get("callee")):
+            c["status"] = "ended"
+            c["endedBy"] = username
+            c["updatedAt"] = ts
 
 
 def format_user(row):
@@ -1535,6 +1546,7 @@ let sentCandidateKeys = new Set();
 let appliedCandidateKeys = new Set();
 let renegotiating = false;
 let needsRenegotiate = false;
+let endingCallInProgress = false;
 
 function getAudioContext() {
   try {
@@ -1627,8 +1639,10 @@ function syncRemoteMediaElements() {
     }
   }
 
-  const videoTracks = remoteStream ? remoteStream.getVideoTracks() : [];
-  const hasLiveVideo = videoTracks.some(t => t.readyState === "live" && t.enabled && !t.muted);
+  const videoTracks = remoteStream
+    ? remoteStream.getVideoTracks().filter(t => t.readyState === "live" && t.enabled && !t.muted)
+    : [];
+  const hasLiveVideo = videoTracks.length > 0;
 
   if (vid) {
     vid.muted = true;
@@ -1642,6 +1656,9 @@ function syncRemoteMediaElements() {
         vp.catch(() => {});
       }
     } else {
+      if (vid.srcObject) {
+        vid.srcObject = null;
+      }
       vid.classList.add("cam-off");
     }
   }
@@ -1653,7 +1670,7 @@ function syncRemoteMediaElements() {
 
 document.addEventListener("pointerdown", () => {
   getAudioContext();
-  if (remoteStream) {
+  if (remoteStream && callState) {
     syncRemoteMediaElements();
   }
 }, { passive: true });
@@ -1770,33 +1787,49 @@ function hideCallModalUi() {
   if (overlay) overlay.classList.add("hidden");
 }
 
-function cleanupLocalCallResources() {
+function forceResetCallUi() {
   stopCallDurationTicker();
   if (pc) {
-    try { pc.close(); } catch (e) {}
+    try {
+      pc.ontrack = null;
+      pc.onicecandidate = null;
+      pc.oniceconnectionstatechange = null;
+      pc.close();
+    } catch (e) {}
     pc = null;
   }
   if (localStream) {
     try {
-      localStream.getTracks().forEach(t => t.stop());
+      localStream.getTracks().forEach(t => {
+        try { t.stop(); } catch (e) {}
+      });
     } catch (e) {}
     localStream = null;
   }
   if (remoteStream) {
     try {
-      remoteStream.getTracks().forEach(t => t.stop());
+      remoteStream.getTracks().forEach(t => {
+        try { t.stop(); } catch (e) {}
+      });
     } catch (e) {}
     remoteStream = null;
   }
   const aud = document.getElementById("remoteAudioEl");
-  if (aud) aud.srcObject = null;
+  if (aud) {
+    try { aud.pause(); } catch (e) {}
+    aud.srcObject = null;
+  }
   const remVid = document.getElementById("remoteVideoEl");
   if (remVid) {
+    try { remVid.pause(); } catch (e) {}
     remVid.srcObject = null;
     remVid.classList.add("cam-off");
   }
   const locVid = document.getElementById("localVideoEl");
-  if (locVid) locVid.srcObject = null;
+  if (locVid) {
+    try { locVid.pause(); } catch (e) {}
+    locVid.srcObject = null;
+  }
   const fallback = document.getElementById("callAvatarFallback");
   if (fallback) fallback.classList.remove("hidden-cam");
 
@@ -1874,6 +1907,36 @@ function scheduleRenegotiate() {
   flushRenegotiateIfReady();
 }
 
+function disableCameraLocallyAndSync() {
+  if (localStream) {
+    localStream.getVideoTracks().forEach(t => {
+      try { t.stop(); } catch (e) {}
+      localStream.removeTrack(t);
+    });
+  }
+  const locVid = document.getElementById("localVideoEl");
+  if (locVid) {
+    try { locVid.pause(); } catch (e) {}
+    locVid.srcObject = null;
+  }
+  if (remoteStream) {
+    remoteStream.getVideoTracks().forEach(t => {
+      try { t.stop(); } catch (e) {}
+      remoteStream.removeTrack(t);
+    });
+  }
+  if (pc) {
+    const sender = pc.getSenders().find(s => s.track && s.track.kind === "video");
+    if (sender) {
+      sender.replaceTrack(null).catch(() => {});
+    }
+    scheduleRenegotiate();
+  }
+  cameraEnabled = false;
+  updateCamButtonUi();
+  syncRemoteMediaElements();
+}
+
 async function toggleCamera() {
   if (!callState) return;
   playSound("click");
@@ -1889,13 +1952,13 @@ async function toggleCamera() {
         audio: false
       });
       const vTrack = camStream.getVideoTracks()[0];
-      if (!vTrack) return;
+      if (!vTrack || !callState) return;
 
       if (!localStream) {
         localStream = new MediaStream([vTrack]);
       } else {
         localStream.getVideoTracks().forEach(t => {
-          t.stop();
+          try { t.stop(); } catch (e) {}
           localStream.removeTrack(t);
         });
         localStream.addTrack(vTrack);
@@ -1925,29 +1988,12 @@ async function toggleCamera() {
 
       cameraEnabled = true;
       updateCamButtonUi();
+      syncRemoteMediaElements();
     } catch (err) {
       alert("Не удалось включить камеру. Разреши доступ к камере и проверь HTTPS.");
     }
   } else {
-    if (localStream) {
-      localStream.getVideoTracks().forEach(t => {
-        t.stop();
-        localStream.removeTrack(t);
-      });
-    }
-    const locVid = document.getElementById("localVideoEl");
-    if (locVid) locVid.srcObject = null;
-
-    if (pc) {
-      const sender = pc.getSenders().find(s => s.track && s.track.kind === "video");
-      if (sender) {
-        try { await sender.replaceTrack(null); } catch (e) {}
-      }
-      scheduleRenegotiate();
-    }
-
-    cameraEnabled = false;
-    updateCamButtonUi();
+    disableCameraLocallyAndSync();
   }
 }
 
@@ -1978,7 +2024,7 @@ async function enqueueOrAddRemoteCandidate(candObj) {
 }
 
 function attachTrackToRemoteStream(track) {
-  if (!track) return;
+  if (!track || !callState) return;
   if (!remoteStream) {
     remoteStream = new MediaStream();
   }
@@ -1994,7 +2040,7 @@ function attachTrackToRemoteStream(track) {
   track.onunmute = () => syncRemoteMediaElements();
   track.onmute = () => syncRemoteMediaElements();
   track.onended = () => {
-    if (track.kind === "video") {
+    if (track.kind === "video" && remoteStream) {
       remoteStream.removeTrack(track);
     }
     syncRemoteMediaElements();
@@ -2033,6 +2079,7 @@ function createPeerConnectionForCall(cid) {
   }
 
   conn.ontrack = (event) => {
+    if (!callState || callState.callId !== cid) return;
     if (event.track) {
       attachTrackToRemoteStream(event.track);
     }
@@ -2065,12 +2112,8 @@ function createPeerConnectionForCall(cid) {
     } else if (st === "checking") {
       callState.iceNote = "Установка соединения...";
       setCallStatusNote("Установка соединения...");
-    } else if (st === "failed") {
-      callState.iceNote = "Нет прямого маршрута между сетями";
-      setCallStatusNote("Нет прямого маршрута между сетями");
-    } else if (st === "disconnected") {
-      callState.iceNote = "Связь прерывалась...";
-      setCallStatusNote("Связь прерывалась...");
+    } else if (st === "failed" || st === "closed") {
+      hangupCall(true);
     }
   };
 
@@ -2096,7 +2139,7 @@ async function startDirectCall() {
   const peerEmoji = activeChat.emoji || "🙂";
   const createRes = await api("/api/call/start", { caller: me.username, callee: peer });
   if (!createRes.ok || !createRes.callId) {
-    cleanupLocalCallResources();
+    forceResetCallUi();
     alert(createRes.error || "Не удалось начать звонок");
     return;
   }
@@ -2117,6 +2160,7 @@ async function startDirectCall() {
 
   pc = createPeerConnectionForCall(cid);
   const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+  if (!callState || callState.callId !== cid || !pc) return;
   await pc.setLocalDescription(offer);
   callState.lastAppliedOfferJson = JSON.stringify(pc.localDescription);
   await api("/api/call/offer", {
@@ -2128,6 +2172,7 @@ async function startDirectCall() {
 
 async function acceptIncomingCall() {
   if (!me || !callState || callState.isCaller) return;
+  const cid = callState.callId;
   playSound("join");
   requestPageFullscreen();
   cameraEnabled = false;
@@ -2141,7 +2186,7 @@ async function acceptIncomingCall() {
     return;
   }
 
-  const cid = callState.callId;
+  if (!callState || callState.callId !== cid) return;
   pc = createPeerConnectionForCall(cid);
 
   if (pendingOfferToApply) {
@@ -2151,8 +2196,9 @@ async function acceptIncomingCall() {
     await flushPendingCandidates();
   }
 
-  if (pc.remoteDescription) {
+  if (pc && pc.remoteDescription && callState && callState.callId === cid) {
     const answer = await pc.createAnswer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+    if (!pc || !callState || callState.callId !== cid) return;
     await pc.setLocalDescription(answer);
     callState.lastAppliedAnswerJson = JSON.stringify(pc.localDescription);
     await api("/api/call/answer", {
@@ -2162,6 +2208,7 @@ async function acceptIncomingCall() {
     });
   }
 
+  if (!callState || callState.callId !== cid) return;
   callState.status = "active";
   if (!callState.connectedAt) {
     callState.connectedAt = Date.now();
@@ -2201,16 +2248,23 @@ function toggleMicMute() {
 }
 
 async function hangupCall(notifyServer = true) {
-  const cid = callState ? callState.callId : null;
+  if (endingCallInProgress) return;
+  endingCallInProgress = true;
+  const cid = callState ? callState.callId : "";
+  const actorNick = me ? me.username : "";
   playSound("leave");
-  cleanupLocalCallResources();
-  if (notifyServer && cid && me) {
-    api("/api/call/end", { callId: cid, from: me.username }).catch(() => {});
+  forceResetCallUi();
+  try {
+    if (notifyServer && cid && actorNick) {
+      await api("/api/call/end", { callId: cid, from: actorNick });
+    }
+  } catch (e) {} finally {
+    endingCallInProgress = false;
   }
 }
 
 async function pollCallStatus() {
-  if (!me) return;
+  if (!me || endingCallInProgress) return;
   const activeId = callState ? callState.callId : "";
   const res = await api(`/api/call/poll?user=${encodeURIComponent(me.username)}&callId=${encodeURIComponent(activeId)}`);
   if (!res || !res.ok) return;
@@ -2218,13 +2272,30 @@ async function pollCallStatus() {
   if (res.ended) {
     if (callState) {
       playSound("leave");
-      cleanupLocalCallResources();
+      forceResetCallUi();
     }
     return;
   }
 
   const c = res.call;
-  if (!c) return;
+  if (!c) {
+    if (callState) {
+      forceResetCallUi();
+    }
+    return;
+  }
+
+  if (c.status === "ended") {
+    if (callState && callState.callId === c.callId) {
+      playSound("leave");
+      forceResetCallUi();
+    }
+    return;
+  }
+
+  if (me.username !== c.caller && me.username !== c.callee) {
+    return;
+  }
 
   if (!callState) {
     if (c.status === "ringing" && c.callee === me.username) {
@@ -2259,12 +2330,21 @@ async function pollCallStatus() {
     const offerJson = JSON.stringify(c.offer);
     const isNewOfferFromPeer = c.offerBy && c.offerBy !== me.username && offerJson !== callState.lastAppliedOfferJson;
     if (isNewOfferFromPeer) {
+      const hasVideoInOffer = typeof c.offer.sdp === "string" && /m=video\s+\d+/.test(c.offer.sdp) && !/a=inactive/.test((c.offer.sdp.split("m=video")[1] || "").split("m=")[0] || "");
+      if (!hasVideoInOffer && remoteStream) {
+        remoteStream.getVideoTracks().forEach(t => {
+          try { t.stop(); } catch (e) {}
+          remoteStream.removeTrack(t);
+        });
+        syncRemoteMediaElements();
+      }
       if (pc && pc.signalingState === "stable") {
         try {
           await pc.setRemoteDescription(new RTCSessionDescription(c.offer));
           callState.lastAppliedOfferJson = offerJson;
           await flushPendingCandidates();
           const ans = await pc.createAnswer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+          if (!pc || !callState || callState.callId !== c.callId) return;
           await pc.setLocalDescription(ans);
           callState.lastAppliedAnswerJson = JSON.stringify(pc.localDescription);
           await api("/api/call/answer", {
@@ -3874,7 +3954,7 @@ function startPolling() {
     refreshChats();
     if (activeChat) refreshMessages(false);
     pollCallStatus();
-  }, 1200);
+  }, 1000);
 }
 
 function esc(s) {
@@ -3989,13 +4069,15 @@ def call_start():
     if not caller or not callee or caller == callee:
         return jsonify({"ok": False, "error": "Некорректный собеседник."})
 
+    now = int(time.time() * 1000)
+    end_user_calls(caller, now)
+
     for cid, c in ACTIVE_CALLS.items():
-        if c.get("status") != "ended" and (callee in (c.get("caller"), c.get("callee")) or caller in (c.get("caller"), c.get("callee"))):
-            return jsonify({"ok": False, "error": "Пользователь сейчас занят или уже в звонке."})
+        if c.get("status") != "ended" and callee in (c.get("caller"), c.get("callee")):
+            return jsonify({"ok": False, "error": "Пользователь сейчас уже в звонке."})
 
     caller_user = get_user(caller) or {}
     caller_emoji = sanitize_user_emoji(caller_user.get("emoji"))
-    now = int(time.time() * 1000)
     cid = f"call_{uuid.uuid4().hex[:12]}"
     ACTIVE_CALLS[cid] = {
         "callId": cid,
@@ -4011,6 +4093,7 @@ def call_start():
         "createdAt": now,
         "updatedAt": now,
         "connectedAt": None,
+        "endedBy": "",
     }
     return jsonify({"ok": True, "callId": cid})
 
@@ -4023,7 +4106,7 @@ def call_offer():
     from_u = (d.get("from") or "").strip()
     offer = d.get("offer")
     c = ACTIVE_CALLS.get(cid)
-    if not c or from_u not in (c.get("caller"), c.get("callee")):
+    if not c or c.get("status") == "ended" or from_u not in (c.get("caller"), c.get("callee")):
         return jsonify({"ok": False})
     c["offer"] = offer
     c["offerBy"] = from_u
@@ -4039,7 +4122,7 @@ def call_answer():
     from_u = (d.get("from") or "").strip()
     answer = d.get("answer")
     c = ACTIVE_CALLS.get(cid)
-    if not c or from_u not in (c.get("caller"), c.get("callee")):
+    if not c or c.get("status") == "ended" or from_u not in (c.get("caller"), c.get("callee")):
         return jsonify({"ok": False})
     now = int(time.time() * 1000)
     c["answer"] = answer
@@ -4059,7 +4142,7 @@ def call_candidate():
     from_u = (d.get("from") or "").strip()
     cand = d.get("candidate")
     c = ACTIVE_CALLS.get(cid)
-    if not c or from_u not in (c.get("caller"), c.get("callee")) or not cand:
+    if not c or c.get("status") == "ended" or from_u not in (c.get("caller"), c.get("callee")) or not cand:
         return jsonify({"ok": False})
     c.setdefault("candidates", []).append({"from": from_u, "candidate": cand})
     c["updatedAt"] = int(time.time() * 1000)
@@ -4071,10 +4154,15 @@ def call_end():
     d = request.get_json(force=True) or {}
     cid = (d.get("callId") or "").strip()
     from_u = (d.get("from") or "").strip()
-    c = ACTIVE_CALLS.get(cid)
-    if c and (not from_u or from_u in (c.get("caller"), c.get("callee"))):
-        c["status"] = "ended"
-        c["updatedAt"] = int(time.time() * 1000)
+    now = int(time.time() * 1000)
+    if cid and cid in ACTIVE_CALLS:
+        c = ACTIVE_CALLS[cid]
+        if not from_u or from_u in (c.get("caller"), c.get("callee")):
+            c["status"] = "ended"
+            c["endedBy"] = from_u
+            c["updatedAt"] = now
+    elif from_u:
+        end_user_calls(from_u, now)
     return jsonify({"ok": True})
 
 
@@ -4088,7 +4176,7 @@ def call_poll():
 
     if active_cid:
         c = ACTIVE_CALLS.get(active_cid)
-        if not c or c.get("status") == "ended":
+        if not c or c.get("status") == "ended" or user not in (c.get("caller"), c.get("callee")):
             return jsonify({"ok": True, "ended": True})
         c["updatedAt"] = int(time.time() * 1000)
         return jsonify({"ok": True, "call": c})
