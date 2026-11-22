@@ -20,6 +20,7 @@ USE_PG = bool(DATABASE_URL and psycopg2 is not None)
 SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
 TYPING_TTL_MS = 4500
 OWNER_NICK = "владислав"
+TRIPLE_BADGE_GROUP_TITLE = "ырка сквад"
 MAX_IMAGE_LEN = 1_500_000
 DEFAULT_GROUP_ICON = "🦜"
 
@@ -50,9 +51,13 @@ def init_db():
                         sender TEXT NOT NULL,
                         text TEXT NOT NULL DEFAULT '',
                         image TEXT NOT NULL DEFAULT '',
-                        ts BIGINT NOT NULL
+                        ts BIGINT NOT NULL,
+                        reply_to_json TEXT NOT NULL DEFAULT '',
+                        reactions_json TEXT NOT NULL DEFAULT '{}'
                     )
                 """)
+                cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS reply_to_json TEXT NOT NULL DEFAULT ''")
+                cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS reactions_json TEXT NOT NULL DEFAULT '{}'")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_key ON messages(chat_key)")
 
                 cur.execute("""
@@ -73,9 +78,13 @@ def init_db():
                         sender TEXT NOT NULL,
                         text TEXT NOT NULL DEFAULT '',
                         image TEXT NOT NULL DEFAULT '',
-                        ts BIGINT NOT NULL
+                        ts BIGINT NOT NULL,
+                        reply_to_json TEXT NOT NULL DEFAULT '',
+                        reactions_json TEXT NOT NULL DEFAULT '{}'
                     )
                 """)
+                cur.execute("ALTER TABLE group_messages ADD COLUMN IF NOT EXISTS reply_to_json TEXT NOT NULL DEFAULT ''")
+                cur.execute("ALTER TABLE group_messages ADD COLUMN IF NOT EXISTS reactions_json TEXT NOT NULL DEFAULT '{}'")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_group_messages_gid ON group_messages(group_id)")
     else:
         if not os.path.exists(DB_FILE):
@@ -113,6 +122,10 @@ def group_typing_key(group_id):
 
 def is_owner_nick(username):
     return (username or "").strip().lower() == OWNER_NICK
+
+
+def is_triple_badge_group(title):
+    return (title or "").strip().lower() == TRIPLE_BADGE_GROUP_TITLE
 
 
 def normalize_group_emoji(em):
@@ -170,17 +183,64 @@ def parse_json_list(val):
         return []
 
 
+def parse_json_dict(val):
+    if isinstance(val, dict):
+        return val
+    try:
+        parsed = json.loads(val or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def sanitize_reply_to(raw):
+    if not isinstance(raw, dict):
+        return None
+    sender = str(raw.get("from") or "").strip()
+    text = str(raw.get("text") or "").strip()[:140]
+    has_image = bool(raw.get("hasImage"))
+    if not sender and not text and not has_image:
+        return None
+    return {
+        "from": sender,
+        "text": text,
+        "hasImage": has_image,
+    }
+
+
+def normalize_reactions(raw):
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for em, users in raw.items():
+        emoji_key = str(em or "").strip()
+        if not emoji_key or not isinstance(users, list):
+            continue
+        cleaned = []
+        seen = set()
+        for u in users:
+            nick = str(u or "").strip()
+            if nick and nick not in seen:
+                seen.add(nick)
+                cleaned.append(nick)
+        if cleaned:
+            out[emoji_key] = cleaned
+    return out
+
+
 def format_group_row(row):
     members = parse_json_list(row.get("members_json") if isinstance(row, dict) else getattr(row, "members_json", "[]"))
     muted = parse_json_list(row.get("muted_json") if isinstance(row, dict) else getattr(row, "muted_json", "[]"))
+    title = row["title"]
     return {
         "id": row["id"],
-        "title": row["title"],
+        "title": title,
         "emoji": normalize_group_emoji(row.get("emoji")),
         "owner": row["owner"],
         "members": members,
         "muted": muted,
         "createdAt": int(row.get("created_at", 0) or 0),
+        "tripleBadge": is_triple_badge_group(title),
     }
 
 
@@ -197,15 +257,54 @@ def get_group_by_id(group_id):
     g = db["groups"].get(group_id)
     if not g:
         return None
+    title = g["title"]
     return {
         "id": g["id"],
-        "title": g["title"],
+        "title": title,
         "emoji": normalize_group_emoji(g.get("emoji")),
         "owner": g["owner"],
         "members": list(g.get("members") or []),
         "muted": list(g.get("muted") or []),
         "createdAt": int(g.get("createdAt") or 0),
+        "tripleBadge": is_triple_badge_group(title),
     }
+
+
+def is_group_title_taken(title, exclude_group_id=None):
+    target = (title or "").strip().lower()
+    if not target:
+        return False
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if exclude_group_id:
+                    cur.execute("SELECT id FROM groups WHERE LOWER(TRIM(title)) = %s AND id <> %s", (target, exclude_group_id))
+                else:
+                    cur.execute("SELECT id FROM groups WHERE LOWER(TRIM(title)) = %s", (target,))
+                return cur.fetchone() is not None
+    db = load_json_db()
+    for gid, g in db["groups"].items():
+        if exclude_group_id and gid == exclude_group_id:
+            continue
+        if str(g.get("title") or "").strip().lower() == target:
+            return True
+    return False
+
+
+def format_message_record(msg_id, sender, text, image, ts, reply_to_raw=None, reactions_raw=None):
+    item = {
+        "id": msg_id,
+        "from": sender,
+        "text": text or "",
+        "ts": int(ts or 0),
+        "reactions": normalize_reactions(reactions_raw),
+    }
+    if image:
+        item["image"] = image
+    rep = sanitize_reply_to(reply_to_raw)
+    if rep:
+        item["replyTo"] = rep
+    return item
 
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -359,6 +458,12 @@ HTML_PAGE = """<!DOCTYPE html>
     line-height: 1;
     flex-shrink: 0;
   }
+  .triple-badges {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+  }
 
   /* Плавающий голубой кружок с карандашом */
   .fab-create {
@@ -472,6 +577,7 @@ HTML_PAGE = """<!DOCTYPE html>
     flex-direction: column;
     min-height: 0;
     overflow: hidden;
+    position: relative;
   }
   .room-header-main {
     display: flex;
@@ -513,6 +619,26 @@ HTML_PAGE = """<!DOCTYPE html>
     opacity: 0.78;
     margin-bottom: 3px;
   }
+  .reply-quote {
+    border-left: 3px solid currentColor;
+    padding: 4px 8px;
+    margin-bottom: 5px;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.16);
+    font-size: 12px;
+    line-height: 1.25;
+    opacity: 0.92;
+  }
+  .reply-quote-author {
+    font-weight: 700;
+    font-size: 11px;
+  }
+  .reply-quote-txt {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 240px;
+  }
   .m {
     padding: 9px 12px;
     border-radius: 14px;
@@ -521,6 +647,9 @@ HTML_PAGE = """<!DOCTYPE html>
     white-space: pre-wrap;
     font-size: var(--msg-font-size);
     line-height: 1.35;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
   }
   .me { align-self: flex-end; background: #9be15d; color: #101511; font-weight: 500; }
   .them { align-self: flex-start; background: #243026; color: #f3f7f3; }
@@ -544,6 +673,103 @@ HTML_PAGE = """<!DOCTYPE html>
     font-size: var(--emoji-size);
     line-height: 1.1;
     vertical-align: middle;
+  }
+  .reactions-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 6px;
+  }
+  .reaction-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    background: rgba(16, 21, 17, 0.35);
+    color: inherit;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    cursor: pointer;
+  }
+  .reaction-chip.reacted-by-me {
+    background: rgba(45, 169, 255, 0.28);
+    border-color: #2da9ff;
+    color: #ffffff;
+  }
+
+  /* Меню долгого нажатия на сообщение */
+  .msg-menu-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+    z-index: 60;
+  }
+  .msg-menu-card {
+    width: 100%;
+    max-width: 340px;
+    background: #1f2920;
+    border: 1px solid #324234;
+    border-radius: 16px;
+    padding: 14px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
+  }
+  .msg-menu-preview {
+    font-size: 12px;
+    color: #a8b7aa;
+    background: #151c16;
+    padding: 8px 10px;
+    border-radius: 10px;
+    margin-bottom: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .reaction-picker-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+  }
+  .reaction-pick-btn {
+    background: #28342a;
+    color: #fff;
+    padding: 7px 10px;
+    font-size: 20px;
+    line-height: 1;
+    border-radius: 10px;
+  }
+
+  .reply-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 7px 12px;
+    background: #212c22;
+    border-top: 1px solid #2f3d31;
+    font-size: 12px;
+  }
+  .reply-bar-info {
+    min-width: 0;
+    flex: 1;
+    border-left: 3px solid #2da9ff;
+    padding-left: 8px;
+  }
+  .reply-bar-title {
+    font-weight: 700;
+    color: #5bc0ff;
+  }
+  .reply-bar-text {
+    color: #c2d0c3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .bottom-dock {
@@ -743,6 +969,13 @@ HTML_PAGE = """<!DOCTYPE html>
           <button type="button" class="em-btn" onclick="insertEmoji('🎉')">🎉</button>
           <button type="button" class="em-btn" onclick="insertEmoji('😭')">😭</button>
         </div>
+        <div id="replyBar" class="reply-bar hidden">
+          <div class="reply-bar-info">
+            <div class="reply-bar-title" id="replyBarAuthor">Ответ @user</div>
+            <div class="reply-bar-text" id="replyBarText"></div>
+          </div>
+          <button type="button" class="mini-btn sec" onclick="clearReplyTarget()">✕</button>
+        </div>
         <div id="attachPreview" class="attach-preview hidden">
           <img id="attachThumb" alt="Превью">
           <div class="muted" id="attachName">Картинка прикреплена</div>
@@ -755,6 +988,16 @@ HTML_PAGE = """<!DOCTYPE html>
           <button type="button" onclick="sendMsg()">➤</button>
         </div>
       </div>
+    </div>
+  </div>
+
+  <div id="msgActionModal" class="msg-menu-backdrop hidden" onclick="closeMsgActionModal(event)">
+    <div class="msg-menu-card" onclick="event.stopPropagation()">
+      <div class="msg-menu-preview" id="msgActionPreview">Сообщение</div>
+      <button type="button" class="blue-btn" style="width:100%;" onclick="startReplyToSelectedMsg()">↩️ Ответить на сообщение</button>
+      <div class="muted mt-12" style="font-weight:700;">Ответить реакцией:</div>
+      <div id="msgReactionChoices" class="reaction-picker-grid"></div>
+      <button type="button" class="sec mt-12" style="width:100%;" onclick="closeMsgActionModal()">Отмена</button>
     </div>
   </div>
 
@@ -827,6 +1070,10 @@ const GROUP_ICONS = [
   "🍕", "👑", "💎", "🐗", "🐄", "🔶"
 ];
 
+const REACTION_EMOJIS = [
+  "😀", "😂", "❤️", "🔥", "👍", "🍐", "🎉", "😭"
+];
+
 const DEFAULT_CUSTOM = {
   msgSize: 15,
   emojiSize: 24,
@@ -838,8 +1085,14 @@ const SINGLE_EMOJI_RE = /([\p{Emoji_Presentation}\p{Extended_Pictographic}]\uFE0
 
 let me = null;
 let authTab = "login";
-let activeChat = null; // { type: 'direct' | 'group', id, username, emoji, isOwner }
+let activeChat = null; // { type: 'direct' | 'group', id, username, emoji, isOwner, tripleBadge }
 let pendingImageData = "";
+let replyTarget = null; // { from, text, hasImage }
+let currentRoomMsgs = [];
+let selectedMsgForAction = null;
+let suppressNextBubbleClick = false;
+let longPressTimer = null;
+
 let lastRenderedMsgsJson = "";
 let lastRenderedCustomJson = "";
 let lastTypingPingTs = 0;
@@ -856,6 +1109,16 @@ let baselineViewportHeight = window.visualViewport ? window.visualViewport.heigh
 
 function isSystemOwnerNick(nick) {
   return String(nick || "").trim().toLowerCase() === "владислав";
+}
+
+function isTripleBadgeGroupTitle(title) {
+  return String(title || "").trim().toLowerCase() === "ырка сквад";
+}
+
+function groupTitleHtml(title, tripleBadge = false) {
+  const showTriple = Boolean(tripleBadge) || isTripleBadgeGroupTitle(title);
+  if (!showTriple) return esc(title);
+  return `${esc(title)} <span class="triple-badges" title="Подтверждённая группа"><span class="verified-badge">✓</span><span class="verified-badge">✓</span><span class="verified-badge">✓</span></span>`;
 }
 
 function setKeyboardLift(px) {
@@ -1081,7 +1344,7 @@ function isFullscreenNow() {
 async function toggleFullscreenByTap(e) {
   if (!e.target.closest) return;
   const interactive = e.target.closest(
-    "button, input, textarea, select, a, .chat-card, .member-pick, .group-member-row, .group-edit-card, .room-header-main, .m, .msg-img, .em-btn, .clip-btn, .attach-preview, .top, .bottom-dock, .custom-box, .fab-create"
+    "button, input, textarea, select, a, .chat-card, .member-pick, .group-member-row, .group-edit-card, .room-header-main, .m, .msg-img, .em-btn, .clip-btn, .attach-preview, .reply-bar, .msg-menu-card, .reaction-chip, .top, .bottom-dock, .custom-box, .fab-create"
   );
   if (interactive) return;
 
@@ -1123,6 +1386,7 @@ function saveLocalUser(user) {
 function showScreen(id) {
   composerFocused = false;
   setKeyboardLift(0);
+  closeMsgActionModal();
   ["loadingScreen", "authScreen", "chatsScreen", "createGroupScreen", "groupSettingsScreen", "searchScreen", "roomScreen", "settingsScreen"].forEach(s => {
     document.getElementById(s).classList.toggle("hidden", s !== id);
   });
@@ -1156,6 +1420,7 @@ async function doAuth() {
 
 function enterChats() {
   activeChat = null;
+  replyTarget = null;
   clearAttachment();
   lastRenderedMsgsJson = "";
   document.getElementById("myAva").textContent = me.emoji || "🍐";
@@ -1167,6 +1432,7 @@ function enterChats() {
 
 function backToChats() {
   activeChat = null;
+  replyTarget = null;
   clearAttachment();
   lastRenderedMsgsJson = "";
   showScreen("chatsScreen");
@@ -1265,7 +1531,7 @@ async function submitCreateGroup() {
     errEl.textContent = res.error || "Не удалось создать группу";
     return;
   }
-  await openGroupChat(res.group.id, res.group.title, res.group.emoji);
+  await openGroupChat(res.group.id, res.group.title, res.group.emoji, res.group.tripleBadge);
 }
 
 /* Настройки группы при нажатии на шапку чата */
@@ -1320,8 +1586,9 @@ async function saveGroupMeta() {
   }
   activeChat.username = res.group.title;
   activeChat.emoji = res.group.emoji;
+  activeChat.tripleBadge = Boolean(res.group.tripleBadge);
   document.getElementById("peerAva").textContent = res.group.emoji || "🦜";
-  document.getElementById("peerNick").innerHTML = esc(res.group.title);
+  document.getElementById("peerNick").innerHTML = groupTitleHtml(res.group.title, activeChat.tripleBadge);
   await renderGroupSettings();
   const okAfter = document.getElementById("editGroupOk");
   if (okAfter) okAfter.textContent = "Название и иконка обновлены!";
@@ -1347,8 +1614,9 @@ async function renderGroupSettings() {
 
   activeChat.username = g.title;
   activeChat.emoji = editGroupEmoji;
+  activeChat.tripleBadge = Boolean(g.tripleBadge);
   document.getElementById("peerAva").textContent = editGroupEmoji;
-  document.getElementById("peerNick").innerHTML = esc(g.title);
+  document.getElementById("peerNick").innerHTML = groupTitleHtml(g.title, activeChat.tripleBadge);
 
   const ownerEditMetaHtml = isGroupOwner ? `
     <div class="group-edit-card">
@@ -1410,7 +1678,7 @@ async function renderGroupSettings() {
     <div style="display:flex; align-items:center; gap:12px;">
       <div class="ava" style="width:52px; height:52px; font-size:26px;">${editGroupEmoji}</div>
       <div>
-        <div style="font-size:18px; font-weight:800;">${esc(g.title)}</div>
+        <div style="font-size:18px; font-weight:800; display:flex; align-items:center; gap:5px;">${groupTitleHtml(g.title, activeChat.tripleBadge)}</div>
         <div class="muted">Владелец: ${nickLabelHtml(g.owner, isSystemOwnerNick(g.owner))}</div>
       </div>
     </div>
@@ -1536,8 +1804,9 @@ async function refreshChats() {
       }
       activeChat.username = matchedGroup.title;
       activeChat.emoji = matchedGroup.emoji;
+      activeChat.tripleBadge = Boolean(matchedGroup.tripleBadge);
       document.getElementById("peerAva").textContent = matchedGroup.emoji || "🦜";
-      document.getElementById("peerNick").innerHTML = esc(matchedGroup.title);
+      document.getElementById("peerNick").innerHTML = groupTitleHtml(matchedGroup.title, activeChat.tripleBadge);
     }
   }
 
@@ -1547,12 +1816,13 @@ async function refreshChats() {
   }
   list.innerHTML = res.chats.map(c => {
     if (c.type === "group") {
+      const typingLabel = c.typingText ? `${esc(c.typingText)} печатает...` : "";
       return `
-        <div class="chat-card" onclick="openGroupChat('${esc(c.groupId)}', '${esc(c.title)}', '${esc(c.emoji || '🦜')}')">
+        <div class="chat-card" onclick="openGroupChat('${esc(c.groupId)}', '${esc(c.title)}', '${esc(c.emoji || '🦜')}', ${c.tripleBadge ? 'true' : 'false'})">
           <div class="ava">${c.emoji || '🦜'}</div>
           <div class="chat-info">
-            <div class="chat-name">${esc(c.title)} <span class="muted" style="font-weight:500; font-size:12px;">• группа</span></div>
-            <div class="chat-last ${c.typing ? 'typing-active' : ''}">${c.typing ? 'печатает...' : esc(c.last || 'Сообщений пока нет')}</div>
+            <div class="chat-name">${groupTitleHtml(c.title, c.tripleBadge)} <span class="muted" style="font-weight:500; font-size:12px;">• группа</span></div>
+            <div class="chat-last ${typingLabel ? 'typing-active' : ''}">${typingLabel || esc(c.last || 'Сообщений пока нет')}</div>
           </div>
         </div>
       `;
@@ -1576,8 +1846,126 @@ function syncRoomComposerLock(isMuted) {
   if (controls) controls.classList.toggle("hidden", Boolean(isMuted));
 }
 
+function clearReplyTarget() {
+  replyTarget = null;
+  const bar = document.getElementById("replyBar");
+  if (bar) bar.classList.add("hidden");
+}
+
+function setReplyTarget(msg) {
+  if (!msg) return;
+  replyTarget = {
+    from: msg.from,
+    text: (msg.text || "").trim(),
+    hasImage: Boolean(msg.image)
+  };
+  const bar = document.getElementById("replyBar");
+  const authorEl = document.getElementById("replyBarAuthor");
+  const txtEl = document.getElementById("replyBarText");
+  if (bar && authorEl && txtEl) {
+    authorEl.textContent = `Ответ @${replyTarget.from}`;
+    txtEl.textContent = replyTarget.text || (replyTarget.hasImage ? "📷 Картинка" : "Сообщение");
+    bar.classList.remove("hidden");
+  }
+  const inp = document.getElementById("msgInput");
+  if (inp) inp.focus();
+}
+
+function openMsgActionModal(msgIndex) {
+  const msg = currentRoomMsgs[msgIndex];
+  if (!msg) return;
+  selectedMsgForAction = msg;
+  const prev = document.getElementById("msgActionPreview");
+  const snippet = (msg.text || "").trim() || (msg.image ? "📷 Картинка" : "Сообщение");
+  if (prev) prev.textContent = `@${msg.from}: ${snippet}`;
+
+  const grid = document.getElementById("msgReactionChoices");
+  if (grid) {
+    const myReactions = msg.reactions || {};
+    grid.innerHTML = REACTION_EMOJIS.map(em => {
+      const users = myReactions[em] || [];
+      const active = users.includes(me.username);
+      return `<button type="button" class="reaction-pick-btn" style="${active ? 'outline:2px solid #2da9ff; background:#1c3242;' : ''}" onclick="pickReactionForSelected('${em}')">${em}</button>`;
+    }).join("");
+  }
+
+  const modal = document.getElementById("msgActionModal");
+  if (modal) modal.classList.remove("hidden");
+}
+
+function closeMsgActionModal(event) {
+  if (event && event.target && event.target.id !== "msgActionModal") return;
+  selectedMsgForAction = null;
+  const modal = document.getElementById("msgActionModal");
+  if (modal) modal.classList.add("hidden");
+}
+
+function startReplyToSelectedMsg() {
+  const target = selectedMsgForAction;
+  closeMsgActionModal();
+  if (target) setReplyTarget(target);
+}
+
+async function pickReactionForSelected(emoji) {
+  const target = selectedMsgForAction;
+  closeMsgActionModal();
+  if (!target || !activeChat || !me) return;
+  await toggleMessageReaction(target.id, emoji);
+}
+
+async function toggleMessageReaction(msgId, emoji) {
+  if (!msgId || !emoji || !activeChat || !me) return;
+  const payload = {
+    actor: me.username,
+    msgId,
+    emoji,
+    chatType: activeChat.type
+  };
+  if (activeChat.type === "group") {
+    payload.groupId = activeChat.id;
+  } else {
+    payload.peer = activeChat.username;
+  }
+  const res = await api("/api/react", payload);
+  if (res.ok) {
+    lastRenderedMsgsJson = "";
+    await refreshMessages(false);
+  }
+}
+
+function bindLongPressToBubble(el, msgIndex) {
+  const startPress = (e) => {
+    if (e.type === "mousedown" && e.button !== 0) return;
+    if (longPressTimer) clearTimeout(longPressTimer);
+    longPressTimer = setTimeout(() => {
+      suppressNextBubbleClick = true;
+      openMsgActionModal(msgIndex);
+    }, 460);
+  };
+  const cancelPress = () => {
+    if (longPressTimer) {
+      clearTimeout(longPressTimer);
+      longPressTimer = null;
+    }
+  };
+  el.addEventListener("touchstart", startPress, { passive: true });
+  el.addEventListener("touchend", cancelPress);
+  el.addEventListener("touchcancel", cancelPress);
+  el.addEventListener("touchmove", cancelPress, { passive: true });
+  el.addEventListener("mousedown", startPress);
+  el.addEventListener("mouseup", cancelPress);
+  el.addEventListener("mouseleave", cancelPress);
+  el.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    cancelPress();
+    openMsgActionModal(msgIndex);
+  });
+}
+
 async function openDirectChat(username, emoji, isOwner = false) {
-  activeChat = { type: "direct", id: username, username, emoji, isOwner };
+  activeChat = { type: "direct", id: username, username, emoji, isOwner, tripleBadge: false };
+  replyTarget = null;
+  clearReplyTarget();
   clearAttachment();
   lastRenderedMsgsJson = "";
   syncRoomComposerLock(false);
@@ -1594,15 +1982,18 @@ async function openDirectChat(username, emoji, isOwner = false) {
   await refreshChats();
 }
 
-async function openGroupChat(groupId, title, emoji) {
-  activeChat = { type: "group", id: groupId, username: title, emoji: emoji || "🦜", isOwner: false };
+async function openGroupChat(groupId, title, emoji, tripleBadge = false) {
+  const badgeFlag = Boolean(tripleBadge) || isTripleBadgeGroupTitle(title);
+  activeChat = { type: "group", id: groupId, username: title, emoji: emoji || "🦜", isOwner: false, tripleBadge: badgeFlag };
+  replyTarget = null;
+  clearReplyTarget();
   clearAttachment();
   lastRenderedMsgsJson = "";
   syncRoomComposerLock(false);
   const headerMain = document.getElementById("roomHeaderMain");
   if (headerMain) headerMain.classList.add("clickable-header");
   document.getElementById("peerAva").textContent = emoji || "🦜";
-  document.getElementById("peerNick").innerHTML = esc(title);
+  document.getElementById("peerNick").innerHTML = groupTitleHtml(title, badgeFlag);
   document.getElementById("peerStatus").textContent = "";
   const inp = document.getElementById("msgInput");
   inp.value = "";
@@ -1617,26 +2008,52 @@ function formatTextWithEmojis(rawText) {
   return safe.replace(SINGLE_EMOJI_RE, match => `<span class="inline-emoji">${match}</span>`);
 }
 
-function renderMsgItem(m) {
+function renderMsgItem(m, index) {
   const isMe = m.from === me.username;
   const cls = isMe ? "me" : "them";
   const text = (m.text || "").trim();
-  const isEmojiOnly = !m.image && text.length > 0 && EMOJI_ONLY_RE.test(text);
+  const hasReply = Boolean(m.replyTo);
+  const reactionsObj = m.reactions || {};
+  const reactionKeys = Object.keys(reactionsObj).filter(k => Array.isArray(reactionsObj[k]) && reactionsObj[k].length > 0);
+  const hasReactions = reactionKeys.length > 0;
+
+  const isEmojiOnly = !m.image && !hasReply && !hasReactions && text.length > 0 && EMOJI_ONLY_RE.test(text);
   const bubbleExtra = isEmojiOnly ? " emoji-only-bubble" : "";
 
   const senderHtml = (activeChat && activeChat.type === "group" && !isMe)
     ? `<div class="msg-sender">@${esc(m.from)}</div>`
     : "";
 
+  const replyHtml = m.replyTo
+    ? `<div class="reply-quote"><div class="reply-quote-author">@${esc(m.replyTo.from || "пользователь")}</div><div class="reply-quote-txt">${esc(m.replyTo.text || (m.replyTo.hasImage ? "📷 Картинка" : "Сообщение"))}</div></div>`
+    : "";
+
   const imgHtml = m.image
-    ? `<img class="msg-img" src="${m.image}" alt="Картинка" onclick="window.open('${m.image}', '_blank')">`
+    ? `<img class="msg-img" src="${m.image}" alt="Картинка" onclick="if(suppressNextBubbleClick){suppressNextBubbleClick=false;return;}event.stopPropagation();window.open('${m.image}', '_blank')">`
     : "";
 
   const txtHtml = text
     ? `<div class="msg-txt">${formatTextWithEmojis(text)}</div>`
     : "";
 
-  return `<div class="m ${cls}${bubbleExtra}">${senderHtml}${imgHtml}${txtHtml}</div>`;
+  const reactionsHtml = hasReactions
+    ? `<div class="reactions-row">${reactionKeys.map(em => {
+        const users = reactionsObj[em];
+        const reactedByMe = users.includes(me.username);
+        return `<span class="reaction-chip ${reactedByMe ? 'reacted-by-me' : ''}" onclick="event.stopPropagation(); toggleMessageReaction(${Number(m.id)}, '${em}')">${em} <span>${users.length}</span></span>`;
+      }).join("")}</div>`
+    : "";
+
+  return `<div class="m ${cls}${bubbleExtra}" data-msg-index="${index}">${senderHtml}${replyHtml}${imgHtml}${txtHtml}${reactionsHtml}</div>`;
+}
+
+function attachMessageInteractions() {
+  const box = document.getElementById("msgsBox");
+  if (!box) return;
+  box.querySelectorAll(".m[data-msg-index]").forEach(el => {
+    const idx = Number(el.getAttribute("data-msg-index"));
+    bindLongPressToBubble(el, idx);
+  });
 }
 
 async function refreshMessages(forceScroll = false) {
@@ -1651,28 +2068,36 @@ async function refreshMessages(forceScroll = false) {
     syncRoomComposerLock(Boolean(res.isMuted));
     activeChat.username = res.title || activeChat.username;
     activeChat.emoji = res.emoji || activeChat.emoji;
+    activeChat.tripleBadge = Boolean(res.tripleBadge) || isTripleBadgeGroupTitle(activeChat.username);
     document.getElementById("peerAva").textContent = activeChat.emoji || "🦜";
-    document.getElementById("peerNick").innerHTML = esc(activeChat.username);
+    document.getElementById("peerNick").innerHTML = groupTitleHtml(activeChat.username, activeChat.tripleBadge);
 
     const statusEl = document.getElementById("peerStatus");
     if (statusEl) {
       const typers = res.typingUsers || [];
-      statusEl.textContent = typers.length ? `${typers.join(", ")} печатает...` : "";
+      if (typers.length) {
+        const formattedTypers = typers.map(n => `@${n}`).join(", ");
+        statusEl.textContent = `${formattedTypers} печатает...`;
+      } else {
+        statusEl.textContent = "";
+      }
     }
 
+    currentRoomMsgs = res.msgs || [];
     const customStamp = JSON.stringify(loadCustom());
-    const json = JSON.stringify(res.msgs);
+    const json = JSON.stringify(currentRoomMsgs);
     if (json === lastRenderedMsgsJson && customStamp === lastRenderedCustomJson && !forceScroll) return;
     lastRenderedMsgsJson = json;
     lastRenderedCustomJson = customStamp;
 
     const box = document.getElementById("msgsBox");
     if (!box) return;
-    if (!res.msgs.length) {
+    if (!currentRoomMsgs.length) {
       box.innerHTML = `<div class="muted" style="margin:auto;">Группа создана! Напишите первое сообщение.</div>`;
       return;
     }
-    box.innerHTML = res.msgs.map(renderMsgItem).join("");
+    box.innerHTML = currentRoomMsgs.map((m, i) => renderMsgItem(m, i)).join("");
+    attachMessageInteractions();
     box.scrollTop = box.scrollHeight;
     return;
   }
@@ -1691,19 +2116,21 @@ async function refreshMessages(forceScroll = false) {
     statusEl.textContent = res.peerTyping ? "печатает..." : "";
   }
 
+  currentRoomMsgs = res.msgs || [];
   const customStamp = JSON.stringify(loadCustom());
-  const json = JSON.stringify(res.msgs);
+  const json = JSON.stringify(currentRoomMsgs);
   if (json === lastRenderedMsgsJson && customStamp === lastRenderedCustomJson && !forceScroll) return;
   lastRenderedMsgsJson = json;
   lastRenderedCustomJson = customStamp;
 
   const box = document.getElementById("msgsBox");
   if (!box) return;
-  if (!res.msgs.length) {
+  if (!currentRoomMsgs.length) {
     box.innerHTML = `<div class="muted" style="margin:auto;">Здесь пока пусто. Напишите первое сообщение!</div>`;
     return;
   }
-  box.innerHTML = res.msgs.map(renderMsgItem).join("");
+  box.innerHTML = currentRoomMsgs.map((m, i) => renderMsgItem(m, i)).join("");
+  attachMessageInteractions();
   box.scrollTop = box.scrollHeight;
 }
 
@@ -1782,6 +2209,7 @@ async function sendMsg() {
   const inp = document.getElementById("msgInput");
   const text = inp.value.trim();
   const image = pendingImageData;
+  const rep = replyTarget ? { ...replyTarget } : null;
   if (!text && !image) return;
 
   if (activeChat.type === "group") {
@@ -1789,7 +2217,8 @@ async function sendMsg() {
       from: me.username,
       groupId: activeChat.id,
       text,
-      image
+      image,
+      replyTo: rep
     });
     if (!res.ok) {
       if (res.muted) syncRoomComposerLock(true);
@@ -1797,6 +2226,7 @@ async function sendMsg() {
     }
     inp.value = "";
     autoResizeComposer();
+    clearReplyTarget();
     clearAttachment();
     inp.focus();
     await refreshMessages(true);
@@ -1806,10 +2236,11 @@ async function sendMsg() {
 
   inp.value = "";
   autoResizeComposer();
+  clearReplyTarget();
   clearAttachment();
   inp.focus();
 
-  await api("/api/send", { from: me.username, to: activeChat.username, text, image });
+  await api("/api/send", { from: me.username, to: activeChat.username, text, image, replyTo: rep });
   await refreshMessages(true);
   await refreshChats();
 }
@@ -1843,6 +2274,7 @@ async function logout() {
   await api("/api/logout", {});
   saveLocalUser(null);
   activeChat = null;
+  replyTarget = null;
   clearAttachment();
   showScreen("authScreen");
 }
@@ -1852,6 +2284,7 @@ async function deleteAccount() {
   await api("/api/delete", { username: me.username });
   saveLocalUser(null);
   activeChat = null;
+  replyTarget = null;
   clearAttachment();
   showScreen("authScreen");
 }
@@ -2069,12 +2502,15 @@ def chats():
                 else:
                     preview_text = "Группа создана"
                     ts_val = g["createdAt"]
+                typers = get_group_typing_users(g["id"], u)
                 out.append({
                     "type": "group",
                     "groupId": g["id"],
                     "title": g["title"],
                     "emoji": normalize_group_emoji(g["emoji"]),
-                    "typing": len(get_group_typing_users(g["id"], u)) > 0,
+                    "tripleBadge": g["tripleBadge"],
+                    "typing": len(typers) > 0,
+                    "typingText": ", ".join(f"@{t}" for t in typers),
                     "last": preview_text,
                     "ts": ts_val,
                 })
@@ -2114,12 +2550,15 @@ def chats():
             else:
                 preview_text = "Группа создана"
                 ts_val = int(g.get("createdAt") or 0)
+            typers = get_group_typing_users(gid, u)
             out.append({
                 "type": "group",
                 "groupId": gid,
                 "title": g["title"],
                 "emoji": normalize_group_emoji(g.get("emoji")),
-                "typing": len(get_group_typing_users(gid, u)) > 0,
+                "tripleBadge": is_triple_badge_group(g.get("title")),
+                "typing": len(typers) > 0,
+                "typingText": ", ".join(f"@{t}" for t in typers),
                 "last": preview_text,
                 "ts": ts_val,
             })
@@ -2138,26 +2577,47 @@ def msgs():
         with get_pg_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT sender AS \"from\", text, image, ts FROM messages WHERE chat_key = %s ORDER BY id ASC",
+                    "SELECT id, sender AS \"from\", text, image, ts, reply_to_json, reactions_json FROM messages WHERE chat_key = %s ORDER BY id ASC",
                     (ck,),
                 )
                 rows = cur.fetchall()
                 cur.execute("SELECT emoji FROM users WHERE username = %s", (b,))
                 peer_row = cur.fetchone()
         peer_emoji = (peer_row.get("emoji") if peer_row else None) or "🍐"
-        formatted = []
-        for r in rows:
-            item = {"from": r["from"], "text": r.get("text") or "", "ts": int(r.get("ts") or 0)}
-            if r.get("image"):
-                item["image"] = r["image"]
-            formatted.append(item)
+        formatted = [
+            format_message_record(
+                r["id"],
+                r["from"],
+                r.get("text") or "",
+                r.get("image") or "",
+                r.get("ts") or 0,
+                parse_json_dict(r.get("reply_to_json")),
+                parse_json_dict(r.get("reactions_json")),
+            )
+            for r in rows
+        ]
         return jsonify({"ok": True, "msgs": formatted, "peerEmoji": peer_emoji, "peerTyping": peer_typing})
 
     db = load_json_db()
     peer_user = db["users"].get(b) or {}
+    raw_list = db["chats"].get(ck, [])
+    formatted = []
+    for idx, m in enumerate(raw_list):
+        msg_id = m.get("id") or f"d_{idx}_{m.get('ts', 0)}"
+        formatted.append(
+            format_message_record(
+                msg_id,
+                m.get("from", ""),
+                m.get("text", ""),
+                m.get("image", ""),
+                m.get("ts", 0),
+                m.get("replyTo"),
+                m.get("reactions"),
+            )
+        )
     return jsonify({
         "ok": True,
-        "msgs": db["chats"].get(ck, []),
+        "msgs": formatted,
         "peerEmoji": peer_user.get("emoji") or "🍐",
         "peerTyping": peer_typing,
     })
@@ -2170,6 +2630,7 @@ def send():
     t = (d.get("to") or "").strip()
     txt = (d.get("text") or "").strip()
     img = d.get("image") or ""
+    rep = sanitize_reply_to(d.get("replyTo"))
     if img and not (img.startswith("data:image/") and len(img) <= MAX_IMAGE_LEN):
         img = ""
     if not f or not t or (not txt and not img):
@@ -2181,18 +2642,104 @@ def send():
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO messages (chat_key, sender, text, image, ts) VALUES (%s, %s, %s, %s, %s)",
-                    (chat_key(f, t), f, txt, img, ts),
+                    "INSERT INTO messages (chat_key, sender, text, image, ts, reply_to_json, reactions_json) VALUES (%s, %s, %s, %s, %s, %s, '{}')",
+                    (chat_key(f, t), f, txt, img, ts, json.dumps(rep, ensure_ascii=False) if rep else ""),
                 )
         return jsonify({"ok": True})
 
-    msg_item = {"from": f, "text": txt, "ts": ts}
+    msg_item = {
+        "id": f"d_{uuid.uuid4().hex[:10]}",
+        "from": f,
+        "text": txt,
+        "ts": ts,
+        "reactions": {},
+    }
     if img:
         msg_item["image"] = img
+    if rep:
+        msg_item["replyTo"] = rep
     db = load_json_db()
     db["chats"].setdefault(chat_key(f, t), []).append(msg_item)
     save_json_db(db)
     return jsonify({"ok": True})
+
+
+@app.post("/api/react")
+def react_api():
+    d = request.get_json(force=True) or {}
+    actor = (d.get("actor") or "").strip()
+    emoji = (d.get("emoji") or "").strip()
+    msg_id = d.get("msgId")
+    chat_type = (d.get("chatType") or "direct").strip()
+
+    if not actor or not emoji or msg_id is None or msg_id == "":
+        return jsonify({"ok": False})
+
+    def apply_toggle(reactions_dict):
+        cur_map = normalize_reactions(reactions_dict)
+        users = list(cur_map.get(emoji) or [])
+        if actor in users:
+            users.remove(actor)
+        else:
+            users.append(actor)
+        if users:
+            cur_map[emoji] = users
+        else:
+            cur_map.pop(emoji, None)
+        return cur_map
+
+    if chat_type == "group":
+        gid = (d.get("groupId") or "").strip()
+        g = get_group_by_id(gid)
+        if not g or actor not in g["members"]:
+            return jsonify({"ok": False})
+        if USE_PG:
+            with get_pg_conn() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SELECT reactions_json FROM group_messages WHERE id = %s AND group_id = %s", (int(msg_id), gid))
+                    row = cur.fetchone()
+                    if not row:
+                        return jsonify({"ok": False})
+                    updated = apply_toggle(parse_json_dict(row.get("reactions_json")))
+                    cur.execute("UPDATE group_messages SET reactions_json = %s WHERE id = %s", (json.dumps(updated, ensure_ascii=False), int(msg_id)))
+            return jsonify({"ok": True, "reactions": updated})
+
+        db = load_json_db()
+        g_list = db["group_msgs"].get(gid) or []
+        for idx, m in enumerate(g_list):
+            mid = m.get("id") or f"g_{idx}_{m.get('ts', 0)}"
+            if str(mid) == str(msg_id):
+                m["id"] = mid
+                m["reactions"] = apply_toggle(m.get("reactions"))
+                save_json_db(db)
+                return jsonify({"ok": True, "reactions": m["reactions"]})
+        return jsonify({"ok": False})
+
+    peer = (d.get("peer") or "").strip()
+    if not peer:
+        return jsonify({"ok": False})
+    ck = chat_key(actor, peer)
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT reactions_json FROM messages WHERE id = %s AND chat_key = %s", (int(msg_id), ck))
+                row = cur.fetchone()
+                if not row:
+                    return jsonify({"ok": False})
+                updated = apply_toggle(parse_json_dict(row.get("reactions_json")))
+                cur.execute("UPDATE messages SET reactions_json = %s WHERE id = %s", (json.dumps(updated, ensure_ascii=False), int(msg_id)))
+        return jsonify({"ok": True, "reactions": updated})
+
+    db = load_json_db()
+    c_list = db["chats"].get(ck) or []
+    for idx, m in enumerate(c_list):
+        mid = m.get("id") or f"d_{idx}_{m.get('ts', 0)}"
+        if str(mid) == str(msg_id):
+            m["id"] = mid
+            m["reactions"] = apply_toggle(m.get("reactions"))
+            save_json_db(db)
+            return jsonify({"ok": True, "reactions": m["reactions"]})
+    return jsonify({"ok": False})
 
 
 @app.post("/api/groups/create")
@@ -2204,6 +2751,8 @@ def create_group():
     raw_members = d.get("members") or []
     if not owner or not title:
         return jsonify({"ok": False, "error": "Укажите название группы."})
+    if is_group_title_taken(title):
+        return jsonify({"ok": False, "error": "Группа с таким названием уже существует!"})
 
     members_clean = []
     seen = set()
@@ -2238,6 +2787,7 @@ def create_group():
         "members": members_clean,
         "muted": [],
         "createdAt": now,
+        "tripleBadge": is_triple_badge_group(title),
     }
     db["groups"][gid] = group_obj
     db["group_msgs"].setdefault(gid, [])
@@ -2258,6 +2808,8 @@ def group_update():
         return jsonify({"ok": False, "error": "Только создатель группы может менять настройки."})
     if not title:
         return jsonify({"ok": False, "error": "Название не может быть пустым."})
+    if is_group_title_taken(title, exclude_group_id=gid):
+        return jsonify({"ok": False, "error": "Группа с таким названием уже существует!"})
 
     if USE_PG:
         with get_pg_conn() as conn:
@@ -2307,31 +2859,54 @@ def group_msgs():
         with get_pg_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "SELECT sender AS \"from\", text, image, ts FROM group_messages WHERE group_id = %s ORDER BY id ASC",
+                    "SELECT id, sender AS \"from\", text, image, ts, reply_to_json, reactions_json FROM group_messages WHERE group_id = %s ORDER BY id ASC",
                     (gid,),
                 )
                 rows = cur.fetchall()
-        formatted = []
-        for r in rows:
-            item = {"from": r["from"], "text": r.get("text") or "", "ts": int(r.get("ts") or 0)}
-            if r.get("image"):
-                item["image"] = r["image"]
-            formatted.append(item)
+        formatted = [
+            format_message_record(
+                r["id"],
+                r["from"],
+                r.get("text") or "",
+                r.get("image") or "",
+                r.get("ts") or 0,
+                parse_json_dict(r.get("reply_to_json")),
+                parse_json_dict(r.get("reactions_json")),
+            )
+            for r in rows
+        ]
         return jsonify({
             "ok": True,
             "msgs": formatted,
             "title": g["title"],
             "emoji": normalize_group_emoji(g["emoji"]),
+            "tripleBadge": g["tripleBadge"],
             "isMuted": is_muted,
             "typingUsers": typers,
         })
 
     db = load_json_db()
+    raw_list = db["group_msgs"].get(gid, [])
+    formatted = []
+    for idx, m in enumerate(raw_list):
+        msg_id = m.get("id") or f"g_{idx}_{m.get('ts', 0)}"
+        formatted.append(
+            format_message_record(
+                msg_id,
+                m.get("from", ""),
+                m.get("text", ""),
+                m.get("image", ""),
+                m.get("ts", 0),
+                m.get("replyTo"),
+                m.get("reactions"),
+            )
+        )
     return jsonify({
         "ok": True,
-        "msgs": db["group_msgs"].get(gid, []),
+        "msgs": formatted,
         "title": g["title"],
-        "emoji": normalize_group_emoji(g["emoji"]),
+        "emoji": normalize_group_emoji(g.get("emoji")),
+        "tripleBadge": is_triple_badge_group(g.get("title")),
         "isMuted": is_muted,
         "typingUsers": typers,
     })
@@ -2344,6 +2919,7 @@ def group_send():
     gid = (d.get("groupId") or "").strip()
     txt = (d.get("text") or "").strip()
     img = d.get("image") or ""
+    rep = sanitize_reply_to(d.get("replyTo"))
     if img and not (img.startswith("data:image/") and len(img) <= MAX_IMAGE_LEN):
         img = ""
 
@@ -2362,14 +2938,22 @@ def group_send():
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO group_messages (group_id, sender, text, image, ts) VALUES (%s, %s, %s, %s, %s)",
-                    (gid, f, txt, img, ts),
+                    "INSERT INTO group_messages (group_id, sender, text, image, ts, reply_to_json, reactions_json) VALUES (%s, %s, %s, %s, %s, %s, '{}')",
+                    (gid, f, txt, img, ts, json.dumps(rep, ensure_ascii=False) if rep else ""),
                 )
         return jsonify({"ok": True})
 
-    msg_item = {"from": f, "text": txt, "ts": ts}
+    msg_item = {
+        "id": f"g_{uuid.uuid4().hex[:10]}",
+        "from": f,
+        "text": txt,
+        "ts": ts,
+        "reactions": {},
+    }
     if img:
         msg_item["image"] = img
+    if rep:
+        msg_item["replyTo"] = rep
     db = load_json_db()
     db["group_msgs"].setdefault(gid, []).append(msg_item)
     save_json_db(db)
