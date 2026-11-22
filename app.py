@@ -1071,6 +1071,7 @@ HTML_PAGE = """<!DOCTYPE html>
     height: 100%;
     object-fit: cover;
     background: var(--input-bg);
+    transform: none;
   }
   .call-avatar-fallback {
     width: 100%;
@@ -1098,6 +1099,7 @@ HTML_PAGE = """<!DOCTYPE html>
     width: 100%;
     height: 100%;
     object-fit: cover;
+    transform: none;
   }
   .call-group-grid {
     width: 100%;
@@ -1122,6 +1124,9 @@ HTML_PAGE = """<!DOCTYPE html>
     justify-content: center;
     padding: 10px;
   }
+  .call-tile.cam-active {
+    justify-content: flex-end;
+  }
   .call-tile-video {
     position: absolute;
     inset: 0;
@@ -1129,6 +1134,7 @@ HTML_PAGE = """<!DOCTYPE html>
     height: 100%;
     object-fit: cover;
     background: var(--input-bg);
+    transform: none;
   }
   .call-tile-ava {
     width: 54px;
@@ -1140,6 +1146,9 @@ HTML_PAGE = """<!DOCTYPE html>
     place-items: center;
     font-size: 28px;
     z-index: 1;
+  }
+  .call-tile.cam-active .call-tile-ava {
+    display: none;
   }
   .call-tile-name {
     margin-top: 8px;
@@ -1154,6 +1163,9 @@ HTML_PAGE = """<!DOCTYPE html>
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .call-tile.cam-active .call-tile-name {
+    margin-top: 0;
   }
   .call-peer-ava {
     width: 82px;
@@ -1535,7 +1547,8 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div class="pad">
       <div style="font-weight:700;">Аватарка (только эмодзи)</div>
-      <div id="avaPicker" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;"></div>
+      <button type="button" id="btnToggleAvaPicker" class="sec mt-8" onclick="toggleAvatarPicker()">Выбрать эмодзи</button>
+      <div id="avaPicker" class="hidden" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;"></div>
 
       <div style="font-weight:700; margin-top:18px;">Изменить никнейм</div>
       <div id="nickHint" class="muted mt-8"></div>
@@ -1606,7 +1619,8 @@ const AVATAR_EMOJIS = [
   "⚡", "🍕", "🦊", "🐼", "🤖", "👻",
   "🦄", "🐉", "🌙", "⭐", "💎", "🎮",
   "🎧", "🚀", "🌵", "🍀", "🍓", "🙂",
-  "🐄", "🐗", "🔶"
+  "🐄", "🐗", "🔶", "🎂", "🥕", "🧸",
+  "🙀", "🥺", "🤷‍♂️"
 ];
 
 const GROUP_ICONS = [
@@ -1736,6 +1750,7 @@ let selectedGroupEmoji = "🦜";
 let selectedGroupMembers = new Set();
 let editGroupEmoji = "🦜";
 let inviteGroupMembers = new Set();
+let avaPickerOpen = false;
 
 let composerFocused = false;
 let baselineViewportHeight = window.visualViewport ? window.visualViewport.height : window.innerHeight;
@@ -2027,6 +2042,16 @@ function updateCamButtonUi() {
   }
 }
 
+function syncGroupTileCameraState(tile, hasCam, stream, vidEl) {
+  if (!tile) return;
+  tile.classList.toggle("cam-active", Boolean(hasCam));
+  if (hasCam && stream) {
+    bindStreamToVideoElement(vidEl, stream, true);
+  } else {
+    hardResetVideoElement(vidEl);
+  }
+}
+
 function renderGroupCallGrid() {
   const grid = document.getElementById("callGroupStage");
   if (!grid || !callState || callState.mode !== "group") return;
@@ -2039,19 +2064,12 @@ function renderGroupCallGrid() {
       if (!tile) return;
       const vid = tile.querySelector("video");
       if (p.username === me.username) {
-        if (cameraEnabled && localStream && localStream.getVideoTracks().some(t => t.readyState === "live" && t.enabled)) {
-          bindStreamToVideoElement(vid, localStream, true);
-        } else {
-          hardResetVideoElement(vid);
-        }
+        const hasLocalCam = Boolean(cameraEnabled && localStream && localStream.getVideoTracks().some(t => t.readyState === "live" && t.enabled));
+        syncGroupTileCameraState(tile, hasLocalCam, localStream, vid);
       } else {
         const entry = groupPeers.get(p.username);
         const hasRemoteVid = Boolean(p.camOn && entry && entry.videoTrack && entry.videoTrack.readyState === "live" && !entry.camOff);
-        if (hasRemoteVid) {
-          bindStreamToVideoElement(vid, entry.videoStream, true);
-        } else {
-          hardResetVideoElement(vid);
-        }
+        syncGroupTileCameraState(tile, hasRemoteVid, entry ? entry.videoStream : null, vid);
       }
     });
     return;
@@ -2076,19 +2094,12 @@ function renderGroupCallGrid() {
     if (!tile) return;
     const vid = tile.querySelector("video");
     if (p.username === me.username) {
-      if (cameraEnabled && localStream && localStream.getVideoTracks().some(t => t.readyState === "live" && t.enabled)) {
-        bindStreamToVideoElement(vid, localStream, true);
-      } else {
-        hardResetVideoElement(vid);
-      }
+      const hasLocalCam = Boolean(cameraEnabled && localStream && localStream.getVideoTracks().some(t => t.readyState === "live" && t.enabled));
+      syncGroupTileCameraState(tile, hasLocalCam, localStream, vid);
     } else {
       const entry = groupPeers.get(p.username);
       const hasRemoteVid = Boolean(p.camOn && entry && entry.videoTrack && entry.videoTrack.readyState === "live" && !entry.camOff);
-      if (hasRemoteVid) {
-        bindStreamToVideoElement(vid, entry.videoStream, true);
-      } else {
-        hardResetVideoElement(vid);
-      }
+      syncGroupTileCameraState(tile, hasRemoteVid, entry ? entry.videoStream : null, vid);
     }
   });
 }
@@ -3578,6 +3589,19 @@ function renderAvatarChoices() {
   ).join("");
 }
 
+function syncAvatarPickerUi() {
+  const box = document.getElementById("avaPicker");
+  const btn = document.getElementById("btnToggleAvaPicker");
+  if (box) box.classList.toggle("hidden", !avaPickerOpen);
+  if (btn) btn.textContent = avaPickerOpen ? "Скрыть эмодзи" : "Выбрать эмодзи";
+}
+
+function toggleAvatarPicker() {
+  avaPickerOpen = !avaPickerOpen;
+  playSound("click");
+  syncAvatarPickerUi();
+}
+
 function isFullscreenNow() {
   return Boolean(document.fullscreenElement || document.webkitFullscreenElement);
 }
@@ -4204,7 +4228,9 @@ function getNickCooldownInfo(userObj) {
 
 function openSettings() {
   playSound("click");
+  avaPickerOpen = false;
   renderAvatarChoices();
+  syncAvatarPickerUi();
   applyCustom(loadCustom());
   document.getElementById("setErr").textContent = "";
   document.getElementById("setOk").textContent = "";
@@ -4872,6 +4898,8 @@ async function setEmoji(em) {
     document.getElementById("myAva").textContent = cleanEm;
     document.getElementById("setOk").textContent = `Аватарка обновлена на ${cleanEm}`;
     document.getElementById("setErr").textContent = "";
+    avaPickerOpen = false;
+    syncAvatarPickerUi();
     refreshChats();
   }
 }
@@ -4943,6 +4971,7 @@ function esc(s) {
 
 applyCustom(loadCustom());
 renderAvatarChoices();
+syncAvatarPickerUi();
 
 (async function boot() {
   let savedNick = "";
@@ -6221,72 +6250,78 @@ def emoji():
 @app.post("/api/nick")
 def nick():
     d = request.get_json(force=True) or {}
-    old_n, new_n = (d.get("oldNick") or "").strip(), (d.get("newNick") or "").strip()
+    old_n = (d.get("oldNick") or "").strip()
+    new_n = (d.get("newNick") or "").strip()
+    if len(new_n) < 2:
+        return jsonify({"ok": False, "error": "Ник минимум 2 символа."})
+
     user = get_user(old_n)
     if not user:
-        return jsonify({"ok": False, "error": "Аккаунт не найден."})
-    now = int(time.time() * 1000)
-    created_at = int(user.get("createdAt", user.get("created_at", now)) or now)
-    last_change = int(user.get("lastNickChangeAt", user.get("last_nick_change_at", created_at)) or created_at)
-    if now - last_change < SEVEN_DAYS_MS:
-        rem_days = max(0, (SEVEN_DAYS_MS - (now - last_change)) // 86400000)
-        return jsonify({"ok": False, "error": f"Никнейм можно менять раз в 7 дней. Подождите ещё ~{rem_days} дн."})
-    if len(new_n) < 2:
-        return jsonify({"ok": False, "error": "Ник слишком короткий."})
+        return jsonify({"ok": False, "error": "Пользователь не найден."})
 
-    clean_emoji = sanitize_user_emoji(user.get("emoji"))
+    now = int(time.time() * 1000)
+    created_at = int(user.get("created_at", user.get("createdAt", 0)) or 0)
+    last_change = int(user.get("last_nick_change_at", user.get("lastNickChangeAt", created_at)) or created_at)
+    if last_change and (now - last_change) < SEVEN_DAYS_MS:
+        rem = SEVEN_DAYS_MS - (now - last_change)
+        days_left = int(rem // 86400000)
+        hours_left = max(1, int(((rem % 86400000) + 3599999) // 3600000))
+        return jsonify({"ok": False, "error": f"Менять ник можно раз в 7 дней. Осталось: {days_left} дн. {hours_left} ч."})
 
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT username FROM users WHERE username = %s", (new_n,))
                 if cur.fetchone():
-                    return jsonify({"ok": False, "error": "Этот ник уже занят!"})
+                    return jsonify({"ok": False, "error": "Этот ник уже занят."})
                 cur.execute(
                     """
-                    INSERT INTO users (username, password, emoji, created_at, last_nick_change_at)
-                    VALUES (%s, %s, %s, %s, %s)
+                    UPDATE users
+                    SET username = %s, last_nick_change_at = %s
+                    WHERE username = %s
+                    RETURNING *
                     """,
-                    (new_n, user["password"], clean_emoji, created_at, now),
+                    (new_n, now, old_n),
                 )
-                cur.execute("SELECT chat_key FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{old_n}::%", f"%::{old_n}"))
-                for r in cur.fetchall():
-                    parts = r["chat_key"].split("::")
-                    new_key = chat_key(new_n if parts[0] == old_n else parts[0], new_n if parts[1] == old_n else parts[1])
-                    cur.execute("UPDATE messages SET chat_key = %s WHERE chat_key = %s", (new_key, r["chat_key"]))
-                cur.execute("UPDATE messages SET sender = %s WHERE sender = %s", (new_n, old_n))
-                cur.execute("DELETE FROM users WHERE username = %s", (old_n,))
-                cur.execute("SELECT * FROM users WHERE username = %s", (new_n,))
                 updated = cur.fetchone()
+                cur.execute("UPDATE messages SET sender = %s WHERE sender = %s", (new_n, old_n))
+                cur.execute(
+                    """
+                    SELECT id, chat_key FROM messages
+                    WHERE chat_key LIKE %s OR chat_key LIKE %s
+                    """,
+                    (f"{old_n}::%", f"%::{old_n}"),
+                )
+                for mrow in cur.fetchall():
+                    parts = mrow["chat_key"].split("::")
+                    new_ck = chat_key(*[new_n if x == old_n else x for x in parts])
+                    cur.execute("UPDATE messages SET chat_key = %s WHERE id = %s", (new_ck, mrow["id"]))
         resp = make_response(jsonify({"ok": True, "user": format_user(updated)}))
         resp.set_cookie("grusha_user", new_n, max_age=30 * 24 * 3600, samesite="Lax")
         return resp
 
     db = load_json_db()
     if new_n in db["users"]:
-        return jsonify({"ok": False, "error": "Этот ник уже занят!"})
-    db["users"][new_n] = {
-        "username": new_n,
-        "password": user["password"],
-        "emoji": clean_emoji,
-        "createdAt": created_at,
-        "lastNickChangeAt": now,
-    }
-    del db["users"][old_n]
+        return jsonify({"ok": False, "error": "Этот ник уже занят."})
+    u_data = db["users"].pop(old_n)
+    u_data["username"] = new_n
+    u_data["lastNickChangeAt"] = now
+    db["users"][new_n] = u_data
+
     new_chats = {}
-    for k, m in db["chats"].items():
+    for k, m_list in db["chats"].items():
         parts = k.split("::")
         if old_n in parts:
-            nk = chat_key(new_n if parts[0] == old_n else parts[0], new_n if parts[1] == old_n else parts[1])
-            for item in m:
+            nk = chat_key(*[new_n if x == old_n else x for x in parts])
+            for item in m_list:
                 if item.get("from") == old_n:
                     item["from"] = new_n
-            new_chats.setdefault(nk, []).extend(m)
+            new_chats.setdefault(nk, []).extend(m_list)
         else:
-            new_chats[k] = m
+            new_chats[k] = m_list
     db["chats"] = new_chats
     save_json_db(db)
-    resp = make_response(jsonify({"ok": True, "user": format_user(db["users"][new_n])}))
+    resp = make_response(jsonify({"ok": True, "user": format_user(u_data)}))
     resp.set_cookie("grusha_user", new_n, max_age=30 * 24 * 3600, samesite="Lax")
     return resp
 
@@ -6295,31 +6330,31 @@ def nick():
 def delete_acc():
     d = request.get_json(force=True) or {}
     u = (d.get("username") or "").strip()
+    if not u:
+        return jsonify({"ok": False})
+
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM users WHERE username = %s", (u,))
-                cur.execute("DELETE FROM messages WHERE sender = %s OR chat_key LIKE %s OR chat_key LIKE %s", (u, f"{u}::%", f"%::{u}"))
-    else:
-        db = load_json_db()
-        db["users"].pop(u, None)
-        db["chats"] = {k: v for k, v in db["chats"].items() if u not in k.split("::")}
-        for gid in list(db["groups"].keys()):
-            g = db["groups"][gid]
-            if g.get("owner") == u:
-                db["groups"].pop(gid, None)
-                db["group_msgs"].pop(gid, None)
-            else:
-                g["members"] = [m for m in (g.get("members") or []) if m != u]
-                g["muted"] = [m for m in (g.get("muted") or []) if m != u]
-        save_json_db(db)
+                cur.execute(
+                    "DELETE FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s",
+                    (f"{u}::%", f"%::{u}"),
+                )
+        resp = make_response(jsonify({"ok": True}))
+        resp.delete_cookie("grusha_user")
+        return resp
 
+    db = load_json_db()
+    db["users"].pop(u, None)
+    for k in [k for k in db["chats"] if u in k.split("::")]:
+        db["chats"].pop(k, None)
+    save_json_db(db)
     resp = make_response(jsonify({"ok": True}))
     resp.delete_cookie("grusha_user")
     return resp
 
 
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port)
