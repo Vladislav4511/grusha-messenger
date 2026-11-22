@@ -8,6 +8,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "db.json")
 SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000
 OWNER_NICK = "владислав"
+MAX_IMAGE_LEN = 1_500_000
 
 
 def load_db():
@@ -45,12 +46,12 @@ HTML_PAGE = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Груша</title>
 <style>
   * { box-sizing: border-box; }
-  body { margin: 0; font-family: system-ui, -apple-system, sans-serif; background: #101511; color: #f3f7f3; }
-  .wrap { max-width: 480px; margin: 0 auto; min-height: 100vh; background: #171e18; display: flex; flex-direction: column; }
+  html, body { margin: 0; padding: 0; background: #101511; color: #f3f7f3; font-family: system-ui, -apple-system, sans-serif; min-height: 100%; }
+  .wrap { max-width: 480px; margin: 0 auto; min-height: 100dvh; background: #171e18; display: flex; flex-direction: column; }
   .top { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; background: #1f2920; border-bottom: 1px solid #2b382d; gap: 8px; }
   .brand { font-size: 20px; font-weight: 800; }
   .pad { padding: 14px; flex: 1; display: flex; flex-direction: column; }
@@ -70,19 +71,26 @@ HTML_PAGE = """<!DOCTYPE html>
   .chat-name { font-weight: 700; font-size: 15px; display: inline-flex; align-items: center; gap: 5px; }
   .chat-last { color: #9aa89c; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 2px; }
   .verified-badge { display: inline-flex; align-items: center; justify-content: center; width: 17px; height: 17px; border-radius: 50%; background: #2da9ff; color: #ffffff; font-size: 11px; font-weight: 900; line-height: 1; flex-shrink: 0; }
-  .msgs { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; max-height: 62vh; }
-  .m { padding: 9px 12px; border-radius: 14px; max-width: 80%; word-break: break-word; font-size: 15px; line-height: 1.35; }
+  .msgs { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; max-height: 58dvh; }
+  .m { padding: 9px 12px; border-radius: 14px; max-width: 82%; word-break: break-word; font-size: 15px; line-height: 1.35; }
   .me { align-self: flex-end; background: #9be15d; color: #101511; font-weight: 500; }
   .them { align-self: flex-start; background: #243026; color: #f3f7f3; }
+  .msg-img { display: block; max-width: 100%; max-height: 240px; border-radius: 10px; object-fit: cover; cursor: pointer; }
+  .msg-txt { margin-top: 6px; }
+  .msg-txt:first-child { margin-top: 0; }
   .em-row { display: flex; gap: 6px; padding: 6px 14px; background: #1b231c; border-top: 1px solid #28342a; overflow-x: auto; }
   .em-btn { background: #263228; color: #fff; padding: 6px 9px; font-size: 18px; border-radius: 8px; flex-shrink: 0; }
-  .composer { display: flex; gap: 8px; padding: 10px 14px 14px; background: #1b231c; }
+  .attach-preview { display: flex; align-items: center; gap: 10px; padding: 8px 14px; background: #1f2920; border-top: 1px solid #2b382d; }
+  .attach-preview img { width: 52px; height: 52px; object-fit: cover; border-radius: 8px; border: 1px solid #394a3c; }
+  .attach-remove { padding: 6px 10px; font-size: 12px; border-radius: 8px; background: #b93838; color: #fff; margin-left: auto; }
+  .composer { display: flex; align-items: center; gap: 6px; padding: 10px 14px 14px; background: #1b231c; }
+  .clip-btn { background: #263228; color: #eef5ee; padding: 10px 11px; font-size: 17px; border-radius: 10px; flex-shrink: 0; }
   .composer input { flex: 1; }
   .hidden { display: none !important; }
 </style>
 </head>
 <body>
-<div class="wrap">
+<div class="wrap" id="appRoot">
   <div id="loadingScreen" class="pad" style="justify-content:center; align-items:center;">
     <div class="brand">🍐 Груша</div>
     <div class="muted mt-8">Загрузка аккаунта...</div>
@@ -136,7 +144,14 @@ HTML_PAGE = """<!DOCTYPE html>
       <button type="button" class="em-btn" onclick="insertEmoji('🎉')">🎉</button>
       <button type="button" class="em-btn" onclick="insertEmoji('😭')">😭</button>
     </div>
+    <div id="attachPreview" class="attach-preview hidden">
+      <img id="attachThumb" alt="Превью">
+      <div class="muted" id="attachName">Картинка прикреплена</div>
+      <button type="button" class="attach-remove" onclick="clearAttachment()">Убрать</button>
+    </div>
     <div class="composer">
+      <input id="fileInput" type="file" accept="image/*" class="hidden" onchange="onFileSelected(event)">
+      <button type="button" class="clip-btn" title="Прикрепить картинку" onclick="document.getElementById('fileInput').click()">📎</button>
       <input id="msgInput" placeholder="Сообщение..." autocomplete="off" spellcheck="false" onkeydown="if(event.key==='Enter'){event.preventDefault();sendMsg();}">
       <button type="button" onclick="sendMsg()">➤</button>
     </div>
@@ -150,16 +165,7 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div class="pad">
       <div style="font-weight:700;">Аватарка (только эмодзи)</div>
-      <div style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;">
-        <button type="button" class="em-btn" onclick="setEmoji('🍐')">🍐</button>
-        <button type="button" class="em-btn" onclick="setEmoji('😎')">😎</button>
-        <button type="button" class="em-btn" onclick="setEmoji('🐱')">🐱</button>
-        <button type="button" class="em-btn" onclick="setEmoji('🐸')">🐸</button>
-        <button type="button" class="em-btn" onclick="setEmoji('🔥')">🔥</button>
-        <button type="button" class="em-btn" onclick="setEmoji('👾')">👾</button>
-        <button type="button" class="em-btn" onclick="setEmoji('⚡')">⚡</button>
-        <button type="button" class="em-btn" onclick="setEmoji('🍕')">🍕</button>
-      </div>
+      <div id="avaPicker" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;"></div>
 
       <div style="font-weight:700; margin-top:18px;">Изменить никнейм</div>
       <div id="nickHint" class="muted mt-8"></div>
@@ -176,11 +182,52 @@ HTML_PAGE = """<!DOCTYPE html>
 </div>
 
 <script>
+const AVATAR_EMOJIS = [
+  "🍐", "😎", "🐱", "🐸", "🔥", "👾",
+  "⚡", "🍕", "🦊", "🐼", "🤖", "👻",
+  "🦄", "🐉", "🌙", "⭐", "💎", "🎮",
+  "🎧", "🚀", "🌵", "🍀", "🍓", "👑"
+];
+
 let me = null;
 let authTab = "login";
 let activePeer = null;
+let pendingImageData = "";
 let lastRenderedMsgsJson = "";
 let pollTimer = null;
+
+function renderAvatarChoices() {
+  const box = document.getElementById("avaPicker");
+  if (!box) return;
+  box.innerHTML = AVATAR_EMOJIS.map(em =>
+    `<button type="button" class="em-btn" onclick="setEmoji('${em}')">${em}</button>`
+  ).join("");
+}
+
+function isFullscreenNow() {
+  return Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+}
+
+async function toggleFullscreenByTap(e) {
+  if (!e.target.closest) return;
+  const interactive = e.target.closest(
+    "button, input, textarea, select, a, .chat-card, .m, .msg-img, .em-btn, .clip-btn, .attach-preview, .top, .em-row, .composer"
+  );
+  if (interactive) return;
+
+  try {
+    if (!isFullscreenNow()) {
+      const el = document.documentElement;
+      if (el.requestFullscreen) await el.requestFullscreen();
+      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    } else {
+      if (document.exitFullscreen) await document.exitFullscreen();
+      else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+    }
+  } catch (err) {}
+}
+
+document.addEventListener("click", toggleFullscreenByTap);
 
 function nickLabelHtml(username, isOwner) {
   const badge = isOwner ? ` <span class="verified-badge" title="Владелец">✓</span>` : "";
@@ -232,6 +279,7 @@ async function doAuth() {
 
 function enterChats() {
   activePeer = null;
+  clearAttachment();
   lastRenderedMsgsJson = "";
   document.getElementById("myAva").textContent = me.emoji || "🍐";
   document.getElementById("myNick").innerHTML = nickLabelHtml(me.username, me.isOwner);
@@ -244,12 +292,14 @@ function enterChats() {
 
 function backToChats() {
   activePeer = null;
+  clearAttachment();
   lastRenderedMsgsJson = "";
   showScreen("chatsScreen");
   refreshChats();
 }
 
 function openSettings() {
+  renderAvatarChoices();
   document.getElementById("setErr").textContent = "";
   document.getElementById("setOk").textContent = "";
   const leftMs = 7 * 24 * 3600 * 1000 - (Date.now() - (me.lastNickChangeAt || me.createdAt || Date.now()));
@@ -310,12 +360,20 @@ async function refreshChats() {
 
 async function openChat(username, emoji, isOwner = false) {
   activePeer = { username, emoji, isOwner };
+  clearAttachment();
   lastRenderedMsgsJson = "";
   document.getElementById("peerAva").textContent = emoji || "🍐";
   document.getElementById("peerNick").innerHTML = nickLabelHtml(username, isOwner);
   document.getElementById("msgInput").value = "";
   showScreen("roomScreen");
   await refreshMessages(true);
+}
+
+function renderMsgItem(m) {
+  const cls = m.from === me.username ? "me" : "them";
+  const imgHtml = m.image ? `<img class="msg-img" src="${m.image}" alt="Картинка" onclick="window.open('${m.image}', '_blank')">` : "";
+  const txtHtml = m.text ? `<div class="msg-txt">${esc(m.text)}</div>` : "";
+  return `<div class="m ${cls}">${imgHtml}${txtHtml}</div>`;
 }
 
 async function refreshMessages(forceScroll = false) {
@@ -332,9 +390,7 @@ async function refreshMessages(forceScroll = false) {
     box.innerHTML = `<div class="muted" style="margin:auto;">Здесь пока пусто. Напишите первое сообщение!</div>`;
     return;
   }
-  box.innerHTML = res.msgs.map(m => `
-    <div class="m ${m.from === me.username ? 'me' : 'them'}">${esc(m.text)}</div>
-  `).join("");
+  box.innerHTML = res.msgs.map(renderMsgItem).join("");
   box.scrollTop = box.scrollHeight;
 }
 
@@ -348,14 +404,76 @@ function insertEmoji(em) {
   inp.setSelectionRange(pos, pos);
 }
 
+function clearAttachment() {
+  pendingImageData = "";
+  const fi = document.getElementById("fileInput");
+  if (fi) fi.value = "";
+  const prev = document.getElementById("attachPreview");
+  if (prev) prev.classList.add("hidden");
+  const thumb = document.getElementById("attachThumb");
+  if (thumb) thumb.removeAttribute("src");
+}
+
+function compressImageFile(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const maxSide = 900;
+        let w = img.width;
+        let h = img.height;
+        if (w > maxSide || h > maxSide) {
+          if (w > h) {
+            h = Math.round((h * maxSide) / w);
+            w = maxSide;
+          } else {
+            w = Math.round((w * maxSide) / h);
+            h = maxSide;
+          }
+        }
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, w, h);
+        resolve(canvas.toDataURL("image/jpeg", 0.78));
+      };
+      img.onerror = reject;
+      img.src = reader.result;
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function onFileSelected(event) {
+  const file = event.target.files && event.target.files[0];
+  if (!file) return;
+  try {
+    const dataUrl = await compressImageFile(file);
+    pendingImageData = dataUrl;
+    document.getElementById("attachThumb").src = dataUrl;
+    document.getElementById("attachName").textContent = file.name || "Картинка прикреплена";
+    document.getElementById("attachPreview").classList.remove("hidden");
+    document.getElementById("msgInput").focus();
+  } catch (e) {
+    clearAttachment();
+  }
+}
+
 async function sendMsg() {
   if (!me || !activePeer) return;
   const inp = document.getElementById("msgInput");
   const text = inp.value.trim();
-  if (!text) return;
+  const image = pendingImageData;
+  if (!text && !image) return;
+
   inp.value = "";
+  clearAttachment();
   inp.focus();
-  await api("/api/send", { from: me.username, to: activePeer.username, text });
+
+  await api("/api/send", { from: me.username, to: activePeer.username, text, image });
   await refreshMessages(true);
   await refreshChats();
 }
@@ -365,7 +483,7 @@ async function setEmoji(em) {
   if (res.ok) {
     me.emoji = em;
     document.getElementById("myAva").textContent = em;
-    document.getElementById("setOk").textContent = "Аватарка обновлена";
+    document.getElementById("setOk").textContent = `Аватарка обновлена на ${em}`;
     document.getElementById("setErr").textContent = "";
   }
 }
@@ -388,6 +506,7 @@ async function logout() {
   await api("/api/logout", {});
   saveLocalUser(null);
   activePeer = null;
+  clearAttachment();
   showScreen("authScreen");
 }
 
@@ -396,6 +515,7 @@ async function deleteAccount() {
   await api("/api/delete", { username: me.username });
   saveLocalUser(null);
   activePeer = null;
+  clearAttachment();
   showScreen("authScreen");
 }
 
@@ -413,6 +533,8 @@ function esc(s) {
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
   }[c]));
 }
+
+renderAvatarChoices();
 
 (async function boot() {
   let savedNick = "";
@@ -517,12 +639,14 @@ def chats():
         a, b = k.split("::")
         peer = b if a == u else (a if b == u else None)
         if peer and peer in db["users"]:
+            last_msg = m[-1]
+            preview_text = last_msg.get("text") or ("📷 Картинка" if last_msg.get("image") else "Сообщений пока нет")
             out.append({
                 "username": peer,
                 "emoji": db["users"][peer].get("emoji", "🍐"),
                 "isOwner": is_owner_nick(peer),
-                "last": m[-1]["text"],
-                "ts": m[-1].get("ts", 0),
+                "last": preview_text,
+                "ts": last_msg.get("ts", 0),
             })
     out.sort(key=lambda x: x["ts"], reverse=True)
     return jsonify({"ok": True, "chats": out})
@@ -539,11 +663,19 @@ def msgs():
 @app.post("/api/send")
 def send():
     d = request.get_json(force=True) or {}
-    f, t, txt = (d.get("from") or "").strip(), (d.get("to") or "").strip(), (d.get("text") or "").strip()
-    if not txt:
+    f = (d.get("from") or "").strip()
+    t = (d.get("to") or "").strip()
+    txt = (d.get("text") or "").strip()
+    img = d.get("image") or ""
+    if img and not (img.startswith("data:image/") and len(img) <= MAX_IMAGE_LEN):
+        img = ""
+    if not txt and not img:
         return jsonify({"ok": False})
+    msg_item = {"from": f, "text": txt, "ts": int(time.time() * 1000)}
+    if img:
+        msg_item["image"] = img
     db = load_db()
-    db["chats"].setdefault(chat_key(f, t), []).append({"from": f, "text": txt, "ts": int(time.time() * 1000)})
+    db["chats"].setdefault(chat_key(f, t), []).append(msg_item)
     save_db(db)
     return jsonify({"ok": True})
 
