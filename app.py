@@ -559,6 +559,64 @@ HTML_PAGE = """<!DOCTYPE html>
     transform: translateY(var(--kb-lift));
     transition: transform 0.16s ease-out;
   }
+  .splash-stage {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px 18px;
+    text-align: center;
+    background: radial-gradient(circle at 50% 42%, var(--accent-soft), transparent 68%);
+  }
+  .splash-trio {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 22px;
+    margin-bottom: 22px;
+  }
+  .splash-side {
+    font-size: 46px;
+    line-height: 1;
+    filter: drop-shadow(0 6px 14px rgba(0, 0, 0, 0.4));
+    animation: splashFloatSide 2s ease-in-out infinite;
+  }
+  .splash-side.right {
+    animation-delay: 0.35s;
+  }
+  .splash-pear-wrap {
+    width: 112px;
+    height: 112px;
+    border-radius: 50%;
+    background: var(--card-bg);
+    border: 2px solid var(--accent);
+    display: grid;
+    place-items: center;
+    font-size: 64px;
+    line-height: 1;
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.5);
+    animation: splashPearPulse 1.6s ease-in-out infinite;
+  }
+  .splash-title {
+    font-size: 23px;
+    font-weight: 800;
+    color: var(--accent);
+    letter-spacing: 0.2px;
+  }
+  .splash-sub {
+    margin-top: 8px;
+    font-size: 13px;
+    color: var(--muted-col);
+  }
+  @keyframes splashPearPulse {
+    0%, 100% { transform: scale(1); }
+    50% { transform: scale(1.06); }
+  }
+  @keyframes splashFloatSide {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-6px); }
+  }
   .top {
     display: flex;
     align-items: center;
@@ -652,6 +710,12 @@ HTML_PAGE = """<!DOCTYPE html>
     place-items: center;
     font-size: 22px;
     flex-shrink: 0;
+  }
+  .ava-picker-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 8px;
   }
   .chat-info { min-width: 0; flex: 1; }
   .chat-name { font-weight: 700; font-size: 15px; display: inline-flex; align-items: center; gap: 5px; }
@@ -1350,9 +1414,14 @@ HTML_PAGE = """<!DOCTYPE html>
   <audio id="remoteAudioEl" autoplay playsinline></audio>
   <div id="groupAudioSink" class="hidden"></div>
 
-  <div id="loadingScreen" class="pad" style="justify-content:center; align-items:center;">
-    <div class="brand">🍐 Груша</div>
-    <div class="muted mt-8">Загрузка аккаунта...</div>
+  <div id="loadingScreen" class="splash-stage">
+    <div class="splash-trio">
+      <div class="splash-side left" aria-label="Какашка">💩</div>
+      <div class="splash-pear-wrap" aria-label="Груша">🍐</div>
+      <div class="splash-side right" aria-label="Попугай">🦜</div>
+    </div>
+    <div class="splash-title">Мессенджер Груша</div>
+    <div class="splash-sub">Загрузка...</div>
   </div>
 
   <div id="authScreen" class="pad hidden">
@@ -1547,7 +1616,10 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
     <div class="pad">
       <div style="font-weight:700;">Аватарка (только эмодзи)</div>
-      <button type="button" id="btnToggleAvaPicker" class="sec mt-8" onclick="toggleAvatarPicker()">Выбрать эмодзи</button>
+      <div class="ava-picker-row">
+        <div class="ava" id="settingsCurrentAva">🍐</div>
+        <button type="button" id="btnToggleAvaPicker" class="sec" onclick="toggleAvatarPicker()">Выбрать эмодзи</button>
+      </div>
       <div id="avaPicker" class="hidden" style="display:flex; flex-wrap:wrap; gap:8px; margin-top:8px;"></div>
 
       <div style="font-weight:700; margin-top:18px;">Изменить никнейм</div>
@@ -1613,6 +1685,7 @@ HTML_PAGE = """<!DOCTYPE html>
 
 <script>
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const SPLASH_DURATION_MS = 4000;
 
 const AVATAR_EMOJIS = [
   "🍐", "😎", "🐱", "🐸", "🔥", "👾",
@@ -3590,6 +3663,10 @@ function renderAvatarChoices() {
 }
 
 function syncAvatarPickerUi() {
+  const curAvaEl = document.getElementById("settingsCurrentAva");
+  if (curAvaEl) {
+    curAvaEl.textContent = sanitizeAvatarEmoji(me ? me.emoji : "🍐");
+  }
   const box = document.getElementById("avaPicker");
   const btn = document.getElementById("btnToggleAvaPicker");
   if (box) box.classList.toggle("hidden", !avaPickerOpen);
@@ -4974,10 +5051,15 @@ renderAvatarChoices();
 syncAvatarPickerUi();
 
 (async function boot() {
+  showScreen("loadingScreen");
   let savedNick = "";
   try { savedNick = localStorage.getItem("grusha_nick") || ""; } catch (e) {}
-  const res = await api(`/api/me?nick=${encodeURIComponent(savedNick)}`);
-  if (res.ok && res.user) {
+
+  const mePromise = api(`/api/me?nick=${encodeURIComponent(savedNick)}`).catch(() => ({ ok: false }));
+  const waitPromise = new Promise(resolve => setTimeout(resolve, SPLASH_DURATION_MS));
+
+  const [res] = await Promise.all([mePromise, waitPromise]);
+  if (res && res.ok && res.user) {
     saveLocalUser(res.user);
     enterChats();
   } else {
@@ -6195,14 +6277,13 @@ def group_kick():
                     "UPDATE groups SET members_json = %s, muted_json = %s WHERE id = %s",
                     (json.dumps(members, ensure_ascii=False), json.dumps(muted, ensure_ascii=False), gid),
                 )
-    else:
-        db = load_json_db()
-        if gid in db["groups"]:
-            db["groups"][gid]["members"] = members
-            db["groups"][gid]["muted"] = muted
-            save_json_db(db)
+        return jsonify({"ok": True})
 
-    append_group_system_message(gid, f'"{target}" вышел', "leave")
+    db = load_json_db()
+    if gid in db["groups"]:
+        db["groups"][gid]["members"] = members
+        db["groups"][gid]["muted"] = muted
+        save_json_db(db)
     return jsonify({"ok": True})
 
 
@@ -6215,6 +6296,7 @@ def group_delete():
     if not g or g["owner"] != actor:
         return jsonify({"ok": False})
 
+    GROUP_CALLS.pop(gid, None)
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
@@ -6250,79 +6332,119 @@ def emoji():
 @app.post("/api/nick")
 def nick():
     d = request.get_json(force=True) or {}
-    old_n = (d.get("oldNick") or "").strip()
-    new_n = (d.get("newNick") or "").strip()
-    if len(new_n) < 2:
-        return jsonify({"ok": False, "error": "Ник минимум 2 символа."})
-
-    user = get_user(old_n)
-    if not user:
-        return jsonify({"ok": False, "error": "Пользователь не найден."})
+    old = (d.get("oldNick") or "").strip()
+    new = (d.get("newNick") or "").strip()
+    if len(new) < 2:
+        return jsonify({"ok": False, "error": "Ник от 2 символов."})
+    if old == new:
+        u_obj = get_user(old)
+        return jsonify({"ok": True, "user": format_user(u_obj)}) if u_obj else jsonify({"ok": False})
 
     now = int(time.time() * 1000)
-    created_at = int(user.get("created_at", user.get("createdAt", 0)) or 0)
-    last_change = int(user.get("last_nick_change_at", user.get("lastNickChangeAt", created_at)) or created_at)
-    if last_change and (now - last_change) < SEVEN_DAYS_MS:
-        rem = SEVEN_DAYS_MS - (now - last_change)
-        days_left = int(rem // 86400000)
-        hours_left = max(1, int(((rem % 86400000) + 3599999) // 3600000))
-        return jsonify({"ok": False, "error": f"Менять ник можно раз в 7 дней. Осталось: {days_left} дн. {hours_left} ч."})
 
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT username FROM users WHERE username = %s", (new_n,))
+                cur.execute("SELECT * FROM users WHERE username = %s", (old,))
+                u_row = cur.fetchone()
+                if not u_row:
+                    return jsonify({"ok": False, "error": "Аккаунт не найден."})
+
+                last_change = int(u_row.get("last_nick_change_at") or u_row.get("created_at") or 0)
+                if last_change and (now - last_change) < SEVEN_DAYS_MS:
+                    rem = SEVEN_DAYS_MS - (now - last_change)
+                    days = rem // 86400000
+                    hours = max(1, (rem % 86400000 + 3599999) // 3600000)
+                    return jsonify({"ok": False, "error": f"Менять ник можно раз в 7 дней. Подожди ещё {days} дн. {hours} ч."})
+
+                cur.execute("SELECT username FROM users WHERE username = %s", (new,))
                 if cur.fetchone():
-                    return jsonify({"ok": False, "error": "Этот ник уже занят."})
+                    return jsonify({"ok": False, "error": "Этот ник уже занят!"})
+
                 cur.execute(
                     """
-                    UPDATE users
-                    SET username = %s, last_nick_change_at = %s
-                    WHERE username = %s
-                    RETURNING *
+                    INSERT INTO users (username, password, emoji, created_at, last_nick_change_at)
+                    VALUES (%s, %s, %s, %s, %s)
                     """,
-                    (new_n, now, old_n),
+                    (new, u_row["password"], sanitize_user_emoji(u_row.get("emoji")), int(u_row.get("created_at") or now), now),
                 )
-                updated = cur.fetchone()
-                cur.execute("UPDATE messages SET sender = %s WHERE sender = %s", (new_n, old_n))
-                cur.execute(
-                    """
-                    SELECT id, chat_key FROM messages
-                    WHERE chat_key LIKE %s OR chat_key LIKE %s
-                    """,
-                    (f"{old_n}::%", f"%::{old_n}"),
-                )
-                for mrow in cur.fetchall():
-                    parts = mrow["chat_key"].split("::")
-                    new_ck = chat_key(*[new_n if x == old_n else x for x in parts])
-                    cur.execute("UPDATE messages SET chat_key = %s WHERE id = %s", (new_ck, mrow["id"]))
-        resp = make_response(jsonify({"ok": True, "user": format_user(updated)}))
-        resp.set_cookie("grusha_user", new_n, max_age=30 * 24 * 3600, samesite="Lax")
+                cur.execute("DELETE FROM users WHERE username = %s", (old,))
+
+                cur.execute("UPDATE messages SET sender = %s WHERE sender = %s", (new, old))
+                cur.execute("SELECT DISTINCT chat_key FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{old}::%", f"%::{old}"))
+                for mr in cur.fetchall():
+                    ck = mr["chat_key"]
+                    parts = ck.split("::")
+                    new_ck = chat_key(new if parts[0] == old else parts[0], new if parts[1] == old else parts[1])
+                    cur.execute("UPDATE messages SET chat_key = %s WHERE chat_key = %s", (new_ck, ck))
+
+                cur.execute("UPDATE group_messages SET sender = %s WHERE sender = %s", (new, old))
+                cur.execute("SELECT * FROM groups")
+                for gr in cur.fetchall():
+                    g = format_group_row(gr)
+                    g_owner = new if g["owner"] == old else g["owner"]
+                    g_members = [new if m == old else m for m in g["members"]]
+                    g_muted = [new if m == old else m for m in g["muted"]]
+                    cur.execute(
+                        "UPDATE groups SET owner = %s, members_json = %s, muted_json = %s WHERE id = %s",
+                        (g_owner, json.dumps(g_members, ensure_ascii=False), json.dumps(g_muted, ensure_ascii=False), g["id"]),
+                    )
+
+                cur.execute("SELECT * FROM users WHERE username = %s", (new,))
+                updated_user = cur.fetchone()
+
+        resp = make_response(jsonify({"ok": True, "user": format_user(updated_user)}))
+        resp.set_cookie("grusha_user", new, max_age=30 * 24 * 3600, samesite="Lax")
         return resp
 
     db = load_json_db()
-    if new_n in db["users"]:
-        return jsonify({"ok": False, "error": "Этот ник уже занят."})
-    u_data = db["users"].pop(old_n)
-    u_data["username"] = new_n
-    u_data["lastNickChangeAt"] = now
-    db["users"][new_n] = u_data
+    if old not in db["users"]:
+        return jsonify({"ok": False, "error": "Аккаунт не найден."})
+    u_data = db["users"][old]
+    last_change = int(u_data.get("lastNickChangeAt") or u_data.get("createdAt") or 0)
+    if last_change and (now - last_change) < SEVEN_DAYS_MS:
+        rem = SEVEN_DAYS_MS - (now - last_change)
+        days = rem // 86400000
+        hours = max(1, (rem % 86400000 + 3599999) // 3600000)
+        return jsonify({"ok": False, "error": f"Менять ник можно раз в 7 дней. Подожди ещё {days} дн. {hours} ч."})
+    if new in db["users"]:
+        return jsonify({"ok": False, "error": "Этот ник уже занят!"})
+
+    db["users"][new] = {
+        "username": new,
+        "password": u_data["password"],
+        "emoji": sanitize_user_emoji(u_data.get("emoji")),
+        "createdAt": int(u_data.get("createdAt") or now),
+        "lastNickChangeAt": now,
+    }
+    del db["users"][old]
 
     new_chats = {}
     for k, m_list in db["chats"].items():
+        for m in m_list:
+            if m.get("from") == old:
+                m["from"] = new
         parts = k.split("::")
-        if old_n in parts:
-            nk = chat_key(*[new_n if x == old_n else x for x in parts])
-            for item in m_list:
-                if item.get("from") == old_n:
-                    item["from"] = new_n
+        if old in parts:
+            nk = chat_key(new if parts[0] == old else parts[0], new if parts[1] == old else parts[1])
             new_chats.setdefault(nk, []).extend(m_list)
         else:
             new_chats[k] = m_list
     db["chats"] = new_chats
+
+    for gid, g in db["groups"].items():
+        if g.get("owner") == old:
+            g["owner"] = new
+        g["members"] = [new if x == old else x for x in (g.get("members") or [])]
+        g["muted"] = [new if x == old else x for x in (g.get("muted") or [])]
+    for gid, gm_list in db["group_msgs"].items():
+        for m in gm_list:
+            if m.get("from") == old:
+                m["from"] = new
+
     save_json_db(db)
-    resp = make_response(jsonify({"ok": True, "user": format_user(u_data)}))
-    resp.set_cookie("grusha_user", new_n, max_age=30 * 24 * 3600, samesite="Lax")
+    resp = make_response(jsonify({"ok": True, "user": format_user(db["users"][new])}))
+    resp.set_cookie("grusha_user", new, max_age=30 * 24 * 3600, samesite="Lax")
     return resp
 
 
@@ -6330,17 +6452,11 @@ def nick():
 def delete_acc():
     d = request.get_json(force=True) or {}
     u = (d.get("username") or "").strip()
-    if not u:
-        return jsonify({"ok": False})
-
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM users WHERE username = %s", (u,))
-                cur.execute(
-                    "DELETE FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s",
-                    (f"{u}::%", f"%::{u}"),
-                )
+                cur.execute("DELETE FROM messages WHERE sender = %s OR chat_key LIKE %s OR chat_key LIKE %s", (u, f"{u}::%", f"%::{u}"))
         resp = make_response(jsonify({"ok": True}))
         resp.delete_cookie("grusha_user")
         return resp
@@ -6348,7 +6464,7 @@ def delete_acc():
     db = load_json_db()
     db["users"].pop(u, None)
     for k in [k for k in db["chats"] if u in k.split("::")]:
-        db["chats"].pop(k, None)
+        del db["chats"][k]
     save_json_db(db)
     resp = make_response(jsonify({"ok": True}))
     resp.delete_cookie("grusha_user")
