@@ -2243,8 +2243,15 @@ function forceResetCallUi() {
 async function ensureLocalAudioStream() {
   getAudioContext();
   if (localStream && localStream.getAudioTracks().length > 0) {
-    localStream.getAudioTracks().forEach(t => { t.enabled = !micMuted; });
-    return localStream;
+    localStream.getAudioTracks().forEach(t => {
+      t.enabled = !micMuted;
+      if (t.readyState === "ended") {
+        localStream.removeTrack(t);
+      }
+    });
+    if (localStream.getAudioTracks().length > 0) {
+      return localStream;
+    }
   }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     throw new Error("Браузер не поддерживает доступ к микрофону");
@@ -2275,6 +2282,7 @@ async function flushRenegotiateIfReady() {
   needsRenegotiate = false;
   try {
     const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+    if (!pc || !callState || pc.signalingState !== "stable") return;
     await pc.setLocalDescription(offer);
     callState.lastAppliedOfferJson = JSON.stringify(pc.localDescription);
     await api("/api/call/offer", {
@@ -2495,15 +2503,15 @@ function attachTrackToRemoteStream(track) {
       remoteAudioStream.addTrack(track);
     }
     track.enabled = true;
-    track.onunmute = () => {
-      track.enabled = true;
-      const aud = document.getElementById("remoteAudioEl");
-      if (aud) playAudioSafe(aud, remoteAudioStream);
-    };
     const aud = document.getElementById("remoteAudioEl");
     if (aud) {
       playAudioSafe(aud, remoteAudioStream);
     }
+    track.onunmute = () => {
+      track.enabled = true;
+      const a = document.getElementById("remoteAudioEl");
+      if (a) playAudioSafe(a, remoteAudioStream);
+    };
     unlockAllAudioOutputs();
     return;
   }
@@ -2545,11 +2553,6 @@ function createPeerConnectionForCall(cid) {
     aud.autoplay = true;
     aud.playsInline = true;
   }
-
-  try {
-    conn.addTransceiver("audio", { direction: "sendrecv" });
-    conn.addTransceiver("video", { direction: "sendrecv" });
-  } catch (e) {}
 
   if (localStream) {
     localStream.getTracks().forEach(track => {
@@ -2936,7 +2939,7 @@ async function startDirectCall() {
   showCallModalUi();
 
   pc = createPeerConnectionForCall(cid);
-  const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+  const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: false });
   if (!callState || callState.callId !== cid || !pc) return;
   await pc.setLocalDescription(offer);
   callState.lastAppliedOfferJson = JSON.stringify(pc.localDescription);
@@ -2982,7 +2985,7 @@ async function acceptIncomingCall() {
   }
 
   if (pc && pc.remoteDescription && callState && callState.callId === cid) {
-    const answer = await pc.createAnswer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
+    const answer = await pc.createAnswer({ offerToReceiveAudio: true, offerToReceiveVideo: false });
     if (!pc || !callState || callState.callId !== cid) return;
     await pc.setLocalDescription(answer);
     callState.lastAppliedAnswerJson = JSON.stringify(pc.localDescription);
@@ -6249,14 +6252,13 @@ def nick():
                 cur.execute("SELECT chat_key FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{old_n}::%", f"%::{old_n}"))
                 for r in cur.fetchall():
                     parts = r["chat_key"].split("::")
-                    new_key = chat_key(*[new_n if p == old_n else p for p in parts])
+                    new_key = chat_key(new_n if parts[0] == old_n else parts[0], new_n if parts[1] == old_n else parts[1])
                     cur.execute("UPDATE messages SET chat_key = %s WHERE chat_key = %s", (new_key, r["chat_key"]))
                 cur.execute("UPDATE messages SET sender = %s WHERE sender = %s", (new_n, old_n))
-                cur.execute("UPDATE group_messages SET sender = %s WHERE sender = %s", (new_n, old_n))
                 cur.execute("DELETE FROM users WHERE username = %s", (old_n,))
                 cur.execute("SELECT * FROM users WHERE username = %s", (new_n,))
-                updated_row = cur.fetchone()
-        resp = make_response(jsonify({"ok": True, "user": format_user(updated_row)}))
+                updated = cur.fetchone()
+        resp = make_response(jsonify({"ok": True, "user": format_user(updated)}))
         resp.set_cookie("grusha_user", new_n, max_age=30 * 24 * 3600, samesite="Lax")
         return resp
 
@@ -6274,11 +6276,14 @@ def nick():
     new_chats = {}
     for k, m in db["chats"].items():
         parts = k.split("::")
-        nk = chat_key(*[new_n if p == old_n else p for p in parts])
-        for msg in m:
-            if msg.get("from") == old_n:
-                msg["from"] = new_n
-        new_chats[nk] = m
+        if old_n in parts:
+            nk = chat_key(new_n if parts[0] == old_n else parts[0], new_n if parts[1] == old_n else parts[1])
+            for item in m:
+                if item.get("from") == old_n:
+                    item["from"] = new_n
+            new_chats.setdefault(nk, []).extend(m)
+        else:
+            new_chats[k] = m
     db["chats"] = new_chats
     save_json_db(db)
     resp = make_response(jsonify({"ok": True, "user": format_user(db["users"][new_n])}))
@@ -6294,20 +6299,27 @@ def delete_acc():
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM users WHERE username = %s", (u,))
-                cur.execute("DELETE FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{u}::%", f"%::{u}"))
-        resp = make_response(jsonify({"ok": True}))
-        resp.delete_cookie("grusha_user")
-        return resp
+                cur.execute("DELETE FROM messages WHERE sender = %s OR chat_key LIKE %s OR chat_key LIKE %s", (u, f"{u}::%", f"%::{u}"))
+    else:
+        db = load_json_db()
+        db["users"].pop(u, None)
+        db["chats"] = {k: v for k, v in db["chats"].items() if u not in k.split("::")}
+        for gid in list(db["groups"].keys()):
+            g = db["groups"][gid]
+            if g.get("owner") == u:
+                db["groups"].pop(gid, None)
+                db["group_msgs"].pop(gid, None)
+            else:
+                g["members"] = [m for m in (g.get("members") or []) if m != u]
+                g["muted"] = [m for m in (g.get("muted") or []) if m != u]
+        save_json_db(db)
 
-    db = load_json_db()
-    db["users"].pop(u, None)
-    db["chats"] = {k: v for k, v in db["chats"].items() if u not in k.split("::")}
-    save_json_db(db)
     resp = make_response(jsonify({"ok": True}))
     resp.delete_cookie("grusha_user")
     return resp
 
 
 if __name__ == "__main__":
+    init_db()
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=True)
