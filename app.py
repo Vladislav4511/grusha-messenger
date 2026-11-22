@@ -1883,8 +1883,13 @@ function playAudioSafe(audioEl, stream) {
 function unlockAllAudioOutputs() {
   getAudioContext();
   const aud = document.getElementById("remoteAudioEl");
-  if (aud && remoteAudioStream) {
-    playAudioSafe(aud, remoteAudioStream);
+  if (aud) {
+    if (!aud.srcObject && remoteAudioStream) {
+      aud.srcObject = remoteAudioStream;
+    }
+    if (aud.srcObject) {
+      playAudioSafe(aud, aud.srcObject);
+    }
   }
   groupPeers.forEach(entry => {
     if (entry.audioStream) {
@@ -1903,8 +1908,12 @@ function syncDirectMediaElements() {
   const locVid = document.getElementById("localVideoEl");
   const locPip = document.getElementById("callLocalPip");
 
-  if (aud && remoteAudioStream) {
-    playAudioSafe(aud, remoteAudioStream);
+  if (aud) {
+    if (remoteAudioStream && remoteAudioStream.getAudioTracks().length > 0) {
+      playAudioSafe(aud, remoteAudioStream);
+    } else if (aud.srcObject) {
+      playAudioSafe(aud, aud.srcObject);
+    }
   }
 
   const hasLiveRemoteVideo = Boolean(
@@ -2486,6 +2495,15 @@ function attachTrackToRemoteStream(track) {
       remoteAudioStream.addTrack(track);
     }
     track.enabled = true;
+    track.onunmute = () => {
+      track.enabled = true;
+      const aud = document.getElementById("remoteAudioEl");
+      if (aud) playAudioSafe(aud, remoteAudioStream);
+    };
+    const aud = document.getElementById("remoteAudioEl");
+    if (aud) {
+      playAudioSafe(aud, remoteAudioStream);
+    }
     unlockAllAudioOutputs();
     return;
   }
@@ -2524,6 +2542,8 @@ function createPeerConnectionForCall(cid) {
     aud.srcObject = remoteAudioStream;
     aud.muted = false;
     aud.volume = 1.0;
+    aud.autoplay = true;
+    aud.playsInline = true;
   }
 
   try {
@@ -2931,6 +2951,7 @@ async function acceptIncomingCall() {
   if (!me || !callState || callState.mode !== "direct" || callState.isCaller) return;
   const cid = callState.callId;
   playSound("join");
+  unlockAllAudioOutputs();
   requestPageFullscreen();
   cameraEnabled = false;
   micMuted = false;
@@ -3290,6 +3311,7 @@ async function pollCallStatus() {
   flushRenegotiateIfReady();
 
   if (callState && callState.status === "active") {
+    unlockAllAudioOutputs();
     syncDirectMediaElements();
   }
 }
@@ -6216,7 +6238,7 @@ def nick():
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("SELECT username FROM users WHERE username = %s", (new_n,))
                 if cur.fetchone():
-                    return jsonify({"ok": False, "error": "Ник уже занят!"})
+                    return jsonify({"ok": False, "error": "Этот ник уже занят!"})
                 cur.execute(
                     """
                     INSERT INTO users (username, password, emoji, created_at, last_nick_change_at)
@@ -6224,40 +6246,23 @@ def nick():
                     """,
                     (new_n, user["password"], clean_emoji, created_at, now),
                 )
+                cur.execute("SELECT chat_key FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{old_n}::%", f"%::{old_n}"))
+                for r in cur.fetchall():
+                    parts = r["chat_key"].split("::")
+                    new_key = chat_key(*[new_n if p == old_n else p for p in parts])
+                    cur.execute("UPDATE messages SET chat_key = %s WHERE chat_key = %s", (new_key, r["chat_key"]))
                 cur.execute("UPDATE messages SET sender = %s WHERE sender = %s", (new_n, old_n))
-                cur.execute(
-                    """
-                    SELECT DISTINCT chat_key FROM messages
-                    WHERE chat_key LIKE %s OR chat_key LIKE %s
-                    """,
-                    (f"{old_n}::%", f"%::{old_n}"),
-                )
-                keys = [r["chat_key"] for r in cur.fetchall()]
-                for ck in keys:
-                    parts = ck.split("::")
-                    if len(parts) == 2:
-                        np = [new_n if p == old_n else p for p in parts]
-                        cur.execute("UPDATE messages SET chat_key = %s WHERE chat_key = %s", (chat_key(np[0], np[1]), ck))
-                cur.execute("UPDATE groups SET owner = %s WHERE owner = %s", (new_n, old_n))
-                cur.execute("SELECT id, members_json, muted_json FROM groups")
-                for gr in cur.fetchall():
-                    m_list = [new_n if x == old_n else x for x in parse_json_list(gr.get("members_json"))]
-                    mu_list = [new_n if x == old_n else x for x in parse_json_list(gr.get("muted_json"))]
-                    cur.execute(
-                        "UPDATE groups SET members_json = %s, muted_json = %s WHERE id = %s",
-                        (json.dumps(m_list, ensure_ascii=False), json.dumps(mu_list, ensure_ascii=False), gr["id"]),
-                    )
                 cur.execute("UPDATE group_messages SET sender = %s WHERE sender = %s", (new_n, old_n))
                 cur.execute("DELETE FROM users WHERE username = %s", (old_n,))
                 cur.execute("SELECT * FROM users WHERE username = %s", (new_n,))
-                updated_user = cur.fetchone()
-        resp = make_response(jsonify({"ok": True, "user": format_user(updated_user)}))
+                updated_row = cur.fetchone()
+        resp = make_response(jsonify({"ok": True, "user": format_user(updated_row)}))
         resp.set_cookie("grusha_user", new_n, max_age=30 * 24 * 3600, samesite="Lax")
         return resp
 
     db = load_json_db()
     if new_n in db["users"]:
-        return jsonify({"ok": False, "error": "Ник уже занят!"})
+        return jsonify({"ok": False, "error": "Этот ник уже занят!"})
     db["users"][new_n] = {
         "username": new_n,
         "password": user["password"],
@@ -6267,26 +6272,14 @@ def nick():
     }
     del db["users"][old_n]
     new_chats = {}
-    for ck, m in db["chats"].items():
-        parts = ck.split("::")
-        if old_n in parts:
-            np = [new_n if p == old_n else p for p in parts]
-            for item in m:
-                if item.get("from") == old_n:
-                    item["from"] = new_n
-            new_chats[chat_key(np[0], np[1])] = m
-        else:
-            new_chats[ck] = m
+    for k, m in db["chats"].items():
+        parts = k.split("::")
+        nk = chat_key(*[new_n if p == old_n else p for p in parts])
+        for msg in m:
+            if msg.get("from") == old_n:
+                msg["from"] = new_n
+        new_chats[nk] = m
     db["chats"] = new_chats
-    for _, g in db["groups"].items():
-        if g.get("owner") == old_n:
-            g["owner"] = new_n
-        g["members"] = [new_n if x == old_n else x for x in (g.get("members") or [])]
-        g["muted"] = [new_n if x == old_n else x for x in (g.get("muted") or [])]
-    for _, gm_list in db["group_msgs"].items():
-        for item in gm_list:
-            if item.get("from") == old_n:
-                item["from"] = new_n
     save_json_db(db)
     resp = make_response(jsonify({"ok": True, "user": format_user(db["users"][new_n])}))
     resp.set_cookie("grusha_user", new_n, max_age=30 * 24 * 3600, samesite="Lax")
@@ -6301,8 +6294,7 @@ def delete_acc():
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM users WHERE username = %s", (u,))
-                cur.execute("DELETE FROM messages WHERE sender = %s OR chat_key LIKE %s OR chat_key LIKE %s", (u, f"{u}::%", f"%::{u}"))
-                cur.execute("DELETE FROM groups WHERE owner = %s", (u,))
+                cur.execute("DELETE FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{u}::%", f"%::{u}"))
         resp = make_response(jsonify({"ok": True}))
         resp.delete_cookie("grusha_user")
         return resp
