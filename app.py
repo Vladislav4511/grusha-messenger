@@ -1562,7 +1562,6 @@ let seenGroupMsgIds = new Set();
 let seenDirectMsgIds = new Set();
 let roomHistoryInitialized = false;
 let seenAlertIds = new Set();
-let autoPermPromptTried = false;
 
 let selectedGroupEmoji = "🦜";
 let selectedGroupMembers = new Set();
@@ -1625,6 +1624,14 @@ function toggleDirectPeerMuted(peer) {
   return nowMuted;
 }
 
+function isSecureNotificationContext() {
+  if (typeof window.isSecureContext === "boolean") {
+    return window.isSecureContext;
+  }
+  const h = window.location.hostname;
+  return window.location.protocol === "https:" || h === "localhost" || h === "127.0.0.1";
+}
+
 function refreshNotificationUiStatus() {
   const txt = document.getElementById("notifPermStatusText");
   const btn = document.getElementById("btnAskNotifPerm");
@@ -1634,12 +1641,17 @@ function refreshNotificationUiStatus() {
     btn.classList.add("hidden");
     return;
   }
+  if (!isSecureNotificationContext()) {
+    txt.textContent = "Системные уведомления браузера работают только по HTTPS или localhost.";
+    btn.classList.remove("hidden");
+    return;
+  }
   const perm = Notification.permission;
   if (perm === "granted") {
     txt.textContent = 'Уведомления браузера включены: приходят в виде Груша: "@ник" и действие.';
     btn.classList.add("hidden");
   } else if (perm === "denied") {
-    txt.textContent = "Уведомления запрещены в настройках браузера для этого сайта. Разреши их в значке 🔒 в адресной строке.";
+    txt.textContent = "Уведомления запрещены в настройках браузера для этого сайта. Разреши их в значке настроек/замочка в адресной строке.";
     btn.classList.remove("hidden");
   } else {
     txt.textContent = "Нажми кнопку ниже, чтобы браузер разрешил присылать уведомления.";
@@ -1649,65 +1661,76 @@ function refreshNotificationUiStatus() {
 
 async function requestNotificationPermissionFromUser() {
   if (!("Notification" in window)) {
-    alert("Браузер не поддерживает уведомления.");
+    showInAppAlert("Уведомления недоступны", "Этот браузер не поддерживает системные уведомления.");
+    return;
+  }
+  if (!isSecureNotificationContext()) {
+    showInAppAlert("Нужен HTTPS", "Открой сайт по HTTPS или localhost, иначе браузер блокирует системные окна уведомлений.");
     return;
   }
   try {
+    if (Notification.permission === "denied") {
+      refreshNotificationUiStatus();
+      showInAppAlert(
+        "Уведомления заблокированы",
+        "Включи уведомления для сайта в настройках браузера (значок слева от адресной строки) и обнови страницу."
+      );
+      return;
+    }
     const perm = await Notification.requestPermission();
     refreshNotificationUiStatus();
     if (perm === "granted") {
       playSound("react");
       emitGrushaBrowserAction(me ? me.username : "Система", "включил уведомления браузера");
-    } else if (perm === "denied") {
-      showInAppAlert("Уведомления заблокированы", "Включи уведомления для сайта в настройках браузера (иконка замочка/настроек в адресной строке).");
+    } else {
+      showInAppAlert(
+        "Разрешение не выдано",
+        "Браузер не разрешил показ окон. Нажми «Разрешить», когда появится системный запрос."
+      );
     }
   } catch (e) {
     refreshNotificationUiStatus();
+    showInAppAlert("Ошибка запроса", "Не удалось запросить разрешение на уведомления в этом браузере.");
   }
 }
 
-function tryAutoRequestNotificationOnce() {
-  if (autoPermPromptTried) return;
-  autoPermPromptTried = true;
-  if (!("Notification" in window)) return;
-  if (Notification.permission === "default") {
-    try {
-      const p = Notification.requestPermission();
-      if (p && typeof p.then === "function") {
-        p.then(() => refreshNotificationUiStatus()).catch(() => {});
-      }
-    } catch (e) {}
-  }
-  refreshNotificationUiStatus();
-}
-
-function showBrowserNativeNotification(title, body) {
+async function showBrowserNativeNotification(title, body) {
   try {
-    if (!("Notification" in window) || Notification.permission !== "granted") {
-      return;
+    if (!("Notification" in window) || !isSecureNotificationContext()) {
+      return false;
     }
+    if (Notification.permission !== "granted") {
+      return false;
+    }
+    const cleanTitle = String(title || "Груша").trim();
+    const cleanBody = String(body || "").trim();
     const opts = {
-      body: body || "",
+      body: cleanBody,
       icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><text y='50' font-size='52'>🍐</text></svg>",
-      tag: `grusha_${Date.now()}`,
-      renotify: true
+      tag: `grusha_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      renotify: true,
+      silent: false
     };
-    if (navigator.serviceWorker && navigator.serviceWorker.getRegistration) {
-      navigator.serviceWorker.getRegistration().then(reg => {
-        if (reg && reg.showNotification) {
-          reg.showNotification(title, opts).catch(() => {
-            try { new Notification(title, opts); } catch (err) {}
-          });
-        } else {
-          try { new Notification(title, opts); } catch (err) {}
+    if ("serviceWorker" in navigator && navigator.serviceWorker.getRegistration) {
+      try {
+        const reg = await navigator.serviceWorker.getRegistration();
+        if (reg && typeof reg.showNotification === "function") {
+          await reg.showNotification(cleanTitle, opts);
+          return true;
         }
-      }).catch(() => {
-        try { new Notification(title, opts); } catch (err) {}
-      });
-    } else {
-      new Notification(title, opts);
+      } catch (swErr) {}
     }
-  } catch (e) {}
+    const n = new Notification(cleanTitle, opts);
+    n.onclick = () => {
+      try {
+        window.focus();
+        n.close();
+      } catch (e) {}
+    };
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 
 function emitGrushaBrowserAction(nickname, actionText, { isDirectMessage = false, peer = "" } = {}) {
@@ -1846,9 +1869,6 @@ function syncRemoteMediaElements() {
 
 document.addEventListener("pointerdown", () => {
   getAudioContext();
-  if ("Notification" in window && Notification.permission === "default" && me) {
-    tryAutoRequestNotificationOnce();
-  }
   if (remoteStream) {
     syncRemoteMediaElements();
   }
@@ -2012,7 +2032,6 @@ function cleanupLocalCallResources() {
   hideCallModalUi();
 }
 
-/* Камера НИКОГДА не включается здесь — только микрофон (audio: true, video: false) */
 async function ensureLocalAudioStream() {
   if (localStream && localStream.getAudioTracks().length > 0) {
     localStream.getAudioTracks().forEach(t => { t.enabled = !micMuted; });
@@ -2170,7 +2189,6 @@ async function enqueueOrAddRemoteCandidate(candObj) {
   }
 }
 
-/* Привязываем входящие треки по kind (аудио и видео отдельно), чтобы каждый говорящий слышался и ничего не затиралось */
 function attachTrackToRemoteStream(track) {
   if (!track) return;
   if (!remoteStream) {
@@ -2452,7 +2470,6 @@ async function pollCallStatus() {
     pc = createPeerConnectionForCall(c.callId);
   }
 
-  /* Обработка новых офферов (включая ренегациацию при включении/выключении камеры) */
   if (c.offer) {
     const offerJson = JSON.stringify(c.offer);
     const isNewOfferFromPeer = c.offerBy && c.offerBy !== me.username && offerJson !== callState.lastAppliedOfferJson;
@@ -2478,7 +2495,6 @@ async function pollCallStatus() {
     }
   }
 
-  /* Обработка ответа на наш оффер (первый ответ или ответ на ренегациацию камеры) */
   if (c.answer && pc && c.answerBy && c.answerBy !== me.username) {
     const remoteJson = JSON.stringify(c.answer);
     if (remoteJson !== callState.lastAppliedAnswerJson && pc.signalingState === "have-local-offer") {
@@ -2559,12 +2575,6 @@ async function pollUserAlerts() {
       if (!viewingThisChat) {
         emitGrushaBrowserAction(actor, actText, { isDirectMessage: true, peer: al.peer || actor });
       }
-    } else if (al.kind === "call_invite") {
-      emitGrushaBrowserAction(actor, actText, { isDirectMessage: false });
-    } else if (al.kind === "group_join") {
-      emitGrushaBrowserAction(actor, actText, { isDirectMessage: false });
-    } else if (al.kind === "group_leave") {
-      emitGrushaBrowserAction(actor, actText, { isDirectMessage: false });
     } else {
       emitGrushaBrowserAction(actor, actText, { isDirectMessage: false });
     }
@@ -2763,7 +2773,6 @@ function applyCustom(cfg) {
   rootStyle.setProperty("--accent", palette.accent);
   rootStyle.setProperty("--accent-contrast", palette.contrast);
   rootStyle.setProperty("--accent-soft", palette.soft);
-  /* Галочки всегда остаются голубыми в любой теме */
   rootStyle.setProperty("--check-blue", "#2196f3");
   rootStyle.setProperty("--check-ink", "#ffffff");
 
@@ -2926,7 +2935,7 @@ function enterChats() {
   document.getElementById("myNick").innerHTML = nickLabelHtml(me.username, me.isOwner);
   refreshNotificationUiStatus();
   if ("Notification" in window && Notification.permission === "default") {
-    showInAppAlert("Включить уведомления?", "Разреши уведомления в браузере или в Настройках.");
+    showInAppAlert("Включить уведомления?", "Нажми «Включить уведомления браузера» в Настройках, чтобы получать окошки.");
   }
   showScreen("chatsScreen");
   refreshChats();
