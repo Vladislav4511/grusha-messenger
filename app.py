@@ -1109,6 +1109,16 @@ HTML_PAGE = """<!DOCTYPE html>
     text-align: center;
     margin-top: 6px;
   }
+  .cam-choice-note {
+    margin-top: 10px;
+    padding: 9px 11px;
+    border-radius: 10px;
+    background: var(--input-bg);
+    border: 1px solid var(--border-col);
+    color: var(--muted-col);
+    font-size: 12px;
+    line-height: 1.35;
+  }
   .call-top-bar {
     display: flex;
     align-items: center;
@@ -1643,7 +1653,8 @@ HTML_PAGE = """<!DOCTYPE html>
       <div class="cam-choice-title">Какую камеру включите?</div>
       <div class="cam-choice-sub">Выбери источник видео для звонка</div>
       <button type="button" class="blue-btn mt-12" style="width:100%;" onclick="selectVideoSource('camera')">📷 Камеру в реальной жизни</button>
-      <button type="button" class="sec mt-8" style="width:100%;" onclick="selectVideoSource('screen')">📱 Камеру гаджета (экран)</button>
+      <button type="button" id="btnSelectScreenSource" class="sec mt-8" style="width:100%;" onclick="selectVideoSource('screen')">📱 Камеру гаджета (экран)</button>
+      <div id="screenSupportNote" class="cam-choice-note"></div>
       <button type="button" class="sec mt-12" style="width:100%;" onclick="closeCamSourceModal()">Отмена</button>
     </div>
   </div>
@@ -1892,6 +1903,10 @@ let endingCallInProgress = false;
 let groupPeers = new Map();
 let activeGroupCallInfo = null;
 let groupGridRenderSignature = "";
+
+function hasDisplayMediaApi() {
+  return Boolean(navigator.mediaDevices && typeof navigator.mediaDevices.getDisplayMedia === "function");
+}
 
 function getAudioContext() {
   try {
@@ -2156,9 +2171,20 @@ function updateCamButtonUi() {
   }
 }
 
+function refreshCamModalSupportHint() {
+  const noteEl = document.getElementById("screenSupportNote");
+  if (!noteEl) return;
+  if (hasDisplayMediaApi()) {
+    noteEl.textContent = "Экран гаджета доступен на ПК, ноутбуке и в поддерживаемых браузерах. Камера работает на всех устройствах.";
+  } else {
+    noteEl.textContent = "Этот мобильный браузер не открывает захват экрана напрямую — можно включить обычную камеру или показать экран с ПК/ноутбука.";
+  }
+}
+
 function openCamSourceModal() {
   if (!callState) return;
   playSound("click");
+  refreshCamModalSupportHint();
   const modal = document.getElementById("camSourceModal");
   if (modal) modal.classList.remove("hidden");
 }
@@ -2538,19 +2564,27 @@ function disableCameraLocallyAndSync() {
 }
 
 async function selectVideoSource(sourceType) {
-  closeCamSourceModal();
   if (!callState) return;
   playSound("click");
 
   const mode = sourceType === "screen" ? "screen" : "camera";
 
+  if (mode === "screen" && !hasDisplayMediaApi()) {
+    refreshCamModalSupportHint();
+    const useCam = confirm(
+      "На этом устройстве или в этом браузере показ экрана гаджета недоступен (можно запустить с ПК/ноутбука или в поддерживаемом браузере).\n\nВключить вместо этого камеру в реальной жизни?"
+    );
+    if (useCam) {
+      await selectVideoSource("camera");
+    }
+    return;
+  }
+
+  closeCamSourceModal();
+
   try {
     let mediaStream = null;
     if (mode === "screen") {
-      if (!navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== "function") {
-        alert("Трансляция экрана гаджета не поддерживается в этом браузере.");
-        return;
-      }
       mediaStream = await navigator.mediaDevices.getDisplayMedia({
         video: { frameRate: { ideal: 24, max: 30 } },
         audio: false
@@ -2638,7 +2672,7 @@ async function selectVideoSource(sourceType) {
     }
   } catch (err) {
     if (mode === "screen") {
-      alert("Не удалось включить экран гаджета. Проверь разрешение экрана или поддержку браузера.");
+      alert("Не удалось включить экран гаджета — браузер заблокировал или отменил захват экрана. Попробуй другой браузер, ПК/ноутбук или включи камеру в реальной жизни.");
     } else {
       alert("Не удалось включить камеру. Разреши доступ к камере и проверь HTTPS.");
     }
@@ -6205,6 +6239,100 @@ def group_info():
     return jsonify({"ok": True, "group": g})
 
 
+@app.post("/api/groups/mute")
+def group_mute():
+    d = request.get_json(force=True) or {}
+    actor = (d.get("actor") or "").strip()
+    gid = (d.get("groupId") or "").strip()
+    target = (d.get("target") or "").strip()
+
+    g = get_group_by_id(gid)
+    if not g or g["owner"] != actor:
+        return jsonify({"ok": False, "error": "Только создатель группы может запрещать писать."})
+    if not target or target == g["owner"] or target not in g["members"]:
+        return jsonify({"ok": False, "error": "Некорректный участник."})
+
+    muted = list(g["muted"])
+    if target in muted:
+        muted.remove(target)
+        now_muted = False
+    else:
+        muted.append(target)
+        now_muted = True
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE groups SET muted_json = %s WHERE id = %s", (json.dumps(muted, ensure_ascii=False), gid))
+    else:
+        db = load_json_db()
+        if gid in db["groups"]:
+            db["groups"][gid]["muted"] = muted
+            save_json_db(db)
+
+    return jsonify({"ok": True, "muted": now_muted, "group": get_group_by_id(gid)})
+
+
+@app.post("/api/groups/kick")
+def group_kick():
+    d = request.get_json(force=True) or {}
+    actor = (d.get("actor") or "").strip()
+    gid = (d.get("groupId") or "").strip()
+    target = (d.get("target") or "").strip()
+
+    g = get_group_by_id(gid)
+    if not g or g["owner"] != actor:
+        return jsonify({"ok": False, "error": "Только создатель группы может удалять участников."})
+    if not target or target == g["owner"] or target not in g["members"]:
+        return jsonify({"ok": False, "error": "Некорректный участник."})
+
+    members = [m for m in g["members"] if m != target]
+    muted = [m for m in g["muted"] if m != target]
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE groups SET members_json = %s, muted_json = %s WHERE id = %s",
+                    (json.dumps(members, ensure_ascii=False), json.dumps(muted, ensure_ascii=False), gid),
+                )
+    else:
+        db = load_json_db()
+        if gid in db["groups"]:
+            db["groups"][gid]["members"] = members
+            db["groups"][gid]["muted"] = muted
+            save_json_db(db)
+
+    append_group_system_message(gid, f'"{target}" вышел', "leave")
+    return jsonify({"ok": True, "group": get_group_by_id(gid)})
+
+
+@app.post("/api/groups/delete")
+def group_delete():
+    d = request.get_json(force=True) or {}
+    actor = (d.get("actor") or "").strip()
+    gid = (d.get("groupId") or "").strip()
+
+    g = get_group_by_id(gid)
+    if not g or g["owner"] != actor:
+        return jsonify({"ok": False, "error": "Удалить группу может только создатель."})
+
+    GROUP_CALLS.pop(gid, None)
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM group_messages WHERE group_id = %s", (gid,))
+                cur.execute("DELETE FROM groups WHERE id = %s", (gid,))
+        return jsonify({"ok": True})
+
+    db = load_json_db()
+    db["groups"].pop(gid, None)
+    db["group_msgs"].pop(gid, None)
+    save_json_db(db)
+    return jsonify({"ok": True})
+
+
 @app.get("/api/groups/msgs")
 def group_msgs():
     gid = (request.args.get("groupId") or "").strip()
@@ -6215,7 +6343,7 @@ def group_msgs():
     if u and u not in g["members"]:
         return jsonify({"ok": False, "kicked": True})
 
-    is_muted = u in set(g.get("muted") or [])
+    is_muted = bool(u and u in g["muted"] and u != g["owner"])
     typers = get_group_typing_users(gid, u)
 
     if USE_PG:
@@ -6241,17 +6369,17 @@ def group_msgs():
         return jsonify({
             "ok": True,
             "msgs": formatted,
-            "title": g["title"],
+            "isMuted": is_muted,
             "owner": g["owner"],
             "callAccess": g["callAccess"],
+            "title": g["title"],
             "emoji": normalize_group_emoji(g["emoji"]),
             "tripleBadge": g["tripleBadge"],
-            "isMuted": is_muted,
             "typingUsers": typers,
         })
 
     db = load_json_db()
-    raw_list = db["group_msgs"].get(gid, [])
+    raw_list = db["group_msgs"].get(gid) or []
     formatted = []
     for idx, m in enumerate(raw_list):
         msg_id = m.get("id") or f"g_{idx}_{m.get('ts', 0)}"
@@ -6269,12 +6397,12 @@ def group_msgs():
     return jsonify({
         "ok": True,
         "msgs": formatted,
-        "title": g["title"],
+        "isMuted": is_muted,
         "owner": g["owner"],
         "callAccess": g["callAccess"],
+        "title": g["title"],
         "emoji": normalize_group_emoji(g["emoji"]),
         "tripleBadge": g["tripleBadge"],
-        "isMuted": is_muted,
         "typingUsers": typers,
     })
 
@@ -6294,9 +6422,9 @@ def group_send():
 
     g = get_group_by_id(gid)
     if not g or f not in g["members"]:
-        return jsonify({"ok": False, "error": "Вы не состоите в группе."})
-    if f in set(g.get("muted") or []):
-        return jsonify({"ok": False, "muted": True, "error": "Вам запрещено писать сообщения в этой группе."})
+        return jsonify({"ok": False, "error": "Вы не состоите в этой группе."})
+    if f in g["muted"] and f != g["owner"]:
+        return jsonify({"ok": False, "muted": True, "error": "Владелец запретил вам писать сообщения в этой группе."})
 
     ts = int(time.time() * 1000)
     TYPING_STATUS.pop((f, group_typing_key(gid)), None)
@@ -6327,258 +6455,157 @@ def group_send():
     return jsonify({"ok": True})
 
 
-@app.post("/api/groups/mute")
-def group_mute():
-    d = request.get_json(force=True) or {}
-    actor = (d.get("actor") or "").strip()
-    gid = (d.get("groupId") or "").strip()
-    target = (d.get("target") or "").strip()
-
-    g = get_group_by_id(gid)
-    if not g or g["owner"] != actor:
-        return jsonify({"ok": False, "error": "Только создатель группы может запрещать писать."})
-    if not target or target == g["owner"] or target not in g["members"]:
-        return jsonify({"ok": False})
-
-    muted_list = list(g.get("muted") or [])
-    if target in muted_list:
-        muted_list.remove(target)
-    else:
-        muted_list.append(target)
-
-    if USE_PG:
-        with get_pg_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE groups SET muted_json = %s WHERE id = %s",
-                    (json.dumps(muted_list, ensure_ascii=False), gid),
-                )
-        return jsonify({"ok": True, "muted": muted_list})
-
-    db = load_json_db()
-    if gid in db["groups"]:
-        db["groups"][gid]["muted"] = muted_list
-        save_json_db(db)
-    return jsonify({"ok": True, "muted": muted_list})
-
-
-@app.post("/api/groups/kick")
-def group_kick():
-    d = request.get_json(force=True) or {}
-    actor = (d.get("actor") or "").strip()
-    gid = (d.get("groupId") or "").strip()
-    target = (d.get("target") or "").strip()
-
-    g = get_group_by_id(gid)
-    if not g or g["owner"] != actor:
-        return jsonify({"ok": False, "error": "Только создатель группы может удалять участников."})
-    if not target or target == g["owner"]:
-        return jsonify({"ok": False})
-
-    new_members = [m for m in g["members"] if m != target]
-    new_muted = [m for m in (g.get("muted") or []) if m != target]
-
-    if USE_PG:
-        with get_pg_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE groups SET members_json = %s, muted_json = %s WHERE id = %s",
-                    (json.dumps(new_members, ensure_ascii=False), json.dumps(new_muted, ensure_ascii=False), gid),
-                )
-    else:
-        db = load_json_db()
-        if gid in db["groups"]:
-            db["groups"][gid]["members"] = new_members
-            db["groups"][gid]["muted"] = new_muted
-            save_json_db(db)
-
-    append_group_system_message(gid, f'"{target}" вышел', "leave")
-    return jsonify({"ok": True})
-
-
-@app.post("/api/groups/delete")
-def group_delete():
-    d = request.get_json(force=True) or {}
-    actor = (d.get("actor") or "").strip()
-    gid = (d.get("groupId") or "").strip()
-
-    g = get_group_by_id(gid)
-    if not g or g["owner"] != actor:
-        return jsonify({"ok": False, "error": "Только создатель группы может удалить группу."})
-
-    GROUP_CALLS.pop(gid, None)
-
-    if USE_PG:
-        with get_pg_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM group_messages WHERE group_id = %s", (gid,))
-                cur.execute("DELETE FROM groups WHERE id = %s", (gid,))
-        return jsonify({"ok": True})
-
-    db = load_json_db()
-    db["groups"].pop(gid, None)
-    db["group_msgs"].pop(gid, None)
-    save_json_db(db)
-    return jsonify({"ok": True})
-
-
 @app.post("/api/emoji")
-def set_emoji():
+def emoji():
     d = request.get_json(force=True) or {}
-    u = (d.get("username") or "").strip()
+    u = d.get("username") or ""
     em = sanitize_user_emoji(d.get("emoji"))
-    if not u or not em:
-        return jsonify({"ok": False})
-
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("UPDATE users SET emoji = %s WHERE username = %s", (em, u))
-        return jsonify({"ok": True, "emoji": em})
-
+        return jsonify({"ok": True})
     db = load_json_db()
     if u in db["users"]:
         db["users"][u]["emoji"] = em
         save_json_db(db)
-    return jsonify({"ok": True, "emoji": em})
+    return jsonify({"ok": True})
 
 
 @app.post("/api/nick")
-def change_nick():
+def nick():
     d = request.get_json(force=True) or {}
-    old_n = (d.get("oldNick") or "").strip()
-    new_n = (d.get("newNick") or "").strip()
-    if len(new_n) < 2:
+    old = (d.get("oldNick") or "").strip()
+    nn = (d.get("newNick") or "").strip()
+    if len(nn) < 2:
         return jsonify({"ok": False, "error": "Ник от 2 символов."})
-    if old_n == new_n:
-        return jsonify({"ok": False, "error": "Это уже ваш текущий ник."})
-
     now = int(time.time() * 1000)
 
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM users WHERE username = %s", (old_n,))
-                old_user = cur.fetchone()
-                if not old_user:
+                cur.execute("SELECT * FROM users WHERE username = %s", (old,))
+                u_obj = cur.fetchone()
+                if not u_obj:
                     return jsonify({"ok": False, "error": "Пользователь не найден."})
+                if nn == old:
+                    return jsonify({"ok": False, "error": "Введите новый никнейм."})
+                cur.execute("SELECT username FROM users WHERE username = %s", (nn,))
+                if cur.fetchone():
+                    return jsonify({"ok": False, "error": "Этот ник уже занят!"})
 
-                base_ts = int(old_user.get("last_nick_change_at") or old_user.get("created_at") or 0)
+                base_ts = int(u_obj.get("last_nick_change_at") or u_obj.get("created_at") or 0)
                 if base_ts and (now - base_ts) < SEVEN_DAYS_MS:
                     rem = SEVEN_DAYS_MS - (now - base_ts)
                     days_left = rem // 86400000
-                    hours_left = max(1, ((rem % 86400000) + 3599999) // 3600000)
-                    return jsonify({"ok": False, "error": f"Сменить никнейм можно раз в 7 дней. Осталось: {days_left} дн. {hours_left} ч."})
-
-                cur.execute("SELECT username FROM users WHERE username = %s", (new_n,))
-                if cur.fetchone():
-                    return jsonify({"ok": False, "error": "Этот ник уже занят!"})
+                    hours_left = max(1, (rem % 86400000 + 3599999) // 3600000)
+                    return jsonify({"ok": False, "error": f"Менять ник можно раз в 7 дней. Осталось: {days_left} дн. {hours_left} ч."})
 
                 cur.execute(
                     """
                     INSERT INTO users (username, password, emoji, created_at, last_nick_change_at)
                     VALUES (%s, %s, %s, %s, %s)
                     """,
-                    (new_n, old_user["password"], sanitize_user_emoji(old_user.get("emoji")), int(old_user["created_at"]), now),
+                    (nn, u_obj["password"], sanitize_user_emoji(u_obj.get("emoji")), int(u_obj["created_at"]), now),
                 )
-                cur.execute("SELECT id, chat_key, sender, text, image, ts, reply_to_json, reactions_json FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{old_n}::%", f"%::{old_n}"))
-                for m in cur.fetchall():
-                    parts = m["chat_key"].split("::")
-                    new_parts = [new_n if x == old_n else x for x in parts]
+                cur.execute("UPDATE messages SET sender = %s WHERE sender = %s", (nn, old))
+                cur.execute(
+                    """
+                    SELECT id, chat_key FROM messages
+                    WHERE chat_key LIKE %s OR chat_key LIKE %s
+                    """,
+                    (f"{old}::%", f"%::{old}"),
+                )
+                for mrow in cur.fetchall():
+                    parts = mrow["chat_key"].split("::")
+                    new_parts = [nn if p == old else p for p in parts]
                     new_ck = "::".join(sorted(new_parts))
-                    new_sender = new_n if m["sender"] == old_n else m["sender"]
-                    cur.execute(
-                        "INSERT INTO messages (chat_key, sender, text, image, ts, reply_to_json, reactions_json) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                        (new_ck, new_sender, m["text"], m["image"], m["ts"], m.get("reply_to_json") or "", m.get("reactions_json") or "{}"),
-                    )
-                cur.execute("DELETE FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{old_n}::%", f"%::{old_n}"))
+                    cur.execute("UPDATE messages SET chat_key = %s WHERE id = %s", (new_ck, mrow["id"]))
 
                 cur.execute("SELECT * FROM groups")
                 for gr in cur.fetchall():
-                    g = format_group_row(gr)
+                    g_obj = format_group_row(gr)
                     changed = False
-                    new_owner = new_n if g["owner"] == old_n else g["owner"]
-                    if new_owner != g["owner"]:
+                    new_owner = nn if g_obj["owner"] == old else g_obj["owner"]
+                    if new_owner != g_obj["owner"]:
                         changed = True
-                    new_members = [new_n if x == old_n else x for x in g["members"]]
-                    if new_members != g["members"]:
+                    new_members = [nn if m == old else m for m in g_obj["members"]]
+                    if new_members != g_obj["members"]:
                         changed = True
-                    new_muted = [new_n if x == old_n else x for x in g["muted"]]
-                    if new_muted != g["muted"]:
+                    new_muted = [nn if m == old else m for m in g_obj["muted"]]
+                    if new_muted != g_obj["muted"]:
                         changed = True
                     if changed:
                         cur.execute(
                             "UPDATE groups SET owner = %s, members_json = %s, muted_json = %s WHERE id = %s",
-                            (new_owner, json.dumps(new_members, ensure_ascii=False), json.dumps(new_muted, ensure_ascii=False), g["id"]),
+                            (new_owner, json.dumps(new_members, ensure_ascii=False), json.dumps(new_muted, ensure_ascii=False), g_obj["id"]),
                         )
-                cur.execute("UPDATE group_messages SET sender = %s WHERE sender = %s", (new_n, old_n))
-                cur.execute("DELETE FROM users WHERE username = %s", (old_n,))
-                cur.execute("SELECT * FROM users WHERE username = %s", (new_n,))
+
+                cur.execute("UPDATE group_messages SET sender = %s WHERE sender = %s", (nn, old))
+                cur.execute("DELETE FROM users WHERE username = %s", (old,))
+                cur.execute("SELECT * FROM users WHERE username = %s", (nn,))
                 updated_user = cur.fetchone()
 
         resp = make_response(jsonify({"ok": True, "user": format_user(updated_user)}))
-        resp.set_cookie("grusha_user", new_n, max_age=30 * 24 * 3600, samesite="Lax")
+        resp.set_cookie("grusha_user", nn, max_age=30 * 24 * 3600, samesite="Lax")
         return resp
 
     db = load_json_db()
-    if old_n not in db["users"]:
+    if old not in db["users"]:
         return jsonify({"ok": False, "error": "Пользователь не найден."})
-    old_u = db["users"][old_n]
-    base_ts = int(old_u.get("lastNickChangeAt") or old_u.get("createdAt") or 0)
+    if nn == old:
+        return jsonify({"ok": False, "error": "Введите новый никнейм."})
+    if nn in db["users"]:
+        return jsonify({"ok": False, "error": "Этот ник уже занят!"})
+
+    u_obj = db["users"][old]
+    base_ts = int(u_obj.get("lastNickChangeAt") or u_obj.get("createdAt") or 0)
     if base_ts and (now - base_ts) < SEVEN_DAYS_MS:
         rem = SEVEN_DAYS_MS - (now - base_ts)
         days_left = rem // 86400000
-        hours_left = max(1, ((rem % 86400000) + 3599999) // 3600000)
-        return jsonify({"ok": False, "error": f"Сменить никнейм можно раз в 7 дней. Осталось: {days_left} дн. {hours_left} ч."})
-    if new_n in db["users"]:
-        return jsonify({"ok": False, "error": "Этот ник уже занят!"})
+        hours_left = max(1, (rem % 86400000 + 3599999) // 3600000)
+        return jsonify({"ok": False, "error": f"Менять ник можно раз в 7 дней. Осталось: {days_left} дн. {hours_left} ч."})
 
-    db["users"][new_n] = {
-        "username": new_n,
-        "password": old_u["password"],
-        "emoji": sanitize_user_emoji(old_u.get("emoji")),
-        "createdAt": int(old_u.get("createdAt") or now),
+    db["users"][nn] = {
+        "username": nn,
+        "password": u_obj["password"],
+        "emoji": sanitize_user_emoji(u_obj.get("emoji")),
+        "createdAt": int(u_obj.get("createdAt") or now),
         "lastNickChangeAt": now,
     }
-    del db["users"][old_n]
+    del db["users"][old]
 
     new_chats = {}
-    for k, m_list in db["chats"].items():
+    for k, mlist in db["chats"].items():
         parts = k.split("::")
-        if old_n in parts:
-            nk = "::".join(sorted([new_n if x == old_n else x for x in parts]))
-            for m in m_list:
-                if m.get("from") == old_n:
-                    m["from"] = new_n
-            new_chats.setdefault(nk, []).extend(m_list)
-        else:
-            new_chats[k] = m_list
+        new_ck = "::".join(sorted([nn if p == old else p for p in parts]))
+        for m in mlist:
+            if m.get("from") == old:
+                m["from"] = nn
+        new_chats.setdefault(new_ck, []).extend(mlist)
     db["chats"] = new_chats
 
-    for _, g in db["groups"].items():
-        if g.get("owner") == old_n:
-            g["owner"] = new_n
-        g["members"] = [new_n if x == old_n else x for x in (g.get("members") or [])]
-        g["muted"] = [new_n if x == old_n else x for x in (g.get("muted") or [])]
+    for gid, g in db["groups"].items():
+        if g.get("owner") == old:
+            g["owner"] = nn
+        g["members"] = [nn if m == old else m for m in (g.get("members") or [])]
+        g["muted"] = [nn if m == old else m for m in (g.get("muted") or [])]
 
-    for _, gm_list in db["group_msgs"].items():
-        for gm in gm_list:
-            if gm.get("from") == old_n:
-                gm["from"] = new_n
+    for gid, mlist in db["group_msgs"].items():
+        for m in mlist:
+            if m.get("from") == old:
+                m["from"] = nn
 
     save_json_db(db)
-    resp = make_response(jsonify({"ok": True, "user": format_user(db["users"][new_n])}))
-    resp.set_cookie("grusha_user", new_n, max_age=30 * 24 * 3600, samesite="Lax")
+    resp = make_response(jsonify({"ok": True, "user": format_user(db["users"][nn])}))
+    resp.set_cookie("grusha_user", nn, max_age=30 * 24 * 3600, samesite="Lax")
     return resp
 
 
 @app.post("/api/delete")
-def del_acc():
+def delete_acc():
     d = request.get_json(force=True) or {}
-    u = (d.get("username") or "").strip()
-    if not u:
-        return jsonify({"ok": False})
-
+    u = d.get("username") or ""
     end_user_calls(u)
 
     if USE_PG:
@@ -6588,16 +6615,16 @@ def del_acc():
                 cur.execute("DELETE FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{u}::%", f"%::{u}"))
                 cur.execute("SELECT * FROM groups")
                 for gr in cur.fetchall():
-                    g = format_group_row(gr)
-                    if g["owner"] == u:
-                        cur.execute("DELETE FROM group_messages WHERE group_id = %s", (g["id"],))
-                        cur.execute("DELETE FROM groups WHERE id = %s", (g["id"],))
-                    elif u in g["members"]:
-                        new_m = [x for x in g["members"] if x != u]
-                        new_mu = [x for x in g["muted"] if x != u]
+                    g_obj = format_group_row(gr)
+                    if g_obj["owner"] == u:
+                        cur.execute("DELETE FROM group_messages WHERE group_id = %s", (g_obj["id"],))
+                        cur.execute("DELETE FROM groups WHERE id = %s", (g_obj["id"],))
+                    elif u in g_obj["members"]:
+                        new_m = [m for m in g_obj["members"] if m != u]
+                        new_mu = [m for m in g_obj["muted"] if m != u]
                         cur.execute(
                             "UPDATE groups SET members_json = %s, muted_json = %s WHERE id = %s",
-                            (json.dumps(new_m, ensure_ascii=False), json.dumps(new_mu, ensure_ascii=False), g["id"]),
+                            (json.dumps(new_m, ensure_ascii=False), json.dumps(new_mu, ensure_ascii=False), g_obj["id"]),
                         )
         resp = make_response(jsonify({"ok": True}))
         resp.delete_cookie("grusha_user")
@@ -6606,12 +6633,13 @@ def del_acc():
     db = load_json_db()
     db["users"].pop(u, None)
     db["chats"] = {k: v for k, v in db["chats"].items() if u not in k.split("::")}
-    for gid in [gid for gid, g in db["groups"].items() if g.get("owner") == u]:
+    owned_gids = [gid for gid, g in db["groups"].items() if g.get("owner") == u]
+    for gid in owned_gids:
         db["groups"].pop(gid, None)
         db["group_msgs"].pop(gid, None)
-    for _, g in db["groups"].items():
-        g["members"] = [x for x in (g.get("members") or []) if x != u]
-        g["muted"] = [x for x in (g.get("muted") or []) if x != u]
+    for gid, g in db["groups"].items():
+        g["members"] = [m for m in (g.get("members") or []) if m != u]
+        g["muted"] = [m for m in (g.get("muted") or []) if m != u]
     save_json_db(db)
     resp = make_response(jsonify({"ok": True}))
     resp.delete_cookie("grusha_user")
