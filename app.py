@@ -2618,6 +2618,7 @@ let me = null;
 let authTab = "login";
 let activeChat = null;
 let currentScreenId = "loadingScreen";
+let roomSwitchToken = 0;
 let currentGroupOwner = "";
 let currentGroupCallAccess = "all";
 let pendingImageData = "";
@@ -2634,10 +2635,10 @@ let lastRenderedMsgsJson = "";
 let lastRenderedCustomJson = "";
 let lastTypingPingTs = 0;
 let pollTimer = null;
+let pollInFlight = false;
 let fabPulseTimer = null;
 let lastChatsScrollTop = 0;
-let seenGroupMsgIds = new Set();
-let seenDirectMsgIds = new Set();
+let seenMsgsByRoom = new Map();
 let roomHistoryInitialized = false;
 
 let selectedGroupEmoji = "🦜";
@@ -2674,6 +2675,27 @@ let groupGridRenderSignature = "";
 let lastServerMsgsCache = [];
 let participantVolumes = new Map();
 let volumeModalTargetUser = "";
+
+function resetRoomInteractionState() {
+  if (longPressTimer) {
+    clearTimeout(longPressTimer);
+    longPressTimer = null;
+  }
+  suppressNextBubbleClick = false;
+  selectedMsgForAction = null;
+  lastRenderedMsgsJson = "";
+  lastServerMsgsCache = [];
+  currentRoomMsgs = [];
+  pendingUploads = [];
+  roomHistoryInitialized = false;
+}
+
+function getRoomBucketKey(chatObj) {
+  if (!chatObj) return "";
+  if (chatObj.type === "admin") return "admin";
+  if (chatObj.type === "group") return `group::${chatObj.id}`;
+  return `direct::${chatObj.username}`;
+}
 
 function clampMax50(val) {
   const n = Number(val);
@@ -2983,11 +3005,12 @@ function renderPresenceHtml(online, lastSeenMs) {
   return `<span class="online-dot is-offline"></span><span style="color:var(--muted-col);">${esc(formatLastSeenLabel(lastSeenMs))}</span>`;
 }
 
-async function updateDirectRoomPresence(username) {
+async function updateDirectRoomPresence(username, token = roomSwitchToken) {
   const el = document.getElementById("peerPresence");
   if (!el || !username) return;
   el.classList.remove("hidden");
   const res = await api(`/api/presence?user=${encodeURIComponent(username)}`);
+  if (token !== roomSwitchToken || !activeChat || activeChat.type !== "direct" || activeChat.username !== username) return;
   if (res && res.ok) {
     el.innerHTML = renderPresenceHtml(Boolean(res.online), res.lastSeen);
   }
@@ -5210,14 +5233,14 @@ async function doAuth() {
 }
 
 async function enterChats(restoreSaved = false) {
+  roomSwitchToken += 1;
   activeChat = null;
   activeGroupCallInfo = null;
   currentGroupOwner = "";
   currentGroupCallAccess = "all";
   replyTarget = null;
-  roomHistoryInitialized = false;
+  resetRoomInteractionState();
   clearAttachment();
-  lastRenderedMsgsJson = "";
   const shownNick = me.banned ? BANNED_DISPLAY_NAME : (me.displayName || me.username);
   renderAvatarElement(document.getElementById("myAva"), me.emoji, me.avatarPhoto, me.username, me.banned);
   document.getElementById("myNick").innerHTML = nickLabelHtml(shownNick, me.isOwner && !me.banned);
@@ -5242,14 +5265,14 @@ async function enterChats(restoreSaved = false) {
 
 function backToChats() {
   playSound("click");
+  roomSwitchToken += 1;
   activeChat = null;
   activeGroupCallInfo = null;
   currentGroupOwner = "";
   currentGroupCallAccess = "all";
   replyTarget = null;
-  roomHistoryInitialized = false;
+  resetRoomInteractionState();
   clearAttachment();
-  lastRenderedMsgsJson = "";
   persistSessionState();
   updateGroupCallBannerUi();
   showScreen("chatsScreen");
@@ -5262,8 +5285,9 @@ function backToRoomFromGroupSettings() {
     backToChats();
     return;
   }
+  lastRenderedMsgsJson = "";
   showScreen("roomScreen");
-  refreshMessages(false);
+  refreshMessages(false, roomSwitchToken);
 }
 
 function backToRoomFromDirectSettings() {
@@ -5272,9 +5296,10 @@ function backToRoomFromDirectSettings() {
     backToChats();
     return;
   }
+  lastRenderedMsgsJson = "";
   showScreen("roomScreen");
-  refreshMessages(false);
-  updateDirectRoomPresence(activeChat.username);
+  refreshMessages(false, roomSwitchToken);
+  updateDirectRoomPresence(activeChat.username, roomSwitchToken);
 }
 
 async function openDirectChatSettings() {
@@ -5522,7 +5547,7 @@ async function submitInviteMembers() {
   playSound("join");
   inviteGroupMembers = new Set();
   await renderGroupSettings();
-  await refreshMessages(false);
+  await refreshMessages(false, roomSwitchToken);
   await refreshChats();
 }
 
@@ -5720,7 +5745,7 @@ async function toggleMuteMember(targetNick) {
   if (res.ok) {
     playSound("click");
     await renderGroupSettings();
-    await refreshMessages(false);
+    await refreshMessages(false, roomSwitchToken);
   }
 }
 
@@ -5734,7 +5759,7 @@ async function kickGroupMember(targetNick) {
   if (res.ok) {
     playSound("leave");
     await renderGroupSettings();
-    await refreshMessages(false);
+    await refreshMessages(false, roomSwitchToken);
     await refreshChats();
   }
 }
@@ -6066,22 +6091,13 @@ function openVideoViewer(msgIndex) {
   const vidEl = document.getElementById("videoViewerEl");
   if (!modal || !vidEl) return;
 
-  if (authorEl) authorEl.textContent = `${msg.from || "пользователь"}`;
-  if (statusEl) statusEl.textContent = "Загрузка видео...";
-
-  vidEl.preload = "auto";
+  if (authorEl) authorEl.textContent = `🎬 Видео от ${msg.from}`;
+  if (statusEl) statusEl.textContent = "Нажмите воспроизведение для загрузки видео";
+  vidEl.pause();
+  vidEl.preload = "none";
   vidEl.src = msg.video;
-  vidEl.onloadeddata = () => {
-    if (statusEl) statusEl.textContent = "Видео готово";
-  };
-  vidEl.onplaying = () => {
-    if (statusEl) statusEl.textContent = "";
-  };
-  vidEl.onerror = () => {
-    if (statusEl) statusEl.textContent = "Не удалось воспроизвести этот формат видео";
-  };
+  vidEl.load();
   modal.classList.remove("hidden");
-  vidEl.play().catch(() => {});
 }
 
 function closeVideoViewer(event) {
@@ -6091,70 +6107,85 @@ function closeVideoViewer(event) {
   if (vidEl) {
     try { vidEl.pause(); } catch (e) {}
     vidEl.removeAttribute("src");
-    vidEl.preload = "none";
-    try { vidEl.load(); } catch (e) {}
+    vidEl.load();
   }
   if (modal) modal.classList.add("hidden");
 }
 
-function canDeleteMessage(msg) {
-  if (!msg || !me || msg.from === "system" || msg.isUploading) return false;
-  if (activeChat && activeChat.type === "admin") return isSystemOwnerNick(me.username);
-  if (isSystemOwnerNick(me.username)) return true;
-  if (activeChat && activeChat.type === "group" && currentGroupOwner === me.username) return true;
-  return msg.from === me.username;
+function renderReactorsBreakdown(reactionsObj) {
+  const box = document.getElementById("msgReactorsList");
+  if (!box) return;
+  if (!reactionsObj || typeof reactionsObj !== "object") {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  const entries = Object.entries(reactionsObj).filter(([, users]) => Array.isArray(users) && users.length > 0);
+  if (!entries.length) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  box.innerHTML = entries.map(([em, users]) =>
+    `<div class="msg-menu-reactor-line"><strong>${esc(em)}</strong> — ${users.map(u => esc(u)).join(", ")}</div>`
+  ).join("");
+  box.classList.remove("hidden");
 }
 
 function openMsgActionModal(msgIndex) {
-  if (suppressNextBubbleClick) {
-    suppressNextBubbleClick = false;
-    return;
-  }
   const msg = currentRoomMsgs[msgIndex];
   if (!msg || msg.from === "system" || msg.isUploading) return;
+  if (activeChat && activeChat.type === "admin") return;
+
+  selectedMsgForAction = { index: msgIndex, msg };
   playSound("click");
-  selectedMsgForAction = msg;
-
-  const prev = document.getElementById("msgActionPreview");
-  if (prev) {
-    const t = (msg.text || "").trim();
-    const label = t || (msg.video ? "🎬 Видео" : (msg.image ? "📷 Фотография" : "Сообщение"));
-    prev.textContent = `${msg.from}: ${label}`;
-  }
-
-  const delBtn = document.getElementById("btnDeleteSelectedMsg");
-  if (delBtn) {
-    delBtn.classList.toggle("hidden", !canDeleteMessage(msg));
-  }
-
-  const choicesBox = document.getElementById("msgReactionChoices");
-  if (choicesBox) {
-    const reactions = (msg.reactions && typeof msg.reactions === "object") ? msg.reactions : {};
-    choicesBox.innerHTML = REACTION_EMOJIS.map(em => {
-      const users = Array.isArray(reactions[em]) ? reactions[em] : [];
-      const active = me && users.includes(me.username);
-      return `<button type="button" class="reaction-pick-btn" style="${active ? 'outline:2px solid var(--accent);' : ''}" onclick="toggleReactionOnSelected('${em}')">${em}</button>`;
-    }).join("");
-  }
-
-  const reactorsBox = document.getElementById("msgReactorsList");
-  if (reactorsBox) {
-    const reactions = (msg.reactions && typeof msg.reactions === "object") ? msg.reactions : {};
-    const entries = Object.entries(reactions).filter(([, list]) => Array.isArray(list) && list.length > 0);
-    if (entries.length) {
-      reactorsBox.classList.remove("hidden");
-      reactorsBox.innerHTML = entries.map(([em, list]) => {
-        const namesText = list.map(u => (u === me.username ? `${u} (вы)` : u)).join(", ");
-        return `<div class="msg-menu-reactor-line"><strong>${em}</strong> — ${esc(namesText)}</div>`;
-      }).join("");
-    } else {
-      reactorsBox.classList.add("hidden");
-      reactorsBox.innerHTML = "";
-    }
-  }
 
   const modal = document.getElementById("msgActionModal");
-  if (modal) modal.classList.remove("hidden");
+  const prev = document.getElementById("msgActionPreview");
+  const delBtn = document.getElementById("btnDeleteSelectedMsg");
+  const choices = document.getElementById("msgReactionChoices");
+
+  const summary = (msg.text || "").trim() || (msg.video ? "🎬 Видео" : (msg.image ? "📷 Фотография" : "Сообщение"));
+  prev.textContent = `${msg.from}: ${summary}`;
+
+  const canDelete = Boolean(me && msg.from === me.username && msg.id);
+  if (delBtn) {
+    delBtn.classList.toggle("hidden", !canDelete);
+  }
+
+  choices.innerHTML = REACTION_EMOJIS.map(em =>
+    `<button type="button" class="reaction-pick-btn" onclick="pickReactionForSelected('${em}')">${em}</button>`
+  ).join("");
+
+  renderReactorsBreakdown(msg.reactions || {});
+  modal.classList.remove("hidden");
+}
+
+async function deleteSelectedMsg() {
+  if (!selectedMsgForAction || !activeChat || !me) return;
+  const targetMsg = selectedMsgForAction.msg;
+  if (!targetMsg || !targetMsg.id || targetMsg.from !== me.username) return;
+
+  const payload = {
+    actor: me.username,
+    msgId: targetMsg.id
+  };
+  if (activeChat.type === "group") {
+    payload.chatType = "group";
+    payload.groupId = activeChat.id;
+  } else {
+    payload.chatType = "direct";
+    payload.peer = activeChat.username;
+  }
+
+  closeMsgActionModal();
+  const res = await api("/api/messages/delete", payload);
+  if (res.ok) {
+    playSound("leave");
+    lastRenderedMsgsJson = "";
+    await refreshMessages(true, roomSwitchToken);
+    await refreshChats();
+  }
 }
 
 function closeMsgActionModal(event) {
@@ -6165,289 +6196,210 @@ function closeMsgActionModal(event) {
 }
 
 function startReplyToSelectedMsg() {
-  const target = selectedMsgForAction;
+  if (!selectedMsgForAction) return;
+  const targetMsg = selectedMsgForAction.msg;
   closeMsgActionModal();
-  if (target) {
-    setReplyTarget(target);
-  }
+  setReplyTarget(targetMsg);
 }
 
-async function deleteSelectedMsg() {
-  const target = selectedMsgForAction;
+async function pickReactionForSelected(emoji) {
+  if (!selectedMsgForAction) return;
+  const targetMsg = selectedMsgForAction.msg;
   closeMsgActionModal();
-  if (!target || !activeChat || !me || !canDeleteMessage(target)) return;
+  await toggleMessageReaction(targetMsg, emoji);
+}
 
-  if (activeChat.type === "admin") {
-    const res = await api("/api/admin/delete", {
-      actor: me.username,
-      msgId: target.id
-    });
-    if (res.ok) {
-      playSound("leave");
-      lastRenderedMsgsJson = "";
-      await refreshMessages(true);
-      await refreshChats();
-    }
-    return;
-  }
-
+async function toggleMessageReaction(msg, emoji) {
+  if (!me || !activeChat || activeChat.type === "admin" || !msg || !msg.id) return;
+  playSound("react");
+  const payload = {
+    user: me.username,
+    emoji,
+    msgId: msg.id
+  };
   if (activeChat.type === "group") {
-    const res = await api("/api/groups/messages/delete", {
-      actor: me.username,
-      groupId: activeChat.id,
-      msgId: target.id
-    });
-    if (res.ok) {
-      playSound("leave");
-      lastRenderedMsgsJson = "";
-      await refreshMessages(true);
-      await refreshChats();
-    }
+    payload.chatType = "group";
+    payload.groupId = activeChat.id;
   } else {
-    const res = await api("/api/messages/delete", {
-      actor: me.username,
-      a: me.username,
-      b: activeChat.username,
-      msgId: target.id
-    });
-    if (res.ok) {
-      playSound("leave");
-      lastRenderedMsgsJson = "";
-      await refreshMessages(true);
-      await refreshChats();
-    }
+    payload.chatType = "direct";
+    payload.peer = activeChat.username;
+  }
+  const res = await api("/api/reactions/toggle", payload);
+  if (res.ok) {
+    lastRenderedMsgsJson = "";
+    await refreshMessages(false, roomSwitchToken);
   }
 }
 
-async function toggleReactionOnSelected(emoji) {
-  const target = selectedMsgForAction;
-  closeMsgActionModal();
-  if (!target || !activeChat || !me || !emoji) return;
-
-  if (activeChat.type === "group") {
-    const res = await api("/api/groups/messages/react", {
-      actor: me.username,
-      groupId: activeChat.id,
-      msgId: target.id,
-      emoji
-    });
-    if (res.ok) {
-      playSound("react");
-      lastRenderedMsgsJson = "";
-      await refreshMessages(true);
+function bindBubbleGestures(el, msgIndex) {
+  const startPress = (e) => {
+    if (e.target && e.target.closest && e.target.closest(".reaction-chip, .msg-img, .msg-video-card")) {
+      return;
     }
-  } else if (activeChat.type === "direct") {
-    const res = await api("/api/messages/react", {
-      actor: me.username,
-      a: me.username,
-      b: activeChat.username,
-      msgId: target.id,
-      emoji
-    });
-    if (res.ok) {
-      playSound("react");
-      lastRenderedMsgsJson = "";
-      await refreshMessages(true);
-    }
-  }
-}
-
-async function toggleReactionFromChip(msgIndex, emoji, event) {
-  if (event) event.stopPropagation();
-  const msg = currentRoomMsgs[msgIndex];
-  if (!msg || !activeChat || !me || !emoji || msg.isUploading) return;
-
-  if (activeChat.type === "group") {
-    const res = await api("/api/groups/messages/react", {
-      actor: me.username,
-      groupId: activeChat.id,
-      msgId: msg.id,
-      emoji
-    });
-    if (res.ok) {
-      playSound("react");
-      lastRenderedMsgsJson = "";
-      await refreshMessages(true);
-    }
-  } else if (activeChat.type === "direct") {
-    const res = await api("/api/messages/react", {
-      actor: me.username,
-      a: me.username,
-      b: activeChat.username,
-      msgId: msg.id,
-      emoji
-    });
-    if (res.ok) {
-      playSound("react");
-      lastRenderedMsgsJson = "";
-      await refreshMessages(true);
-    }
-  }
-}
-
-function attachBubbleLongPressHandlers(bubbleEl, msgIndex) {
-  if (!bubbleEl) return;
-
-  const startPress = () => {
-    clearTimeout(longPressTimer);
+    if (longPressTimer) clearTimeout(longPressTimer);
     suppressNextBubbleClick = false;
     longPressTimer = setTimeout(() => {
       suppressNextBubbleClick = true;
       openMsgActionModal(msgIndex);
     }, 450);
   };
-
   const cancelPress = () => {
     if (longPressTimer) {
       clearTimeout(longPressTimer);
       longPressTimer = null;
     }
   };
-
-  bubbleEl.addEventListener("pointerdown", startPress);
-  bubbleEl.addEventListener("pointerup", cancelPress);
-  bubbleEl.addEventListener("pointercancel", cancelPress);
-  bubbleEl.addEventListener("pointerleave", cancelPress);
-  bubbleEl.addEventListener("contextmenu", (e) => {
+  el.addEventListener("pointerdown", startPress);
+  el.addEventListener("pointerup", cancelPress);
+  el.addEventListener("pointercancel", cancelPress);
+  el.addEventListener("pointerleave", cancelPress);
+  el.addEventListener("contextmenu", (e) => {
+    if (e.target && e.target.closest && e.target.closest(".reaction-chip, .msg-img, .msg-video-card")) {
+      return;
+    }
     e.preventDefault();
     cancelPress();
     suppressNextBubbleClick = true;
     openMsgActionModal(msgIndex);
   });
-}
-
-function renderDirectRoomHeader(username, emoji, avatarPhoto, isOwner, banned = false, displayName = "") {
-  const isBan = Boolean(banned || emoji === BANNED_EMOJI);
-  const shownName = isBan ? BANNED_DISPLAY_NAME : (displayName || username);
-  renderAvatarElement(document.getElementById("peerAva"), emoji, avatarPhoto, username, isBan);
-  document.getElementById("peerNick").innerHTML = nickLabelHtml(shownName, isOwner && !isBan);
-  const headerMain = document.getElementById("roomHeaderMain");
-  if (headerMain) headerMain.classList.add("clickable-header");
-  const presEl = document.getElementById("peerPresence");
-  if (presEl) presEl.classList.remove("hidden");
-  const btnCall = document.getElementById("btnCallRoom");
-  if (btnCall) {
-    btnCall.classList.remove("hidden");
-    btnCall.disabled = isBan;
-    btnCall.title = "Позвонить";
-  }
+  el.addEventListener("click", (e) => {
+    if (e.target && e.target.closest && e.target.closest(".reaction-chip, .msg-img, .msg-video-card")) {
+      return;
+    }
+    if (suppressNextBubbleClick) {
+      suppressNextBubbleClick = false;
+      return;
+    }
+    openMsgActionModal(msgIndex);
+  });
 }
 
 async function openAdminChat() {
   if (!me || !isSystemOwnerNick(me.username)) return;
   playSound("click");
-  activeChat = { type: "admin", username: "Чат администратора", emoji: "🛡️" };
+  const token = ++roomSwitchToken;
+  activeChat = { type: "admin", username: "Администратор", emoji: "🛡️" };
   persistSessionState();
-  activeGroupCallInfo = null;
   currentGroupOwner = "";
   currentGroupCallAccess = "all";
-  replyTarget = null;
-  roomHistoryInitialized = false;
+  activeGroupCallInfo = null;
+  updateGroupCallBannerUi();
   clearReplyTarget();
+  resetRoomInteractionState();
   clearAttachment();
-  lastRenderedMsgsJson = "";
-  document.getElementById("peerAva").textContent = "🛡️";
-  document.getElementById("peerNick").innerHTML = `Чат администратора ${nickLabelHtml(me.username, true)}`;
+
   const headerMain = document.getElementById("roomHeaderMain");
   if (headerMain) headerMain.classList.remove("clickable-header");
+  document.getElementById("peerAva").textContent = "🛡️";
+  document.getElementById("peerNick").innerHTML = `Чат администратора ${nickLabelHtml(me.username, true)}`;
   const presEl = document.getElementById("peerPresence");
   if (presEl) presEl.classList.add("hidden");
   document.getElementById("peerStatus").textContent = "";
   const btnCall = document.getElementById("btnCallRoom");
   if (btnCall) btnCall.classList.add("hidden");
-  updateGroupCallBannerUi();
+
   syncRoomComposerLock(false);
   syncAdminRoomUi(true);
+  showScreen("roomScreen");
   document.getElementById("msgInput").value = "";
   autoResizeComposer();
-  showScreen("roomScreen");
+  await refreshMessages(true, token);
   refreshChats();
-  await refreshMessages(true);
 }
 
-async function openDirectChat(username, emoji, isOwner = false, avatarPhoto = "", banned = false, displayName = "") {
+function renderDirectRoomHeader(username, ava, photo = "", isOwner = false, banned = false, displayName = "") {
+  const headerMain = document.getElementById("roomHeaderMain");
+  if (headerMain) headerMain.classList.add("clickable-header");
+  const isBan = Boolean(banned || ava === BANNED_EMOJI);
+  const cleanAva = sanitizeAvatarEmoji(ava, isBan);
+  const cleanPhoto = sanitizeAvatarPhotoClient(photo, username, isBan);
+  const shownName = isBan ? BANNED_DISPLAY_NAME : (displayName || username);
+  renderAvatarElement(document.getElementById("peerAva"), cleanAva, cleanPhoto, username, isBan);
+  document.getElementById("peerNick").innerHTML = nickLabelHtml(shownName, isOwner && !isBan);
+}
+
+async function openDirectChat(username, ava, isOwner = false, photo = "", banned = false, displayName = "") {
   playSound("click");
-  const cached = getCachedUserAvatar(username);
-  const isBan = Boolean(banned || emoji === BANNED_EMOJI || cached.banned);
-  const cleanEm = sanitizeAvatarEmoji(emoji || cached.emoji || "🍐", isBan);
-  const cleanPhoto = sanitizeAvatarPhotoClient(avatarPhoto || cached.avatarPhoto || "", username, isBan);
-  const cleanIsOwner = Boolean(isOwner) && !isBan;
-  const shownName = isBan ? BANNED_DISPLAY_NAME : (displayName || cached.displayName || username);
-  cacheUserAvatar(username, cleanEm, cleanPhoto, isBan, shownName);
+  const token = ++roomSwitchToken;
+  const isBan = Boolean(banned || ava === BANNED_EMOJI);
+  const cleanAva = sanitizeAvatarEmoji(ava, isBan);
+  const cleanPhoto = sanitizeAvatarPhotoClient(photo, username, isBan);
+  const shownName = isBan ? BANNED_DISPLAY_NAME : (displayName || username);
+  cacheUserAvatar(username, cleanAva, cleanPhoto, isBan, shownName);
 
   activeChat = {
     type: "direct",
     username,
     displayName: shownName,
     banned: isBan,
-    emoji: cleanEm,
+    emoji: cleanAva,
     avatarPhoto: cleanPhoto,
-    isOwner: cleanIsOwner
+    isOwner: Boolean(isOwner) && !isBan
   };
   persistSessionState();
-  activeGroupCallInfo = null;
   currentGroupOwner = "";
   currentGroupCallAccess = "all";
-  replyTarget = null;
-  roomHistoryInitialized = false;
-  clearReplyTarget();
-  clearAttachment();
-  lastRenderedMsgsJson = "";
-  renderDirectRoomHeader(username, cleanEm, cleanPhoto, cleanIsOwner, isBan, shownName);
-  document.getElementById("peerStatus").textContent = "";
+  activeGroupCallInfo = null;
   updateGroupCallBannerUi();
+  clearReplyTarget();
+  resetRoomInteractionState();
+  clearAttachment();
+
+  renderDirectRoomHeader(username, cleanAva, cleanPhoto, activeChat.isOwner, isBan, shownName);
+  document.getElementById("peerStatus").textContent = "";
+  const btnCall = document.getElementById("btnCallRoom");
+  if (btnCall) {
+    btnCall.classList.remove("hidden");
+    btnCall.disabled = false;
+    btnCall.title = "Позвонить";
+  }
   syncRoomComposerLock(false);
   syncAdminRoomUi(false);
+  showScreen("roomScreen");
   document.getElementById("msgInput").value = "";
   autoResizeComposer();
-  showScreen("roomScreen");
+  await refreshMessages(true, token);
+  updateDirectRoomPresence(username, token);
   refreshChats();
-  updateDirectRoomPresence(username);
-  await refreshMessages(true);
-  pollCallStatus();
 }
 
-async function openGroupChat(groupId, title, emoji = "🦜", tripleBadge = false) {
+async function openGroupChat(groupId, title, emoji, tripleBadge = false) {
   playSound("click");
+  const token = ++roomSwitchToken;
   const gAva = sanitizeAvatarEmoji(emoji || "🦜");
   const showTriple = Boolean(tripleBadge) || isTripleBadgeGroupTitle(title);
   activeChat = { type: "group", id: groupId, username: title, emoji: gAva, tripleBadge: showTriple };
   persistSessionState();
-  activeGroupCallInfo = null;
   currentGroupOwner = "";
   currentGroupCallAccess = "all";
-  replyTarget = null;
-  roomHistoryInitialized = false;
   clearReplyTarget();
+  resetRoomInteractionState();
   clearAttachment();
-  lastRenderedMsgsJson = "";
-  document.getElementById("peerAva").textContent = gAva;
-  document.getElementById("peerNick").innerHTML = groupTitleHtml(title, showTriple);
+
   const headerMain = document.getElementById("roomHeaderMain");
   if (headerMain) headerMain.classList.add("clickable-header");
+  document.getElementById("peerAva").textContent = gAva;
+  document.getElementById("peerNick").innerHTML = groupTitleHtml(title, showTriple);
   const presEl = document.getElementById("peerPresence");
   if (presEl) presEl.classList.add("hidden");
   document.getElementById("peerStatus").textContent = "";
   const btnCall = document.getElementById("btnCallRoom");
   if (btnCall) {
     btnCall.classList.remove("hidden");
-    btnCall.disabled = false;
     btnCall.title = "Позвонить в группу";
   }
-  updateGroupCallBannerUi();
+  syncGroupCallPermissionUi();
   syncRoomComposerLock(false);
   syncAdminRoomUi(false);
+  showScreen("roomScreen");
   document.getElementById("msgInput").value = "";
   autoResizeComposer();
-  showScreen("roomScreen");
-  refreshChats();
-  await refreshMessages(true);
+  await refreshMessages(true, token);
   pollCallStatus();
+  refreshChats();
 }
 
 function insertEmoji(em) {
-  if (activeChat && activeChat.type === "admin") return;
-  playSound("click");
   const inp = document.getElementById("msgInput");
   inp.value += em;
   autoResizeComposer();
@@ -6463,15 +6415,16 @@ function clearAttachment() {
   const pInp = document.getElementById("photoFileInput");
   if (vInp) vInp.value = "";
   if (pInp) pInp.value = "";
-  const box = document.getElementById("attachPreview");
-  const thumb = document.getElementById("attachThumb");
+  document.getElementById("attachPreview").classList.add("hidden");
+  const imgEl = document.getElementById("attachThumb");
   const vidBadge = document.getElementById("attachVideoBadge");
-  if (thumb) {
-    thumb.src = "";
-    thumb.classList.add("hidden");
+  if (imgEl) {
+    imgEl.src = "";
+    imgEl.classList.add("hidden");
   }
-  if (vidBadge) vidBadge.classList.add("hidden");
-  if (box) box.classList.add("hidden");
+  if (vidBadge) {
+    vidBadge.classList.add("hidden");
+  }
 }
 
 function compressImageFile(file) {
@@ -6481,29 +6434,28 @@ function compressImageFile(file) {
       const img = new Image();
       img.onload = () => {
         const maxSide = 900;
-        let w = img.width;
-        let h = img.height;
-        if (w > maxSide || h > maxSide) {
-          if (w > h) {
-            h = Math.round((h * maxSide) / w);
-            w = maxSide;
+        let { width, height } = img;
+        if (width > maxSide || height > maxSide) {
+          if (width > height) {
+            height = Math.round((height * maxSide) / width);
+            width = maxSide;
           } else {
-            w = Math.round((w * maxSide) / h);
-            h = maxSide;
+            width = Math.round((width * maxSide) / height);
+            height = maxSide;
           }
         }
         const canvas = document.createElement("canvas");
-        canvas.width = w;
-        canvas.height = h;
+        canvas.width = width;
+        canvas.height = height;
         const ctx = canvas.getContext("2d");
-        ctx.drawImage(img, 0, 0, w, h);
-        let quality = 0.8;
-        let dataUrl = canvas.toDataURL("image/jpeg", quality);
-        while (dataUrl.length > 1_100_000 && quality > 0.35) {
+        ctx.drawImage(img, 0, 0, width, height);
+        let quality = 0.78;
+        let out = canvas.toDataURL("image/jpeg", quality);
+        while (out.length > 1_100_000 && quality > 0.35) {
           quality -= 0.1;
-          dataUrl = canvas.toDataURL("image/jpeg", quality);
+          out = canvas.toDataURL("image/jpeg", quality);
         }
-        resolve(dataUrl);
+        resolve(out);
       };
       img.onerror = reject;
       img.src = reader.result;
@@ -6516,7 +6468,11 @@ function compressImageFile(file) {
 async function onFileSelected(event) {
   const file = event.target.files && event.target.files[0];
   if (!file) return;
-  if (file.type && file.type.startsWith("video/")) {
+  const isVideo = (file.type && file.type.startsWith("video/")) || event.target.id === "videoFileInput";
+  const imgEl = document.getElementById("attachThumb");
+  const vidBadge = document.getElementById("attachVideoBadge");
+
+  if (isVideo) {
     if (file.size > MAX_VIDEO_FILE_BYTES) {
       alert("Видео слишком большое. Максимум — 25 МБ.");
       clearAttachment();
@@ -6525,40 +6481,29 @@ async function onFileSelected(event) {
     pendingImageData = "";
     pendingVideoFile = file;
     pendingVideoName = file.name || "video.mp4";
-    const thumb = document.getElementById("attachThumb");
-    const vidBadge = document.getElementById("attachVideoBadge");
-    const nameEl = document.getElementById("attachName");
-    const box = document.getElementById("attachPreview");
-    if (thumb) {
-      thumb.src = "";
-      thumb.classList.add("hidden");
+    if (imgEl) {
+      imgEl.src = "";
+      imgEl.classList.add("hidden");
     }
     if (vidBadge) vidBadge.classList.remove("hidden");
-    if (nameEl) {
-      const mb = (file.size / (1024 * 1024)).toFixed(1);
-      nameEl.textContent = `${pendingVideoName} (${mb} МБ)`;
-    }
-    if (box) box.classList.remove("hidden");
+    document.getElementById("attachName").textContent = `🎬 ${pendingVideoName}`;
+    document.getElementById("attachPreview").classList.remove("hidden");
     playSound("click");
     return;
   }
 
   try {
-    const dataUrl = await compressImageFile(file);
     pendingVideoFile = null;
     pendingVideoName = "";
+    const dataUrl = await compressImageFile(file);
     pendingImageData = dataUrl;
-    const thumb = document.getElementById("attachThumb");
-    const vidBadge = document.getElementById("attachVideoBadge");
-    const nameEl = document.getElementById("attachName");
-    const box = document.getElementById("attachPreview");
     if (vidBadge) vidBadge.classList.add("hidden");
-    if (thumb) {
-      thumb.src = dataUrl;
-      thumb.classList.remove("hidden");
+    if (imgEl) {
+      imgEl.src = dataUrl;
+      imgEl.classList.remove("hidden");
     }
-    if (nameEl) nameEl.textContent = file.name || "Фотография";
-    if (box) box.classList.remove("hidden");
+    document.getElementById("attachName").textContent = file.name || "Фотография";
+    document.getElementById("attachPreview").classList.remove("hidden");
     playSound("click");
   } catch (e) {
     alert("Не удалось прочитать фотографию");
@@ -6566,29 +6511,40 @@ async function onFileSelected(event) {
   }
 }
 
-function uploadVideoWithProgress(file, onProgress) {
+function uploadVideoWithProgress(file, metaPayload, onProgress) {
   return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/upload-video", true);
     xhr.withCredentials = true;
+
     xhr.upload.onprogress = (ev) => {
       if (ev.lengthComputable && typeof onProgress === "function") {
         const pct = Math.max(1, Math.min(99, Math.round((ev.loaded / ev.total) * 100)));
         onProgress(pct);
       }
     };
+
     xhr.onload = () => {
       try {
-        const data = JSON.parse(xhr.responseText || "{}");
-        resolve(data);
+        const parsed = JSON.parse(xhr.responseText || "{}");
+        resolve(parsed);
       } catch (e) {
         resolve({ ok: false, error: "Ошибка ответа сервера при загрузке видео" });
       }
     };
-    xhr.onerror = () => resolve({ ok: false, error: "Ошибка сети при загрузке видео" });
-    const fd = new FormData();
-    fd.append("video", file, file.name || "video.mp4");
-    xhr.send(fd);
+
+    xhr.onerror = () => {
+      resolve({ ok: false, error: "Ошибка сети при загрузке видео" });
+    };
+
+    const formData = new FormData();
+    formData.append("video", file, file.name || "video.mp4");
+    Object.entries(metaPayload || {}).forEach(([k, v]) => {
+      if (v !== undefined && v !== null) {
+        formData.append(k, typeof v === "string" ? v : JSON.stringify(v));
+      }
+    });
+    xhr.send(formData);
   });
 }
 
@@ -6596,401 +6552,403 @@ async function sendMsg() {
   if (!me || !activeChat) return;
   const inp = document.getElementById("msgInput");
   const text = inp.value.trim();
-  const image = pendingImageData;
-  const videoFile = pendingVideoFile;
-  const videoName = pendingVideoName;
-  const currentReply = replyTarget ? { ...replyTarget } : null;
 
   if (activeChat.type === "admin") {
     if (!text) return;
     inp.value = "";
     autoResizeComposer();
-    clearReplyTarget();
     playSound("send");
-    const res = await api("/api/admin/command", {
-      actor: me.username,
-      text
-    });
-    if (res && res.ok) {
-      lastRenderedMsgsJson = "";
-      await refreshMessages(true);
-      await refreshChats();
-      if (res.user) {
-        saveLocalUser(res.user);
-      }
+    const res = await api("/api/admin/command", { actor: me.username, text });
+    if (!res.ok) {
+      alert(res.error || "Ошибка выполнения команды");
     }
+    lastRenderedMsgsJson = "";
+    await refreshMessages(true, roomSwitchToken);
+    await refreshChats();
     return;
   }
 
-  if (!text && !image && !videoFile) return;
+  const img = pendingImageData;
+  const vidFile = pendingVideoFile;
+  const vidName = pendingVideoName;
+  const currentReply = replyTarget ? { ...replyTarget } : null;
 
-  if (videoFile) {
+  if (!text && !img && !vidFile) return;
+
+  if (vidFile) {
     const tempId = `up_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const roomSnapshot = { ...activeChat };
     const uploadItem = {
-      id: tempId,
+      tempId,
       from: me.username,
       text,
-      video: "",
-      videoName: videoName || "Видео",
+      videoName: vidName || "Видео",
+      progress: 5,
       ts: Date.now(),
-      replyTo: currentReply,
-      reactions: {},
-      isUploading: true,
-      uploadProgress: 1
+      replyTo: currentReply || undefined,
+      isUploading: true
     };
-
+    pendingUploads.push(uploadItem);
     inp.value = "";
     autoResizeComposer();
-    clearReplyTarget();
     clearAttachment();
-    pendingUploads.push(uploadItem);
+    clearReplyTarget();
     playSound("send");
     lastRenderedMsgsJson = "";
-    renderMessagesList(lastServerMsgsCache, false);
+    refreshMessages(true, roomSwitchToken);
 
-    const upRes = await uploadVideoWithProgress(videoFile, (pct) => {
-      uploadItem.uploadProgress = pct;
-      const fillEl = document.querySelector(`[data-upload-id="${CSS.escape(tempId)}"] .upload-progress-fill`);
-      const pctEl = document.querySelector(`[data-upload-id="${CSS.escape(tempId)}"] .upload-pct-label`);
-      if (fillEl) fillEl.style.width = `${pct}%`;
-      if (pctEl) pctEl.textContent = `Отправка видео... ${pct}%`;
+    const meta = {
+      from: me.username,
+      text,
+      replyTo: currentReply || ""
+    };
+    if (activeChat.type === "group") {
+      meta.chatType = "group";
+      meta.groupId = activeChat.id;
+    } else {
+      meta.chatType = "direct";
+      meta.to = activeChat.username;
+    }
+
+    const res = await uploadVideoWithProgress(vidFile, meta, (pct) => {
+      uploadItem.progress = pct;
+      lastRenderedMsgsJson = "";
+      refreshMessages(false, roomSwitchToken);
     });
 
-    pendingUploads = pendingUploads.filter(u => u.id !== tempId);
-
-    if (!upRes.ok || !upRes.videoUrl) {
-      lastRenderedMsgsJson = "";
-      renderMessagesList(lastServerMsgsCache, false);
-      alert(upRes.error || "Не удалось загрузить видео");
-      return;
+    pendingUploads = pendingUploads.filter(u => u.tempId !== tempId);
+    if (!res.ok) {
+      alert(res.error || "Не удалось загрузить видео");
     }
-
-    const sendRes = roomSnapshot.type === "group"
-      ? await api("/api/groups/send", {
-          from: me.username,
-          groupId: roomSnapshot.id,
-          text,
-          image: "",
-          video: upRes.videoUrl,
-          replyTo: currentReply
-        })
-      : await api("/api/send", {
-          from: me.username,
-          to: roomSnapshot.username,
-          text,
-          image: "",
-          video: upRes.videoUrl,
-          replyTo: currentReply
-        });
-
-    if (sendRes && sendRes.ok === false && sendRes.error) {
-      alert(sendRes.error);
-    }
-
-    if (activeChat && ((roomSnapshot.type === "group" && activeChat.type === "group" && activeChat.id === roomSnapshot.id) || (roomSnapshot.type === "direct" && activeChat.type === "direct" && activeChat.username === roomSnapshot.username))) {
-      lastRenderedMsgsJson = "";
-      await refreshMessages(true);
-      await refreshChats();
-    }
+    lastRenderedMsgsJson = "";
+    await refreshMessages(true, roomSwitchToken);
+    await refreshChats();
     return;
   }
 
   inp.value = "";
   autoResizeComposer();
-  clearReplyTarget();
   clearAttachment();
+  clearReplyTarget();
   playSound("send");
 
+  let res;
   if (activeChat.type === "group") {
-    const res = await api("/api/groups/send", { from: me.username, groupId: activeChat.id, text, image, video: "", replyTo: currentReply });
-    if (res.muted) {
-      syncRoomComposerLock(true);
-      return;
-    }
-    if (res && res.ok === false && res.error) {
-      alert(res.error);
-      return;
-    }
-    await refreshMessages(true);
+    res = await api("/api/groups/send", {
+      groupId: activeChat.id,
+      from: me.username,
+      text,
+      image: img,
+      replyTo: currentReply
+    });
   } else {
-    const res = await api("/api/send", { from: me.username, to: activeChat.username, text, image, video: "", replyTo: currentReply });
-    if (res && res.ok === false && res.error) {
-      alert(res.error);
-      return;
-    }
-    await refreshMessages(true);
+    res = await api("/api/send", {
+      from: me.username,
+      to: activeChat.username,
+      text,
+      image: img,
+      replyTo: currentReply
+    });
   }
+
+  if (res && res.ok === false && res.error) {
+    alert(res.error);
+  }
+  lastRenderedMsgsJson = "";
+  await refreshMessages(true, roomSwitchToken);
   await refreshChats();
 }
 
 function isEmojiOnlyText(str) {
-  const s = (str || "").trim();
-  if (!s) return false;
-  return EMOJI_ONLY_RE.test(s);
+  const trimmed = (str || "").trim();
+  if (!trimmed) return false;
+  return EMOJI_ONLY_RE.test(trimmed);
 }
 
 function formatMessageTextHtml(str) {
-  const raw = str || "";
-  if (isEmojiOnlyText(raw)) {
-    return esc(raw);
-  }
-  const parts = raw.split(SINGLE_EMOJI_RE);
-  return parts.map(part => {
-    if (!part) return "";
-    if (SINGLE_EMOJI_RE.test(part)) {
-      SINGLE_EMOJI_RE.lastIndex = 0;
-      return `<span class="inline-emoji">${esc(part)}</span>`;
-    }
-    SINGLE_EMOJI_RE.lastIndex = 0;
-    return esc(part);
-  }).join("");
+  const escaped = esc(str || "");
+  return escaped.replace(SINGLE_EMOJI_RE, (em) => `<span class="inline-emoji">${em}</span>`);
 }
 
-function renderReplyQuoteHtml(replyTo) {
-  if (!replyTo || typeof replyTo !== "object") return "";
-  const author = (replyTo.from || "").trim();
-  const txt = (replyTo.text || "").trim();
-  let label = txt;
-  if (!label && replyTo.hasVideo) label = "🎬 Видео";
-  else if (!label && replyTo.hasImage) label = "📷 Фотография";
-  else if (label && replyTo.hasVideo) label = `🎬 ${label}`;
-  else if (label && replyTo.hasImage) label = `📷 ${label}`;
-  if (!author && !label) return "";
+function renderReplyQuoteHtml(replyObj) {
+  if (!replyObj || typeof replyObj !== "object") return "";
+  const author = esc(replyObj.from || "Пользователь");
+  const txt = (replyObj.text || "").trim();
+  let bodyLine = esc(txt);
+  if (!bodyLine && replyObj.hasVideo) bodyLine = "🎬 Видео";
+  else if (!bodyLine && replyObj.hasImage) bodyLine = "📷 Фотография";
+  else if (txt && replyObj.hasVideo) bodyLine = `🎬 ${esc(txt)}`;
+  else if (txt && replyObj.hasImage) bodyLine = `📷 ${esc(txt)}`;
   return `
     <div class="reply-quote">
-      <div class="reply-quote-author">${esc(author || "Сообщение")}</div>
-      <div class="reply-quote-txt">${esc(label || "Сообщение")}</div>
+      <div class="reply-quote-author">↩️ ${author}</div>
+      <div class="reply-quote-txt">${bodyLine}</div>
     </div>
   `;
 }
 
-function renderReactionsHtml(reactions, msgIndex) {
+function renderReactionsHtml(msg, msgIndex) {
+  const reactions = msg.reactions;
   if (!reactions || typeof reactions !== "object") return "";
-  const entries = Object.entries(reactions).filter(([, list]) => Array.isArray(list) && list.length > 0);
+  const entries = Object.entries(reactions).filter(([, users]) => Array.isArray(users) && users.length > 0);
   if (!entries.length) return "";
-  return `<div class="reactions-row">` + entries.map(([em, users]) => {
+  const chips = entries.map(([em, users]) => {
     const reactedByMe = me && users.includes(me.username);
-    return `<button type="button" class="reaction-chip ${reactedByMe ? 'reacted-by-me' : ''}" onclick="toggleReactionFromChip(${msgIndex}, '${esc(em)}', event)"><span>${esc(em)}</span><span>${users.length}</span></button>`;
-  }).join("") + `</div>`;
-}
-
-function renderMessagesList(serverMsgs, forceScrollBottom = false) {
-  const safeServerMsgs = Array.isArray(serverMsgs) ? serverMsgs : [];
-  lastServerMsgsCache = safeServerMsgs;
-  const combinedMsgs = [...safeServerMsgs, ...pendingUploads];
-  currentRoomMsgs = combinedMsgs;
-
-  const box = document.getElementById("msgsBox");
-  const customCfg = loadCustom();
-  const payloadKey = JSON.stringify({
-    msgs: combinedMsgs,
-    custom: customCfg,
-    groupOwner: currentGroupOwner,
-    meNick: me ? me.username : "",
-    chatType: activeChat ? activeChat.type : ""
-  });
-  if (payloadKey === lastRenderedMsgsJson && !forceScrollBottom) return;
-  lastRenderedMsgsJson = payloadKey;
-
-  const isNearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
-
-  box.innerHTML = combinedMsgs.map((m, idx) => {
-    if (m.from === "system") {
-      return `<div class="sys-msg">${esc(m.text)}</div>`;
-    }
-
-    const isMe = m.from === me.username;
-    const hasText = Boolean((m.text || "").trim());
-    const hasImg = Boolean(m.image);
-    const hasVid = Boolean(m.video);
-    const hasReply = Boolean(m.replyTo);
-    const isEmojiOnly = !hasImg && !hasVid && !hasReply && !m.isUploading && hasText && isEmojiOnlyText(m.text);
-    const senderHeader = (!isMe && activeChat && activeChat.type === "group")
-      ? `<div class="msg-sender">${nickLabelHtml(m.from, isSystemOwnerNick(m.from))}</div>`
-      : "";
-    const replyHtml = renderReplyQuoteHtml(m.replyTo);
-    const imgHtml = hasImg
-      ? `<img class="msg-img" src="${m.image}" alt="Фото" onclick="window.open(this.src, '_blank')">`
-      : "";
-
-    let vidHtml = "";
-    if (m.isUploading) {
-      const pct = Math.max(1, Math.min(99, Number(m.uploadProgress) || 1));
-      vidHtml = `
-        <div class="msg-video-card uploading" data-upload-id="${esc(m.id)}">
-          <div class="msg-video-play">⏳</div>
-          <div class="msg-video-meta">
-            <div class="msg-video-title">${esc(m.videoName || "Видео")}</div>
-            <div class="msg-video-sub upload-pct-label">Отправка видео... ${pct}%</div>
-            <div class="upload-progress-track">
-              <div class="upload-progress-fill" style="width:${pct}%;"></div>
-            </div>
-          </div>
-        </div>
-      `;
-    } else if (hasVid) {
-      vidHtml = `
-        <div class="msg-video-card" onclick="event.stopPropagation(); openVideoViewer(${idx})">
-          <div class="msg-video-play">▶</div>
-          <div class="msg-video-meta">
-            <div class="msg-video-title">Видео</div>
-            <div class="msg-video-sub">Нажми, чтобы открыть</div>
-          </div>
-        </div>
-      `;
-    }
-
-    const txtHtml = hasText
-      ? `<div class="msg-txt">${formatMessageTextHtml(m.text)}</div>`
-      : "";
-    const timeLabel = formatMessageTime(m.ts);
-    const footerTimeHtml = timeLabel
-      ? `<div class="msg-footer-meta">${esc(timeLabel)}</div>`
-      : "";
-    const reactionsHtml = m.isUploading ? "" : renderReactionsHtml(m.reactions, idx);
-
-    const bubbleClass = `m ${isMe ? 'me' : 'them'} ${isEmojiOnly ? 'emoji-only-bubble' : ''}`;
-    const bubbleHtml = `<div class="${bubbleClass}" data-msg-idx="${idx}">${senderHeader}${replyHtml}${imgHtml}${vidHtml}${txtHtml}${footerTimeHtml}${reactionsHtml}</div>`;
-
-    if (activeChat && activeChat.type === "group" && !isMe) {
-      const avInfo = getCachedUserAvatar(m.from);
-      const isBan = Boolean(avInfo.banned || avInfo.emoji === BANNED_EMOJI);
-      const avaElHtml = `<div class="ava msg-row-ava" title="Информация об участнике" onclick="event.stopPropagation(); openGroupMemberInfoModal('${esc(m.from)}')">${avatarHtml(avInfo.emoji, avInfo.avatarPhoto, m.from, isBan)}</div>`;
-      return `<div class="msg-row row-them">${avaElHtml}${bubbleHtml}</div>`;
-    }
-
-    return bubbleHtml;
+    return `<button type="button" class="reaction-chip ${reactedByMe ? 'reacted-by-me' : ''}" onclick="event.stopPropagation(); onReactionChipClick(${msgIndex}, '${esc(em)}')"><span>${esc(em)}</span><span>${users.length}</span></button>`;
   }).join("");
-
-  box.querySelectorAll(".m[data-msg-idx]").forEach(el => {
-    const idx = Number(el.getAttribute("data-msg-idx"));
-    attachBubbleLongPressHandlers(el, idx);
-  });
-
-  if (forceScrollBottom || isNearBottom) {
-    box.scrollTop = box.scrollHeight;
-  }
+  return `<div class="reactions-row">${chips}</div>`;
 }
 
-function detectNewEventsAndPlaySounds(serverMsgs, isGroupRoom) {
-  const safeMsgs = Array.isArray(serverMsgs) ? serverMsgs : [];
-  const seenSet = isGroupRoom ? seenGroupMsgIds : seenDirectMsgIds;
+function onReactionChipClick(msgIndex, emoji) {
+  const msg = currentRoomMsgs[msgIndex];
+  if (!msg) return;
+  toggleMessageReaction(msg, emoji);
+}
+
+function playMessageEventSoundIfNew(serverMsgs, isGroupRoom, roomKey) {
+  if (!Array.isArray(serverMsgs)) return;
+  if (!seenMsgsByRoom.has(roomKey)) {
+    seenMsgsByRoom.set(roomKey, new Set());
+  }
+  const seenSet = seenMsgsByRoom.get(roomKey);
 
   if (!roomHistoryInitialized) {
-    safeMsgs.forEach(m => {
-      if (m && m.id !== undefined && m.id !== null) {
-        seenSet.add(String(m.id));
-      }
+    serverMsgs.forEach((m, idx) => {
+      seenSet.add(m.id || `${m.ts || 0}_${idx}`);
     });
     roomHistoryInitialized = true;
     return;
   }
 
-  for (const m of safeMsgs) {
-    if (!m || m.id === undefined || m.id === null) continue;
-    const key = String(m.id);
-    if (seenSet.has(key)) continue;
+  let hasNewIncoming = false;
+  let hasJoinEvent = false;
+  let hasLeaveEvent = false;
+
+  serverMsgs.forEach((m, idx) => {
+    const key = m.id || `${m.ts || 0}_${idx}`;
+    if (seenSet.has(key)) return;
     seenSet.add(key);
 
     if (m.from === "system") {
-      const txt = (m.text || "").toLowerCase();
-      if (m.eventKind === "join" || txt.includes("зашёл") || txt.includes("зашел")) {
-        playSound("join");
-      } else if (m.eventKind === "leave" || txt.includes("вышел")) {
-        playSound("leave");
+      if (isGroupRoom) {
+        if (m.eventKind === "join" || (m.text && m.text.endsWith("зашёл"))) {
+          hasJoinEvent = true;
+        } else if (m.eventKind === "leave" || (m.text && m.text.endsWith("вышел"))) {
+          hasLeaveEvent = true;
+        }
       }
-      continue;
+    } else if (me && m.from !== me.username) {
+      hasNewIncoming = true;
+    }
+  });
+
+  if (hasJoinEvent) playSound("join");
+  else if (hasLeaveEvent) playSound("leave");
+  else if (hasNewIncoming) playSound("receive");
+}
+
+function buildMessageBubbleInner(m, idx, isGroupRoom, isAdminRoom) {
+  const quoteHtml = renderReplyQuoteHtml(m.replyTo);
+  const senderHtml = (isGroupRoom && !isAdminRoom) ? `<div class="msg-sender">${esc(m.from)}</div>` : "";
+  const timeStr = formatMessageTime(m.ts);
+  const footerHtml = timeStr ? `<div class="msg-footer-meta">${esc(timeStr)}</div>` : "";
+
+  if (m.isUploading) {
+    const pct = Math.max(1, Math.min(100, Number(m.progress) || 1));
+    const captionHtml = m.text ? `<div class="msg-txt">${formatMessageTextHtml(m.text)}</div>` : "";
+    return `
+      ${senderHtml}
+      ${quoteHtml}
+      <div class="msg-video-card uploading">
+        <div class="msg-video-play">⏳</div>
+        <div class="msg-video-meta">
+          <div class="msg-video-title">${esc(m.videoName || "Видео")}</div>
+          <div class="msg-video-sub">Загрузка на сервер... ${pct}%</div>
+          <div class="upload-progress-track"><div class="upload-progress-fill" style="width:${pct}%;"></div></div>
+        </div>
+      </div>
+      ${captionHtml}
+      ${footerHtml}
+    `;
+  }
+
+  const hasVideo = Boolean(m.video);
+  const hasImg = Boolean(m.image);
+  const hasText = Boolean((m.text || "").trim());
+  const onlyEmoji = !hasImg && !hasVideo && !quoteHtml && hasText && isEmojiOnlyText(m.text);
+
+  let mediaHtml = "";
+  if (hasVideo) {
+    mediaHtml += `
+      <div class="msg-video-card" onclick="event.stopPropagation(); openVideoViewer(${idx})">
+        <div class="msg-video-play">▶</div>
+        <div class="msg-video-meta">
+          <div class="msg-video-title">Видео</div>
+          <div class="msg-video-sub">Нажми, чтобы открыть плеер</div>
+        </div>
+      </div>
+    `;
+  }
+  if (hasImg) {
+    mediaHtml += `<img class="msg-img" src="${m.image}" alt="Фото" onclick="event.stopPropagation(); window.open(this.src, '_blank')">`;
+  }
+  const textHtml = hasText
+    ? (onlyEmoji ? formatMessageTextHtml(m.text) : `<div class="msg-txt">${formatMessageTextHtml(m.text)}</div>`)
+    : "";
+  const reactionsHtml = isAdminRoom ? "" : renderReactionsHtml(m, idx);
+
+  return `${senderHtml}${quoteHtml}${mediaHtml}${textHtml}${reactionsHtml}${footerHtml}`;
+}
+
+function renderMessagesList(msgs, forceScroll = false, isGroupRoom = false, isAdminRoom = false) {
+  const box = document.getElementById("msgsBox");
+  if (!box) return;
+  const customSnap = JSON.stringify(loadCustom());
+  const snap = JSON.stringify(msgs) + "||" + customSnap;
+  if (snap === lastRenderedMsgsJson && !forceScroll) return;
+  lastRenderedMsgsJson = snap;
+
+  currentRoomMsgs = msgs;
+  const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 90;
+  box.innerHTML = "";
+
+  msgs.forEach((m, idx) => {
+    if (m.from === "system") {
+      const sysDiv = document.createElement("div");
+      sysDiv.className = "sys-msg";
+      sysDiv.textContent = m.text;
+      box.appendChild(sysDiv);
+      return;
     }
 
-    if (m.from !== me.username) {
-      playSound("receive");
+    const isMe = me && m.from === me.username;
+    const hasImg = Boolean(m.image);
+    const hasVideo = Boolean(m.video);
+    const hasText = Boolean((m.text || "").trim());
+    const onlyEmoji = !m.isUploading && !hasImg && !hasVideo && !m.replyTo && hasText && isEmojiOnlyText(m.text);
+
+    const bubble = document.createElement("div");
+    bubble.className = `m ${isMe ? "me" : "them"}` + (onlyEmoji ? " emoji-only-bubble" : "");
+    bubble.innerHTML = buildMessageBubbleInner(m, idx, isGroupRoom, isAdminRoom);
+    if (!m.isUploading && !isAdminRoom) {
+      bindBubbleGestures(bubble, idx);
     }
+
+    if (isGroupRoom && !isAdminRoom && !isMe) {
+      const row = document.createElement("div");
+      row.className = "msg-row row-them";
+
+      const avInfo = getCachedUserAvatar(m.from);
+      const isBan = Boolean(avInfo.banned || avInfo.emoji === BANNED_EMOJI);
+      const avaEl = document.createElement("div");
+      avaEl.className = "ava msg-row-ava";
+      avaEl.title = `Профиль ${m.from}`;
+      renderAvatarElement(avaEl, avInfo.emoji, avInfo.avatarPhoto, m.from, isBan);
+      avaEl.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openGroupMemberInfoModal(m.from);
+      });
+
+      row.appendChild(avaEl);
+      row.appendChild(bubble);
+      box.appendChild(row);
+    } else {
+      box.appendChild(bubble);
+    }
+  });
+
+  if (forceScroll || nearBottom) {
+    box.scrollTop = box.scrollHeight;
   }
 }
 
-async function refreshMessages(forceScrollBottom = false) {
-  if (!me || !activeChat) return;
+async function refreshMessages(forceScroll = false, expectedToken = roomSwitchToken) {
+  if (!activeChat || !me) return;
+  const chatSnapshot = { ...activeChat };
+  const roomKey = getRoomBucketKey(chatSnapshot);
 
-  if (activeChat.type === "admin") {
-    const res = await api(`/api/admin/messages?user=${encodeURIComponent(me.username)}`);
+  if (chatSnapshot.type === "admin") {
+    const res = await api(`/api/admin/messages?actor=${encodeURIComponent(me.username)}`);
+    if (expectedToken !== roomSwitchToken || !activeChat || activeChat.type !== "admin") return;
     if (!res.ok) return;
-    document.getElementById("peerStatus").textContent = "";
-    syncRoomComposerLock(false);
-    syncAdminRoomUi(true);
-    renderMessagesList(res.messages || [], forceScrollBottom);
+    const serverMsgs = res.messages || [];
+    playMessageEventSoundIfNew(serverMsgs, false, roomKey);
+    lastServerMsgsCache = serverMsgs;
+    renderMessagesList(serverMsgs, forceScroll, false, true);
     return;
   }
 
-  syncAdminRoomUi(false);
-
-  if (activeChat.type === "group") {
-    const res = await api(`/api/groups/messages?groupId=${encodeURIComponent(activeChat.id)}&user=${encodeURIComponent(me.username)}`);
+  if (chatSnapshot.type === "group") {
+    const res = await api(`/api/groups/messages?groupId=${encodeURIComponent(chatSnapshot.id)}&user=${encodeURIComponent(me.username)}`);
+    if (expectedToken !== roomSwitchToken || !activeChat || activeChat.type !== "group" || activeChat.id !== chatSnapshot.id) return;
     if (!res.ok) {
-      if (res.notMember) {
-        backToChats();
-      }
+      backToChats();
       return;
     }
-    if (res.title) {
-      activeChat.username = res.title;
-      activeChat.tripleBadge = Boolean(res.tripleBadge);
+    if (res.group) {
+      activeChat.username = res.group.title;
+      activeChat.emoji = sanitizeAvatarEmoji(res.group.emoji);
+      activeChat.tripleBadge = Boolean(res.group.tripleBadge);
       persistSessionState();
-      document.getElementById("peerNick").innerHTML = groupTitleHtml(res.title, activeChat.tripleBadge);
-    }
-    if (res.emoji) {
-      activeChat.emoji = sanitizeAvatarEmoji(res.emoji);
-      persistSessionState();
+      currentGroupOwner = res.group.owner || "";
+      currentGroupCallAccess = res.group.callAccess || "all";
+      syncGroupCallPermissionUi();
       document.getElementById("peerAva").textContent = activeChat.emoji;
+      document.getElementById("peerNick").innerHTML = groupTitleHtml(res.group.title, activeChat.tripleBadge);
     }
-    if (res.owner) {
-      currentGroupOwner = res.owner;
+    if (Array.isArray(res.memberProfiles)) {
+      res.memberProfiles.forEach(mp => {
+        if (mp && mp.username) {
+          cacheUserAvatar(mp.username, mp.emoji, mp.avatarPhoto, mp.banned, mp.displayName);
+        }
+      });
     }
-    if (res.callAccess) {
-      currentGroupCallAccess = res.callAccess;
-    }
-    syncGroupCallPermissionUi();
     syncRoomComposerLock(Boolean(res.muted));
     const typers = Array.isArray(res.typingUsers) ? res.typingUsers : [];
     document.getElementById("peerStatus").textContent = typers.length ? `${typers.join(", ")} печатает...` : "";
-    detectNewEventsAndPlaySounds(res.messages || [], true);
-    renderMessagesList(res.messages || [], forceScrollBottom);
-  } else {
-    const res = await api(`/api/messages?a=${encodeURIComponent(me.username)}&b=${encodeURIComponent(activeChat.username)}`);
-    if (!res.ok) return;
-    if (typeof res.peerBanned === "boolean" || res.peerEmoji || res.peerAvatarPhoto !== undefined || res.peerDisplayName) {
-      const pBan = Boolean(res.peerBanned || res.peerEmoji === BANNED_EMOJI);
-      const pEm = sanitizeAvatarEmoji(res.peerEmoji || activeChat.emoji, pBan);
-      const pPh = sanitizeAvatarPhotoClient(res.peerAvatarPhoto, activeChat.username, pBan);
-      const pDisp = pBan ? BANNED_DISPLAY_NAME : (res.peerDisplayName || activeChat.username);
-      const pOwn = Boolean(res.peerIsOwner) && !pBan;
-      activeChat.banned = pBan;
-      activeChat.emoji = pEm;
-      activeChat.avatarPhoto = pPh;
-      activeChat.displayName = pDisp;
-      activeChat.isOwner = pOwn;
-      cacheUserAvatar(activeChat.username, pEm, pPh, pBan, pDisp);
-      renderDirectRoomHeader(activeChat.username, pEm, pPh, pOwn, pBan, pDisp);
-    }
-    syncRoomComposerLock(false);
-    document.getElementById("peerStatus").textContent = res.typing ? "печатает..." : "";
-    updateDirectRoomPresence(activeChat.username);
-    detectNewEventsAndPlaySounds(res.messages || [], false);
-    renderMessagesList(res.messages || [], forceScrollBottom);
+    const serverMsgs = res.messages || [];
+    playMessageEventSoundIfNew(serverMsgs, true, roomKey);
+    lastServerMsgsCache = serverMsgs;
+    const combined = [...serverMsgs, ...pendingUploads];
+    renderMessagesList(combined, forceScroll || pendingUploads.length > 0, true, false);
+    return;
   }
+
+  const res = await api(`/api/messages?a=${encodeURIComponent(me.username)}&b=${encodeURIComponent(chatSnapshot.username)}`);
+  if (expectedToken !== roomSwitchToken || !activeChat || activeChat.type !== "direct" || activeChat.username !== chatSnapshot.username) return;
+  if (!res.ok) return;
+  if (res.peerProfile) {
+    const pp = res.peerProfile;
+    const isBan = Boolean(pp.banned || pp.emoji === BANNED_EMOJI);
+    cacheUserAvatar(pp.username, pp.emoji, pp.avatarPhoto, isBan, pp.displayName);
+    activeChat.banned = isBan;
+    activeChat.displayName = isBan ? BANNED_DISPLAY_NAME : (pp.displayName || pp.username);
+    activeChat.emoji = sanitizeAvatarEmoji(pp.emoji, isBan);
+    activeChat.avatarPhoto = sanitizeAvatarPhotoClient(pp.avatarPhoto, pp.username, isBan);
+    activeChat.isOwner = Boolean(pp.isOwner) && !isBan;
+    persistSessionState();
+    renderDirectRoomHeader(activeChat.username, activeChat.emoji, activeChat.avatarPhoto, activeChat.isOwner, activeChat.banned, activeChat.displayName);
+  }
+  const peerBlocksMe = Boolean(res.peerBlocksMe);
+  syncRoomComposerLock(peerBlocksMe, "Этот пользователь ограничил входящие личные сообщения.");
+  document.getElementById("peerStatus").textContent = res.typing ? "печатает..." : "";
+  const serverMsgs = res.messages || [];
+  playMessageEventSoundIfNew(serverMsgs, false, roomKey);
+  lastServerMsgsCache = serverMsgs;
+  const combined = [...serverMsgs, ...pendingUploads];
+  renderMessagesList(combined, forceScroll || pendingUploads.length > 0, false, false);
+  updateDirectRoomPresence(chatSnapshot.username, expectedToken);
 }
 
 async function setEmoji(em) {
   if (me && me.banned) return;
-  const cleanEm = sanitizeAvatarEmoji(em);
-  const res = await api("/api/emoji", { username: me.username, emoji: cleanEm });
+  const clean = sanitizeAvatarEmoji(em, false);
+  const res = await api("/api/emoji", { username: me.username, emoji: clean });
   if (res.ok) {
     playSound("react");
-    me.emoji = sanitizeAvatarEmoji(res.emoji || cleanEm, me.banned);
+    me.emoji = sanitizeAvatarEmoji(res.emoji || clean, false);
     cacheUserAvatar(me.username, me.emoji, me.avatarPhoto, me.banned, me.displayName);
     renderAvatarElement(document.getElementById("myAva"), me.emoji, me.avatarPhoto, me.username, me.banned);
     syncAvatarPickerUi();
-    document.getElementById("setErr").textContent = "";
     document.getElementById("setOk").textContent = "Аватарка обновлена!";
     refreshChats();
   }
@@ -6998,68 +6956,82 @@ async function setEmoji(em) {
 
 async function changeNick() {
   if (me && me.banned) return;
-  const newNick = document.getElementById("newNickInput").value.trim();
   const errEl = document.getElementById("setErr");
   const okEl = document.getElementById("setOk");
   errEl.textContent = "";
   okEl.textContent = "";
-  const res = await api("/api/nick", { oldUsername: me.username, newUsername: newNick });
+
+  const cd = getNickCooldownInfo(me);
+  if (!cd.canChange) {
+    errEl.textContent = `Сменить никнейм можно раз в 7 дней. Осталось: ${cd.daysLeft} дн. ${cd.hoursLeft} ч.`;
+    return;
+  }
+
+  const newNick = document.getElementById("newNickInput").value.trim();
+  const res = await api("/api/change-nick", { oldUsername: me.username, newUsername: newNick });
   if (!res.ok) {
     errEl.textContent = res.error || "Не удалось сменить никнейм";
     return;
   }
   playSound("react");
   saveLocalUser(res.user);
-  const shownNick = me.banned ? BANNED_DISPLAY_NAME : (me.displayName || me.username);
   renderAvatarElement(document.getElementById("myAva"), me.emoji, me.avatarPhoto, me.username, me.banned);
-  document.getElementById("myNick").innerHTML = nickLabelHtml(shownNick, me.isOwner && !me.banned);
-  syncAvatarPickerUi();
-  const cd = getNickCooldownInfo(me);
-  document.getElementById("nickHint").textContent = cd.canChange
+  document.getElementById("myNick").innerHTML = nickLabelHtml(me.username, me.isOwner);
+  const nextCd = getNickCooldownInfo(me);
+  document.getElementById("nickHint").textContent = nextCd.canChange
     ? "Никнейм можно менять раз в 7 дней. Сейчас смена доступна!"
-    : `Сменить никнейм можно раз в 7 дней. Осталось: ${cd.daysLeft} дн. ${cd.hoursLeft} ч.`;
+    : `Сменить никнейм можно раз в 7 дней. Осталось: ${nextCd.daysLeft} дн. ${nextCd.hoursLeft} ч.`;
   okEl.textContent = "Никнейм успешно изменён!";
   refreshChats();
 }
 
-function logout() {
+async function logout() {
   playSound("leave");
-  forceResetCallUi();
+  await hangupCall(true);
+  await api("/api/logout", {});
   saveLocalUser(null);
-  try {
-    sessionStorage.removeItem(SESSION_CHAT_KEY);
-    sessionStorage.removeItem(SESSION_CALL_KEY);
-  } catch (e) {}
-  if (pollTimer) clearInterval(pollTimer);
+  activeChat = null;
+  roomSwitchToken += 1;
+  resetRoomInteractionState();
+  try { sessionStorage.removeItem(SESSION_CHAT_KEY); } catch (e) {}
+  try { sessionStorage.removeItem(SESSION_CALL_KEY); } catch (e) {}
   showScreen("authScreen");
 }
 
 async function deleteAccount() {
   if (!me) return;
+  playSound("leave");
+  await hangupCall(true);
   const res = await api("/api/delete-account", { username: me.username });
   if (res.ok) {
-    logout();
+    saveLocalUser(null);
+    activeChat = null;
+    roomSwitchToken += 1;
+    resetRoomInteractionState();
+    try { sessionStorage.removeItem(SESSION_CHAT_KEY); } catch (e) {}
+    try { sessionStorage.removeItem(SESSION_CALL_KEY); } catch (e) {}
+    showScreen("authScreen");
   }
 }
 
 function startPolling() {
   if (pollTimer) clearInterval(pollTimer);
   pollTimer = setInterval(async () => {
-    if (!me) return;
-    api("/api/ping", { username: me.username }).catch(() => {});
-    if (currentScreenId === "chatsScreen") {
-      await refreshChats();
-    } else if (currentScreenId === "roomScreen" && activeChat) {
-      await refreshMessages(false);
-      if (activeChat.type === "direct") {
+    if (!me || pollInFlight) return;
+    pollInFlight = true;
+    try {
+      await pollCallStatus();
+      if (currentScreenId === "chatsScreen") {
         await refreshChats();
+      } else if (currentScreenId === "roomScreen" && activeChat) {
+        await refreshMessages(false, roomSwitchToken);
+        await refreshChats();
+      } else if (currentScreenId === "groupSettingsScreen" && activeChat && activeChat.type === "group") {
+        await renderGroupSettings();
       }
-    } else if (currentScreenId === "groupSettingsScreen" && activeChat && activeChat.type === "group") {
-      await renderGroupSettings();
-    } else if (currentScreenId === "directChatSettingsScreen" && activeChat && activeChat.type === "direct") {
-      await renderDirectChatSettings();
+    } finally {
+      pollInFlight = false;
     }
-    await pollCallStatus();
   }, 1500);
 }
 
@@ -7072,24 +7044,34 @@ function escAttr(s) {
 }
 
 (async function boot() {
-  const initialCustom = loadCustom();
-  applyCustom(initialCustom);
-  lastRenderedCustomJson = JSON.stringify(initialCustom);
+  applyCustom(loadCustom());
   showScreen("loadingScreen");
+  const splashStartedAt = Date.now();
 
-  const splashTimer = new Promise(resolve => setTimeout(resolve, SPLASH_DURATION_MS));
-  let saved = "";
-  try { saved = localStorage.getItem("grusha_nick") || ""; } catch (e) {}
+  let savedNick = "";
+  try { savedNick = localStorage.getItem("grusha_nick") || ""; } catch (e) {}
 
-  const sessionPromise = saved
-    ? api(`/api/me?username=${encodeURIComponent(saved)}`)
-    : Promise.resolve({ ok: false });
+  let sessionUser = null;
+  const meRes = await api("/api/me");
+  if (meRes && meRes.ok && meRes.user) {
+    sessionUser = meRes.user;
+  } else if (savedNick) {
+    const uRes = await api(`/api/user?username=${encodeURIComponent(savedNick)}`);
+    if (uRes && uRes.ok && uRes.user) {
+      sessionUser = uRes.user;
+    }
+  }
 
-  const [, res] = await Promise.all([splashTimer, sessionPromise]);
-  if (res && res.ok && res.user) {
-    saveLocalUser(res.user);
-    enterChats(true);
+  const elapsed = Date.now() - splashStartedAt;
+  if (elapsed < SPLASH_DURATION_MS) {
+    await new Promise(r => setTimeout(r, SPLASH_DURATION_MS - elapsed));
+  }
+
+  if (sessionUser) {
+    saveLocalUser(sessionUser);
+    await enterChats(true);
   } else {
+    saveLocalUser(null);
     showScreen("authScreen");
   }
 })();
@@ -7099,207 +7081,6 @@ function escAttr(s) {
 """
 
 
-def get_all_users_rows():
-    if USE_PG:
-        with get_pg_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM users")
-                return cur.fetchall()
-    db = load_json_db()
-    return list(db["users"].values())
-
-
-def get_direct_messages_list(a, b):
-    key = chat_key(a, b)
-    if USE_PG:
-        with get_pg_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT id, sender, text, image, video, ts, reply_to_json, reactions_json FROM messages WHERE chat_key = %s ORDER BY id ASC",
-                    (key,),
-                )
-                rows = cur.fetchall()
-        return [
-            format_message_record(
-                r["id"],
-                r["sender"],
-                r["text"],
-                r["image"],
-                r["ts"],
-                parse_json_dict(r.get("reply_to_json")),
-                parse_json_dict(r.get("reactions_json")),
-                r.get("video") or "",
-            )
-            for r in rows
-        ]
-    db = load_json_db()
-    raw_list = db["chats"].get(key, [])
-    return [
-        format_message_record(
-            m.get("id") or f"d_{idx}",
-            m.get("from", ""),
-            m.get("text", ""),
-            m.get("image", ""),
-            m.get("ts", 0),
-            m.get("replyTo"),
-            m.get("reactions"),
-            m.get("video", ""),
-        )
-        for idx, m in enumerate(raw_list)
-    ]
-
-
-def get_group_messages_list(group_id):
-    if USE_PG:
-        with get_pg_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    "SELECT id, sender, text, image, video, ts, reply_to_json, reactions_json FROM group_messages WHERE group_id = %s ORDER BY id ASC",
-                    (group_id,),
-                )
-                rows = cur.fetchall()
-        return [
-            format_message_record(
-                r["id"],
-                r["sender"],
-                r["text"],
-                r["image"],
-                r["ts"],
-                parse_json_dict(r.get("reply_to_json")),
-                parse_json_dict(r.get("reactions_json")),
-                r.get("video") or "",
-            )
-            for r in rows
-        ]
-    db = load_json_db()
-    raw_list = db["group_msgs"].get(group_id, [])
-    return [
-        format_message_record(
-            m.get("id") or f"g_{idx}",
-            m.get("from", ""),
-            m.get("text", ""),
-            m.get("image", ""),
-            m.get("ts", 0),
-            m.get("replyTo"),
-            m.get("reactions"),
-            m.get("video", ""),
-        )
-        for idx, m in enumerate(raw_list)
-    ]
-
-
-def get_user_groups(username):
-    if USE_PG:
-        with get_pg_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM groups ORDER BY created_at DESC")
-                rows = cur.fetchall()
-        result = []
-        for r in rows:
-            g = format_group_row(r)
-            if username in g["members"]:
-                result.append(g)
-        return result
-    db = load_json_db()
-    result = []
-    for _, g in db["groups"].items():
-        members = list(g.get("members") or [])
-        if username in members:
-            title = g["title"]
-            result.append({
-                "id": g["id"],
-                "title": title,
-                "emoji": normalize_group_emoji(g.get("emoji")),
-                "owner": g["owner"],
-                "members": members,
-                "muted": list(g.get("muted") or []),
-                "callAccess": sanitize_call_access(g.get("callAccess")),
-                "createdAt": int(g.get("createdAt") or 0),
-                "tripleBadge": is_triple_badge_group(title),
-            })
-    result.sort(key=lambda x: x.get("createdAt", 0), reverse=True)
-    return result
-
-
-def get_direct_peers_with_messages(username):
-    peers = set()
-    if USE_PG:
-        with get_pg_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT DISTINCT chat_key FROM messages")
-                for r in cur.fetchall():
-                    parts = (r["chat_key"] or "").split("::")
-                    if len(parts) == 2 and username in parts:
-                        other = parts[0] if parts[1] == username else parts[1]
-                        if other and other != username:
-                            peers.add(other)
-        return peers
-    db = load_json_db()
-    for key, msgs in db["chats"].items():
-        if not msgs:
-            continue
-        parts = key.split("::")
-        if len(parts) == 2 and username in parts:
-            other = parts[0] if parts[1] == username else parts[1]
-            if other and other != username:
-                peers.add(other)
-    return peers
-
-
-def format_last_preview(last_msg):
-    if not last_msg:
-        return "Сообщений пока нет"
-    txt = (last_msg.get("text") or "").strip()
-    if txt:
-        return txt
-    if last_msg.get("video"):
-        return "🎬 Видео"
-    if last_msg.get("image"):
-        return "📷 Фотография"
-    return "Сообщений пока нет"
-
-
-def update_group_record(group_id, title=None, emoji=None, members=None, muted=None, call_access=None):
-    g = get_group_by_id(group_id)
-    if not g:
-        return None
-    new_title = title if title is not None else g["title"]
-    new_emoji = normalize_group_emoji(emoji) if emoji is not None else g["emoji"]
-    new_members = list(members) if members is not None else list(g["members"])
-    new_muted = list(muted) if muted is not None else list(g["muted"])
-    new_access = sanitize_call_access(call_access) if call_access is not None else sanitize_call_access(g.get("callAccess"))
-
-    if USE_PG:
-        with get_pg_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    UPDATE groups
-                    SET title = %s, emoji = %s, members_json = %s, muted_json = %s, call_access = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        new_title,
-                        new_emoji,
-                        json.dumps(new_members, ensure_ascii=False),
-                        json.dumps(new_muted, ensure_ascii=False),
-                        new_access,
-                        group_id,
-                    ),
-                )
-    else:
-        db = load_json_db()
-        if group_id in db["groups"]:
-            db["groups"][group_id]["title"] = new_title
-            db["groups"][group_id]["emoji"] = new_emoji
-            db["groups"][group_id]["members"] = new_members
-            db["groups"][group_id]["muted"] = new_muted
-            db["groups"][group_id]["callAccess"] = new_access
-            save_json_db(db)
-
-    return get_group_by_id(group_id)
-
-
 @app.route("/")
 def index():
     return render_template_string(HTML_PAGE)
@@ -7307,53 +7088,72 @@ def index():
 
 @app.route("/uploads/<path:filename>")
 def serve_upload(filename):
-    safe_name = os.path.basename(filename)
-    return send_from_directory(UPLOAD_DIR, safe_name, conditional=True)
+    return send_from_directory(UPLOAD_DIR, filename)
 
 
-@app.post("/api/upload-video")
-def upload_video():
-    f = request.files.get("video")
-    if not f or not f.filename:
-        return jsonify({"ok": False, "error": "Видеофайл не выбран"})
-    mime = (f.mimetype or "").lower()
-    ext = os.path.splitext(secure_filename(f.filename))[1].lower()
-    allowed_exts = {".mp4", ".webm", ".mov", ".m4v", ".3gp", ".ogg"}
-    if not mime.startswith("video/") and ext not in allowed_exts:
-        return jsonify({"ok": False, "error": "Поддерживаются только видеофайлы"})
-
-    f.seek(0, os.SEEK_END)
-    size = f.tell()
-    f.seek(0)
-    if size <= 0:
-        return jsonify({"ok": False, "error": "Пустой видеофайл"})
-    if size > MAX_VIDEO_BYTES:
-        return jsonify({"ok": False, "error": "Видео слишком большое (максимум 25 МБ)"})
-
-    if not ext:
-        ext = ".mp4"
-    stored_name = f"{uuid.uuid4().hex}{ext}"
-    out_path = os.path.join(UPLOAD_DIR, stored_name)
-    f.save(out_path)
-    return jsonify({"ok": True, "videoUrl": f"/uploads/{stored_name}"})
+@app.errorhandler(413)
+def file_too_large(_err):
+    return jsonify({"ok": False, "error": "Файл слишком большой. Максимум — 25 МБ."}), 413
 
 
-@app.post("/api/register")
-def register():
-    data = request.get_json(force=True) or {}
+def get_session_user():
+    nick = (request.cookies.get("grusha_session") or "").strip()
+    if not nick:
+        return None
+    row = get_user(nick)
+    if not row:
+        return None
+    touch_user_online(row["username"])
+    return row
+
+
+def attach_session_cookie(resp, username):
+    resp.set_cookie(
+        "grusha_session",
+        username,
+        max_age=30 * 24 * 3600,
+        httponly=True,
+        samesite="Lax",
+        path="/",
+    )
+    return resp
+
+
+@app.route("/api/me")
+def api_me():
+    row = get_session_user()
+    if not row:
+        return jsonify({"ok": False})
+    return jsonify({"ok": True, "user": format_user(row)})
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    row = get_session_user()
+    if row:
+        end_user_calls(row["username"])
+        TYPING_STATUS.pop(row["username"], None)
+    resp = make_response(jsonify({"ok": True}))
+    resp.delete_cookie("grusha_session", path="/")
+    return resp
+
+
+@app.route("/api/register", methods=["POST"])
+def api_register():
+    data = request.get_json(force=True, silent=True) or {}
     u = (data.get("username") or "").strip()
     p = data.get("password") or ""
     if len(u) < 2 or len(u) > 24:
-        return jsonify({"ok": False, "error": "Никнейм: от 2 до 24 символов"})
+        return jsonify({"ok": False, "error": "Никнейм от 2 до 24 символов"})
     if len(p) < 3:
-        return jsonify({"ok": False, "error": "Пароль: минимум 3 символа"})
+        return jsonify({"ok": False, "error": "Пароль минимум 3 символа"})
     if is_nick_banned(u):
-        return jsonify({"ok": False, "error": "Этот никнейм забанен"})
-    if get_user(u):
+        return jsonify({"ok": False, "error": "Этот никнейм заблокирован администратором"})
+    if find_user_by_nick_ci(u):
         return jsonify({"ok": False, "error": "Такой никнейм уже занят"})
 
     now = int(time.time() * 1000)
-    default_em = "🙂" if is_owner_nick(u) else DEFAULT_USER_EMOJI
+    default_em = DEFAULT_USER_EMOJI
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
@@ -7376,82 +7176,81 @@ def register():
         save_json_db(db)
 
     touch_user_online(u)
-    row = get_user(u)
-    return jsonify({"ok": True, "user": format_user(row)})
+    user_obj = format_user(get_user(u))
+    resp = make_response(jsonify({"ok": True, "user": user_obj}))
+    return attach_session_cookie(resp, u)
 
 
-@app.post("/api/login")
-def login():
-    data = request.get_json(force=True) or {}
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json(force=True, silent=True) or {}
     u = (data.get("username") or "").strip()
     p = data.get("password") or ""
-    if is_nick_banned(u):
-        return jsonify({"ok": False, "error": "Этот никнейм забанен"})
-    row = get_user(u)
+    row = get_user(u) or find_user_by_nick_ci(u)
     if not row or row["password"] != p:
         return jsonify({"ok": False, "error": "Неверный никнейм или пароль"})
-    touch_user_online(u)
-    return jsonify({"ok": True, "user": format_user(row)})
+    real_nick = row["username"]
+    if is_nick_banned(real_nick) and not is_user_banned(row):
+        return jsonify({"ok": False, "error": "Этот никнейм заблокирован администратором"})
+    touch_user_online(real_nick)
+    resp = make_response(jsonify({"ok": True, "user": format_user(row)}))
+    return attach_session_cookie(resp, real_nick)
 
 
-@app.get("/api/me")
-def me_info():
+@app.route("/api/user")
+def api_user():
     u = (request.args.get("username") or "").strip()
-    if is_nick_banned(u):
-        return jsonify({"ok": False, "error": "Этот никнейм забанен"})
-    row = get_user(u)
+    row = get_user(u) or find_user_by_nick_ci(u)
     if not row:
         return jsonify({"ok": False})
-    touch_user_online(u)
     return jsonify({"ok": True, "user": format_user(row)})
 
 
-@app.post("/api/ping")
-def ping_user():
-    data = request.get_json(force=True) or {}
-    u = (data.get("username") or "").strip()
-    if not u:
-        return jsonify({"ok": False})
-    touch_user_online(u)
-    return jsonify({"ok": True})
-
-
-@app.get("/api/presence")
-def presence_info():
+@app.route("/api/presence")
+def api_presence():
     u = (request.args.get("user") or "").strip()
     if not u:
         return jsonify({"ok": False})
-    info = get_user_online_info(u)
-    return jsonify({"ok": True, "user": u, "online": info["online"], "lastSeen": info["lastSeen"]})
+    row = get_user(u) or find_user_by_nick_ci(u)
+    if not row:
+        return jsonify({"ok": False})
+    info = get_user_online_info(row["username"])
+    return jsonify({"ok": True, "online": info["online"], "lastSeen": info["lastSeen"]})
 
 
-@app.get("/api/search")
-def search():
+@app.route("/api/search")
+def api_search():
     q = (request.args.get("q") or "").strip().lower()
     ex = (request.args.get("exclude") or "").strip()
     if not q:
         return jsonify({"users": []})
     out = []
-    for row in get_all_users_rows():
-        uname = row["username"]
-        if uname == ex:
-            continue
-        if is_user_banned(row):
-            continue
-        if uname.lower().startswith(q):
-            out.append(format_user(row))
-    return jsonify({"users": out})
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM users WHERE LOWER(username) LIKE %s ORDER BY username ASC LIMIT 30", (q + "%",))
+                for r in cur.fetchall():
+                    if r["username"] != ex:
+                        out.append(format_user(r))
+    else:
+        db = load_json_db()
+        for uname, r in db["users"].items():
+            if uname != ex and uname.lower().startswith(q):
+                out.append(format_user(r))
+        out.sort(key=lambda x: x["username"].lower())
+    return jsonify({"users": out[:30]})
 
 
-@app.post("/api/emoji")
-def set_emoji():
-    data = request.get_json(force=True) or {}
+@app.route("/api/emoji", methods=["POST"])
+def api_emoji():
+    data = request.get_json(force=True, silent=True) or {}
     u = (data.get("username") or "").strip()
     row = get_user(u)
     if not row:
         return jsonify({"ok": False})
+    touch_user_online(u)
     if is_user_banned(row):
-        return jsonify({"ok": False, "error": "Пользователь забанен"})
+        return jsonify({"ok": True, "emoji": BANNED_EMOJI})
     em = sanitize_user_emoji(data.get("emoji"), banned=False)
     if USE_PG:
         with get_pg_conn() as conn:
@@ -7465,139 +7264,160 @@ def set_emoji():
     return jsonify({"ok": True, "emoji": em})
 
 
-@app.post("/api/avatar-photo")
-def set_avatar_photo():
-    data = request.get_json(force=True) or {}
+@app.route("/api/avatar-photo", methods=["POST"])
+def api_avatar_photo():
+    data = request.get_json(force=True, silent=True) or {}
     u = (data.get("username") or "").strip()
     row = get_user(u)
     if not row:
         return jsonify({"ok": False, "error": "Пользователь не найден"})
+    touch_user_online(u)
     if is_user_banned(row):
-        return jsonify({"ok": False, "error": "Пользователь забанен"})
+        return jsonify({"ok": False, "error": "Заблокированному пользователю нельзя менять аватарку"})
     if not can_use_photo_avatar(u, row):
-        return jsonify({"ok": False, "error": "Установка фото на аватарку недоступна для этого аккаунта"})
-    photo = sanitize_avatar_photo(data.get("avatarPhoto"), u, row)
+        return jsonify({"ok": False, "error": "Установка фото на аватарку доступна только для «Пъдпъдък»"})
+    raw_photo = data.get("avatarPhoto") or ""
+    clean_photo = sanitize_avatar_photo(raw_photo, u, row)
+    if raw_photo and not clean_photo:
+        return jsonify({"ok": False, "error": "Некорректное или слишком большое изображение"})
+
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE users SET avatar_photo = %s WHERE username = %s", (photo, u))
+                cur.execute("UPDATE users SET avatar_photo = %s WHERE username = %s", (clean_photo, u))
     else:
         db = load_json_db()
         if u in db["users"]:
-            db["users"][u]["avatarPhoto"] = photo
+            db["users"][u]["avatarPhoto"] = clean_photo
             save_json_db(db)
-    return jsonify({"ok": True, "avatarPhoto": photo})
+    return jsonify({"ok": True, "avatarPhoto": clean_photo})
 
 
-@app.post("/api/privacy")
-def set_privacy():
-    data = request.get_json(force=True) or {}
+@app.route("/api/privacy", methods=["POST"])
+def api_privacy():
+    data = request.get_json(force=True, silent=True) or {}
     u = (data.get("username") or "").strip()
     row = get_user(u)
     if not row:
         return jsonify({"ok": False, "error": "Пользователь не найден"})
-    priv = sanitize_dm_privacy(data.get("dmPrivacy"))
+    touch_user_online(u)
+    mode = sanitize_dm_privacy(data.get("dmPrivacy"))
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("UPDATE users SET dm_privacy = %s WHERE username = %s", (priv, u))
+                cur.execute("UPDATE users SET dm_privacy = %s WHERE username = %s", (mode, u))
     else:
         db = load_json_db()
         if u in db["users"]:
-            db["users"][u]["dmPrivacy"] = priv
+            db["users"][u]["dmPrivacy"] = mode
             save_json_db(db)
-    return jsonify({"ok": True, "dmPrivacy": priv})
+    return jsonify({"ok": True, "dmPrivacy": mode})
 
 
-@app.post("/api/nick")
-def change_nick():
-    data = request.get_json(force=True) or {}
+@app.route("/api/change-nick", methods=["POST"])
+def api_change_nick():
+    data = request.get_json(force=True, silent=True) or {}
     old_u = (data.get("oldUsername") or "").strip()
     new_u = (data.get("newUsername") or "").strip()
     if len(new_u) < 2 or len(new_u) > 24:
-        return jsonify({"ok": False, "error": "Никнейм: от 2 до 24 символов"})
+        return jsonify({"ok": False, "error": "Никнейм от 2 до 24 символов"})
+    if is_nick_banned(new_u):
+        return jsonify({"ok": False, "error": "Этот никнейм заблокирован администратором"})
+
     row = get_user(old_u)
     if not row:
         return jsonify({"ok": False, "error": "Пользователь не найден"})
+    touch_user_online(old_u)
     if is_user_banned(row):
-        return jsonify({"ok": False, "error": "Пользователь забанен"})
-    if new_u == old_u:
-        return jsonify({"ok": False, "error": "Это уже ваш текущий никнейм"})
-    if is_nick_banned(new_u):
-        return jsonify({"ok": False, "error": "Этот никнейм забанен"})
-    if get_user(new_u):
-        return jsonify({"ok": False, "error": "Этот никнейм уже занят"})
+        return jsonify({"ok": False, "error": "Заблокированный пользователь не может сменить никнейм"})
 
     now = int(time.time() * 1000)
     created_at = int(row.get("createdAt", row.get("created_at", now)) or now)
     last_change = int(row.get("lastNickChangeAt", row.get("last_nick_change_at", created_at)) or created_at)
     if now - last_change < SEVEN_DAYS_MS:
-        rem = SEVEN_DAYS_MS - (now - last_change)
-        days_left = rem // 86400000
-        hours_left = max(1, (rem % 86400000 + 3599999) // 3600000)
+        remaining = SEVEN_DAYS_MS - (now - last_change)
+        days_left = int(remaining // 86400000)
+        hours_left = max(1, int(((remaining % 86400000) + 3599999) // 3600000))
         return jsonify({"ok": False, "error": f"Сменить никнейм можно раз в 7 дней. Осталось: {days_left} дн. {hours_left} ч."})
 
-    em = sanitize_user_emoji(row.get("emoji"), banned=False)
-    if is_owner_nick(new_u) and em == DEFAULT_USER_EMOJI:
-        em = "🙂"
-    photo = sanitize_avatar_photo(row.get("avatarPhoto", row.get("avatar_photo", "")), new_u, row)
-    priv = sanitize_dm_privacy(row.get("dmPrivacy", row.get("dm_privacy", "all")))
+    if new_u == old_u:
+        return jsonify({"ok": True, "user": format_user(row)})
+
+    if get_user(new_u) or find_user_by_nick_ci(new_u):
+        return jsonify({"ok": False, "error": "Такой никнейм уже занят"})
+
+    end_user_calls(old_u, now)
+    USER_LAST_SEEN.pop(old_u, None)
+    touch_user_online(new_u)
 
     if USE_PG:
         with get_pg_conn() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "INSERT INTO users (username, password, emoji, avatar_photo, dm_privacy, banned, created_at, last_nick_change_at) VALUES (%s, %s, %s, %s, %s, FALSE, %s, %s)",
-                    (new_u, row["password"], em, photo, priv, created_at, now),
+                    "INSERT INTO users (username, password, emoji, avatar_photo, dm_privacy, banned, created_at, last_nick_change_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        new_u,
+                        row["password"],
+                        sanitize_user_emoji(row.get("emoji"), banned=is_user_banned(row)),
+                        sanitize_avatar_photo(row.get("avatar_photo", ""), new_u, row),
+                        sanitize_dm_privacy(row.get("dm_privacy", "all")),
+                        is_user_banned(row),
+                        created_at,
+                        now,
+                    ),
                 )
-                cur.execute("DELETE FROM users WHERE username = %s", (old_u,))
-                cur.execute("SELECT id, chat_key FROM messages")
-                for mrow in cur.fetchall():
-                    parts = (mrow[1] or "").split("::")
-                    if len(parts) == 2 and old_u in parts:
-                        other = parts[0] if parts[1] == old_u else parts[1]
-                        new_key = chat_key(new_u, other)
-                        cur.execute("UPDATE messages SET chat_key = %s WHERE id = %s", (new_key, mrow[0]))
-                cur.execute("UPDATE messages SET sender = %s WHERE sender = %s", (new_u, old_u))
-                cur.execute("UPDATE groups SET owner = %s WHERE owner = %s", (new_u, old_u))
-                cur.execute("SELECT id, members_json, muted_json FROM groups")
-                for grow in cur.fetchall():
-                    m_list = [new_u if x == old_u else x for x in parse_json_list(grow[1])]
-                    mu_list = [new_u if x == old_u else x for x in parse_json_list(grow[2])]
+                cur.execute("SELECT id, chat_key, sender, reactions_json FROM messages WHERE chat_key LIKE %s OR sender = %s", (f"%{old_u}%", old_u))
+                for m in cur.fetchall():
+                    parts = m["chat_key"].split("::")
+                    new_key = "::".join(sorted([new_u if p == old_u else p for p in parts]))
+                    new_sender = new_u if m["sender"] == old_u else m["sender"]
+                    rx = parse_json_dict(m.get("reactions_json"))
+                    for em_k, u_list in list(rx.items()):
+                        rx[em_k] = [new_u if x == old_u else x for x in u_list]
                     cur.execute(
-                        "UPDATE groups SET members_json = %s, muted_json = %s WHERE id = %s",
-                        (json.dumps(m_list, ensure_ascii=False), json.dumps(mu_list, ensure_ascii=False), grow[0]),
+                        "UPDATE messages SET chat_key = %s, sender = %s, reactions_json = %s WHERE id = %s",
+                        (new_key, new_sender, json.dumps(rx, ensure_ascii=False), m["id"]),
                     )
-                cur.execute("UPDATE group_messages SET sender = %s WHERE sender = %s", (new_u, old_u))
+                cur.execute("SELECT id, sender, reactions_json FROM group_messages WHERE sender = %s OR reactions_json LIKE %s", (old_u, f"%{old_u}%"))
+                for gm in cur.fetchall():
+                    new_sender = new_u if gm["sender"] == old_u else gm["sender"]
+                    rx = parse_json_dict(gm.get("reactions_json"))
+                    for em_k, u_list in list(rx.items()):
+                        rx[em_k] = [new_u if x == old_u else x for x in u_list]
+                    cur.execute(
+                        "UPDATE group_messages SET sender = %s, reactions_json = %s WHERE id = %s",
+                        (new_sender, json.dumps(rx, ensure_ascii=False), gm["id"]),
+                    )
+                cur.execute("SELECT id, owner, members_json, muted_json FROM groups")
+                for g in cur.fetchall():
+                    g_owner = new_u if g["owner"] == old_u else g["owner"]
+                    members = [new_u if x == old_u else x for x in parse_json_list(g["members_json"])]
+                    muted = [new_u if x == old_u else x for x in parse_json_list(g["muted_json"])]
+                    cur.execute(
+                        "UPDATE groups SET owner = %s, members_json = %s, muted_json = %s WHERE id = %s",
+                        (g_owner, json.dumps(members, ensure_ascii=False), json.dumps(muted, ensure_ascii=False), g["id"]),
+                    )
+                cur.execute("DELETE FROM users WHERE username = %s", (old_u,))
     else:
         db = load_json_db()
-        db["users"][new_u] = {
-            "username": new_u,
-            "password": row["password"],
-            "emoji": em,
-            "avatarPhoto": photo,
-            "dmPrivacy": priv,
-            "banned": False,
-            "createdAt": created_at,
-            "lastNickChangeAt": now,
-        }
-        db["users"].pop(old_u, None)
+        old_obj = db["users"].pop(old_u)
+        old_obj["username"] = new_u
+        old_obj["lastNickChangeAt"] = now
+        db["users"][new_u] = old_obj
 
         new_chats = {}
         for k, msgs in db["chats"].items():
             parts = k.split("::")
-            if len(parts) == 2 and old_u in parts:
-                other = parts[0] if parts[1] == old_u else parts[1]
-                nk = chat_key(new_u, other)
-                for m in msgs:
-                    if m.get("from") == old_u:
-                        m["from"] = new_u
-                new_chats.setdefault(nk, []).extend(msgs)
-            else:
-                for m in msgs:
-                    if m.get("from") == old_u:
-                        m["from"] = new_u
-                new_chats[k] = msgs
+            nk = "::".join(sorted([new_u if p == old_u else p for p in parts]))
+            for m in msgs:
+                if m.get("from") == old_u:
+                    m["from"] = new_u
+                rx = m.get("reactions")
+                if isinstance(rx, dict):
+                    for em_k, u_list in list(rx.items()):
+                        if isinstance(u_list, list):
+                            rx[em_k] = [new_u if x == old_u else x for x in u_list]
+            new_chats.setdefault(nk, []).extend(msgs)
         db["chats"] = new_chats
 
         for _, g in db["groups"].items():
@@ -7607,135 +7427,298 @@ def change_nick():
             g["muted"] = [new_u if x == old_u else x for x in (g.get("muted") or [])]
 
         for _, gmsgs in db["group_msgs"].items():
-            for m in gmsgs:
-                if m.get("from") == old_u:
-                    m["from"] = new_u
+            for gm in gmsgs:
+                if gm.get("from") == old_u:
+                    gm["from"] = new_u
+                rx = gm.get("reactions")
+                if isinstance(rx, dict):
+                    for em_k, u_list in list(rx.items()):
+                        if isinstance(u_list, list):
+                            rx[em_k] = [new_u if x == old_u else x for x in u_list]
 
         save_json_db(db)
 
     updated_row = get_user(new_u)
-    return jsonify({"ok": True, "user": format_user(updated_row)})
+    resp = make_response(jsonify({"ok": True, "user": format_user(updated_row)}))
+    return attach_session_cookie(resp, new_u)
 
 
-@app.post("/api/delete-account")
-def delete_account():
-    data = request.get_json(force=True) or {}
+@app.route("/api/delete-account", methods=["POST"])
+def api_delete_account():
+    data = request.get_json(force=True, silent=True) or {}
     u = (data.get("username") or "").strip()
     if not u:
         return jsonify({"ok": False})
     end_user_calls(u)
+    USER_LAST_SEEN.pop(u, None)
 
     if USE_PG:
         with get_pg_conn() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute("DELETE FROM users WHERE username = %s", (u,))
-                cur.execute("SELECT id, chat_key FROM messages")
-                for mrow in cur.fetchall():
-                    parts = (mrow[1] or "").split("::")
-                    if len(parts) == 2 and u in parts:
-                        cur.execute("DELETE FROM messages WHERE id = %s", (mrow[0],))
+                cur.execute("DELETE FROM messages WHERE chat_key LIKE %s OR sender = %s", (f"%{u}%", u))
                 cur.execute("SELECT id, owner, members_json, muted_json FROM groups")
-                for grow in cur.fetchall():
-                    gid, gowner = grow[0], grow[1]
-                    if gowner == u:
-                        cur.execute("DELETE FROM group_messages WHERE group_id = %s", (gid,))
-                        cur.execute("DELETE FROM groups WHERE id = %s", (gid,))
+                for g in cur.fetchall():
+                    members = [x for x in parse_json_list(g["members_json"]) if x != u]
+                    muted = [x for x in parse_json_list(g["muted_json"]) if x != u]
+                    if g["owner"] == u:
+                        if members:
+                            cur.execute(
+                                "UPDATE groups SET owner = %s, members_json = %s, muted_json = %s WHERE id = %s",
+                                (members[0], json.dumps(members, ensure_ascii=False), json.dumps(muted, ensure_ascii=False), g["id"]),
+                            )
+                        else:
+                            cur.execute("DELETE FROM groups WHERE id = %s", (g["id"],))
+                            cur.execute("DELETE FROM group_messages WHERE group_id = %s", (g["id"],))
                     else:
-                        m_list = [x for x in parse_json_list(grow[2]) if x != u]
-                        mu_list = [x for x in parse_json_list(grow[3]) if x != u]
                         cur.execute(
                             "UPDATE groups SET members_json = %s, muted_json = %s WHERE id = %s",
-                            (json.dumps(m_list, ensure_ascii=False), json.dumps(mu_list, ensure_ascii=False), gid),
+                            (json.dumps(members, ensure_ascii=False), json.dumps(muted, ensure_ascii=False), g["id"]),
                         )
     else:
         db = load_json_db()
         db["users"].pop(u, None)
-        db["chats"] = {
-            k: v for k, v in db["chats"].items()
-            if not (len(k.split("::")) == 2 and u in k.split("::"))
-        }
-        rem_groups = {}
+        db["chats"] = {k: v for k, v in db["chats"].items() if u not in k.split("::")}
+        empty_gids = []
         for gid, g in db["groups"].items():
+            g["members"] = [x for x in (g.get("members") or []) if x != u]
+            g["muted"] = [x for x in (g.get("muted") or []) if x != u]
             if g.get("owner") == u:
-                db["group_msgs"].pop(gid, None)
-            else:
-                g["members"] = [x for x in (g.get("members") or []) if x != u]
-                g["muted"] = [x for x in (g.get("muted") or []) if x != u]
-                rem_groups[gid] = g
-        db["groups"] = rem_groups
+                if g["members"]:
+                    g["owner"] = g["members"][0]
+                else:
+                    empty_gids.append(gid)
+        for gid in empty_gids:
+            db["groups"].pop(gid, None)
+            db["group_msgs"].pop(gid, None)
         save_json_db(db)
 
-    return jsonify({"ok": True})
+    resp = make_response(jsonify({"ok": True}))
+    resp.delete_cookie("grusha_session", path="/")
+    return resp
 
 
-@app.get("/api/admin/messages")
-def admin_messages_get():
-    u = (request.args.get("user") or "").strip()
-    if not is_owner_nick(u):
-        return jsonify({"ok": False, "error": "Доступ запрещён"})
-    return jsonify({"ok": True, "messages": get_admin_messages()})
-
-
-@app.post("/api/admin/command")
-def admin_command_post():
-    data = request.get_json(force=True) or {}
-    actor = (data.get("actor") or "").strip()
-    raw_text = (data.get("text") or "").strip()
-    if not is_owner_nick(actor):
-        return jsonify({"ok": False, "error": "Доступ запрещён"})
-    if not raw_text:
-        return jsonify({"ok": False, "error": "Пустая команда"})
-    append_admin_message(actor, raw_text)
-    result_text = execute_admin_command(raw_text)
-    append_admin_message("system", result_text)
-    urow = get_user(actor)
-    return jsonify({
-        "ok": True,
-        "result": result_text,
-        "user": format_user(urow) if urow else None,
-    })
-
-
-@app.post("/api/admin/delete")
-def admin_message_delete():
-    data = request.get_json(force=True) or {}
-    actor = (data.get("actor") or "").strip()
-    msg_id = data.get("msgId")
-    if not is_owner_nick(actor):
-        return jsonify({"ok": False, "error": "Доступ запрещён"})
+@app.route("/api/chats/delete", methods=["POST"])
+def api_delete_direct_chat():
+    data = request.get_json(force=True, silent=True) or {}
+    a = (data.get("a") or "").strip()
+    b = (data.get("b") or "").strip()
+    if not a or not b:
+        return jsonify({"ok": False, "error": "Не указан чат"})
+    touch_user_online(a)
+    ck = chat_key(a, b)
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM admin_messages WHERE id = %s", (int(msg_id),))
+                cur.execute("DELETE FROM messages WHERE chat_key = %s", (ck,))
     else:
         db = load_json_db()
-        admin_obj = db.setdefault("admin", {"msgs": [], "bannedNicks": []})
-        admin_obj["msgs"] = [m for m in (admin_obj.get("msgs") or []) if str(m.get("id")) != str(msg_id)]
+        db["chats"].pop(ck, None)
         save_json_db(db)
     return jsonify({"ok": True})
 
 
-@app.post("/api/groups/create")
-def create_group():
-    data = request.get_json(force=True) or {}
+@app.route("/api/chats")
+def api_chats():
+    u = (request.args.get("user") or "").strip()
+    if not u:
+        return jsonify({"ok": True, "chats": []})
+    touch_user_online(u)
+    now = int(time.time() * 1000)
+
+    def summarize_msg(last):
+        if not last:
+            return ""
+        txt = (last.get("text") or "").strip()
+        if txt:
+            return txt
+        if last.get("video"):
+            return "🎬 Видео"
+        if last.get("image"):
+            return "📷 Фотография"
+        return ""
+
+    out = []
+    if is_owner_nick(u):
+        admin_msgs = get_admin_messages()
+        last_adm_txt = summarize_msg(admin_msgs[-1]) if admin_msgs else "Команды: /ban <ник>, /razban <ник>"
+        out.append({
+            "type": "admin",
+            "username": "Администратор",
+            "title": "Чат администратора",
+            "emoji": "🛡️",
+            "isOwner": True,
+            "last": last_adm_txt,
+            "ts": int(admin_msgs[-1]["ts"]) if admin_msgs else now + 10_000_000,
+            "typing": False,
+        })
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT DISTINCT chat_key FROM messages WHERE chat_key LIKE %s OR chat_key LIKE %s", (f"{u}::%", f"%::{u}"))
+                keys = [r["chat_key"] for r in cur.fetchall()]
+                for k in keys:
+                    parts = k.split("::")
+                    if len(parts) != 2 or u not in parts:
+                        continue
+                    peer = parts[1] if parts[0] == u else parts[0]
+                    cur.execute("SELECT sender, text, image, video, ts FROM messages WHERE chat_key = %s ORDER BY id DESC LIMIT 1", (k,))
+                    last = cur.fetchone()
+                    if not last:
+                        continue
+                    prow = get_user(peer)
+                    p_banned = is_user_banned(prow) if prow else False
+                    p_emoji = sanitize_user_emoji(prow.get("emoji") if prow else DEFAULT_USER_EMOJI, banned=p_banned)
+                    p_photo = sanitize_avatar_photo(prow.get("avatar_photo") if prow else "", peer, prow)
+                    p_disp = "ПОЛЬЗОВАТЕЛЬ ЗАБАНЕН" if p_banned else peer
+                    out.append({
+                        "type": "direct",
+                        "username": peer,
+                        "displayName": p_disp,
+                        "banned": p_banned,
+                        "emoji": p_emoji,
+                        "avatarPhoto": p_photo,
+                        "isOwner": is_owner_nick(peer) and not p_banned,
+                        "last": summarize_msg(last),
+                        "ts": int(last["ts"] or 0),
+                        "typing": is_peer_typing(peer, u),
+                    })
+
+                cur.execute("SELECT * FROM groups ORDER BY created_at DESC")
+                for g in cur.fetchall():
+                    g_obj = format_group_row(g)
+                    if u not in g_obj["members"]:
+                        continue
+                    cur.execute("SELECT sender, text, image, video, ts FROM group_messages WHERE group_id = %s ORDER BY id DESC LIMIT 1", (g_obj["id"],))
+                    glast = cur.fetchone()
+                    last_txt = ""
+                    last_ts = g_obj["createdAt"]
+                    if glast:
+                        last_ts = int(glast["ts"] or last_ts)
+                        s_txt = summarize_msg(glast)
+                        if glast["sender"] == "system":
+                            last_txt = s_txt
+                        else:
+                            last_txt = f"{glast['sender']}: {s_txt}" if s_txt else ""
+                    typers = get_group_typing_users(g_obj["id"], u)
+                    out.append({
+                        "type": "group",
+                        "groupId": g_obj["id"],
+                        "title": g_obj["title"],
+                        "emoji": g_obj["emoji"],
+                        "owner": g_obj["owner"],
+                        "callAccess": g_obj["callAccess"],
+                        "tripleBadge": g_obj["tripleBadge"],
+                        "last": last_txt,
+                        "ts": last_ts,
+                        "typingText": ", ".join(typers),
+                    })
+    else:
+        db = load_json_db()
+        for k, msgs in db["chats"].items():
+            parts = k.split("::")
+            if len(parts) == 2 and u in parts and msgs:
+                peer = parts[1] if parts[0] == u else parts[0]
+                last = msgs[-1]
+                prow = db["users"].get(peer)
+                p_banned = is_user_banned(prow) if prow else False
+                p_emoji = sanitize_user_emoji(prow.get("emoji") if prow else DEFAULT_USER_EMOJI, banned=p_banned)
+                p_photo = sanitize_avatar_photo(prow.get("avatarPhoto") if prow else "", peer, prow)
+                p_disp = "ПОЛЬЗОВАТЕЛЬ ЗАБАНЕН" if p_banned else peer
+                out.append({
+                    "type": "direct",
+                    "username": peer,
+                    "displayName": p_disp,
+                    "banned": p_banned,
+                    "emoji": p_emoji,
+                    "avatarPhoto": p_photo,
+                    "isOwner": is_owner_nick(peer) and not p_banned,
+                    "last": summarize_msg(last),
+                    "ts": int(last.get("ts") or 0),
+                    "typing": is_peer_typing(peer, u),
+                })
+
+        for gid, g in db["groups"].items():
+            if u not in (g.get("members") or []):
+                continue
+            g_emoji = normalize_group_emoji(g.get("emoji"))
+            title = g.get("title") or "Группа"
+            gmsgs = db["group_msgs"].get(gid) or []
+            last_txt = ""
+            last_ts = int(g.get("createdAt") or 0)
+            if gmsgs:
+                glast = gmsgs[-1]
+                last_ts = int(glast.get("ts") or last_ts)
+                s_txt = summarize_msg(glast)
+                if glast.get("from") == "system":
+                    last_txt = s_txt
+                else:
+                    last_txt = f"{glast.get('from')}: {s_txt}" if s_txt else ""
+            typers = get_group_typing_users(gid, u)
+            out.append({
+                "type": "group",
+                "groupId": gid,
+                "title": title,
+                "emoji": g_emoji,
+                "owner": g.get("owner") or "",
+                "callAccess": sanitize_call_access(g.get("callAccess")),
+                "tripleBadge": is_triple_badge_group(title),
+                "last": last_txt,
+                "ts": last_ts,
+                "typingText": ", ".join(typers),
+            })
+
+    out.sort(key=lambda x: x.get("ts", 0), reverse=True)
+    return jsonify({"ok": True, "chats": out})
+
+
+@app.route("/api/admin/messages")
+def api_admin_messages():
+    actor = (request.args.get("actor") or "").strip()
+    if not is_owner_nick(actor):
+        return jsonify({"ok": False, "error": "Доступ запрещён"})
+    touch_user_online(actor)
+    return jsonify({"ok": True, "messages": get_admin_messages()})
+
+
+@app.route("/api/admin/command", methods=["POST"])
+def api_admin_command():
+    data = request.get_json(force=True, silent=True) or {}
+    actor = (data.get("actor") or "").strip()
+    text = (data.get("text") or "").strip()
+    if not is_owner_nick(actor):
+        return jsonify({"ok": False, "error": "Доступ запрещён"})
+    if not text:
+        return jsonify({"ok": False, "error": "Пустая команда"})
+    touch_user_online(actor)
+    append_admin_message(actor, text)
+    reply_txt = execute_admin_command(text)
+    append_admin_message("Система", reply_txt)
+    return jsonify({"ok": True, "result": reply_txt})
+
+
+@app.route("/api/groups/create", methods=["POST"])
+def api_groups_create():
+    data = request.get_json(force=True, silent=True) or {}
     owner = (data.get("owner") or "").strip()
     title = (data.get("title") or "").strip()
     emoji = normalize_group_emoji(data.get("emoji"))
     raw_members = data.get("members") or []
-    if not owner or not get_user(owner):
-        return jsonify({"ok": False, "error": "Пользователь не найден"})
+    if not owner:
+        return jsonify({"ok": False, "error": "Не указан владелец"})
+    touch_user_online(owner)
     if not title:
         return jsonify({"ok": False, "error": "Введите название группы"})
     if len(title) > 40:
-        return jsonify({"ok": False, "error": "Название группы: до 40 символов"})
+        return jsonify({"ok": False, "error": "Название группы до 40 символов"})
     if is_group_title_taken(title):
         return jsonify({"ok": False, "error": "Группа с таким названием уже существует"})
 
-    allowed_peers = get_direct_peers_with_messages(owner)
     members = [owner]
     for m in raw_members:
         nick = (m or "").strip()
-        if nick and nick != owner and nick in allowed_peers and get_user(nick) and nick not in members:
+        if nick and nick not in members and get_user(nick):
             members.append(nick)
 
     gid = f"grp_{uuid.uuid4().hex[:10]}"
@@ -7764,154 +7747,241 @@ def create_group():
         save_json_db(db)
 
     append_group_system_message(gid, f"{owner} создал группу «{title}»")
-    return jsonify({"ok": True, "group": get_group_by_id(gid)})
+    group_obj = get_group_by_id(gid)
+    return jsonify({"ok": True, "group": group_obj})
 
 
-@app.get("/api/groups/info")
-def group_info():
+@app.route("/api/groups/info")
+def api_groups_info():
     gid = (request.args.get("groupId") or "").strip()
     u = (request.args.get("user") or "").strip()
+    if u:
+        touch_user_online(u)
     g = get_group_by_id(gid)
-    if not g or u not in g["members"]:
+    if not g or (u and u not in g["members"]):
         return jsonify({"ok": False})
     return jsonify({"ok": True, "group": g})
 
 
-@app.post("/api/groups/call-access")
-def group_set_call_access():
-    data = request.get_json(force=True) or {}
+@app.route("/api/groups/call-access", methods=["POST"])
+def api_groups_call_access():
+    data = request.get_json(force=True, silent=True) or {}
     actor = (data.get("actor") or "").strip()
     gid = (data.get("groupId") or "").strip()
     mode = sanitize_call_access(data.get("callAccess"))
+    if actor:
+        touch_user_online(actor)
     g = get_group_by_id(gid)
     if not g:
         return jsonify({"ok": False, "error": "Группа не найдена"})
     if g["owner"] != actor:
-        return jsonify({"ok": False, "error": "Только владелец группы может менять права на звонки"})
-    updated = update_group_record(gid, call_access=mode)
-    return jsonify({"ok": True, "callAccess": updated["callAccess"], "group": updated})
+        return jsonify({"ok": False, "error": "Менять права звонков может только владелец"})
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE groups SET call_access = %s WHERE id = %s", (mode, gid))
+    else:
+        db = load_json_db()
+        if gid in db["groups"]:
+            db["groups"][gid]["callAccess"] = mode
+            save_json_db(db)
+
+    return jsonify({"ok": True, "callAccess": mode})
 
 
-@app.post("/api/groups/update")
-def update_group_meta():
-    data = request.get_json(force=True) or {}
+@app.route("/api/groups/update", methods=["POST"])
+def api_groups_update():
+    data = request.get_json(force=True, silent=True) or {}
     actor = (data.get("actor") or "").strip()
     gid = (data.get("groupId") or "").strip()
     new_title = (data.get("title") or "").strip()
     new_emoji = normalize_group_emoji(data.get("emoji"))
+    if actor:
+        touch_user_online(actor)
+
     g = get_group_by_id(gid)
     if not g:
         return jsonify({"ok": False, "error": "Группа не найдена"})
     if g["owner"] != actor:
-        return jsonify({"ok": False, "error": "Только владелец группы может менять название и иконку"})
+        return jsonify({"ok": False, "error": "Менять название и иконку может только владелец"})
     if not new_title:
         return jsonify({"ok": False, "error": "Введите название группы"})
     if len(new_title) > 40:
-        return jsonify({"ok": False, "error": "Название группы: до 40 символов"})
+        return jsonify({"ok": False, "error": "Название группы до 40 символов"})
     if is_group_title_taken(new_title, exclude_group_id=gid):
         return jsonify({"ok": False, "error": "Группа с таким названием уже существует"})
 
-    updated = update_group_record(gid, title=new_title, emoji=new_emoji)
-    if updated["title"] != g["title"]:
-        append_group_system_message(gid, f"{actor} изменил название группы на «{updated['title']}»")
-    return jsonify({"ok": True, "group": updated})
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE groups SET title = %s, emoji = %s WHERE id = %s", (new_title, new_emoji, gid))
+    else:
+        db = load_json_db()
+        if gid in db["groups"]:
+            db["groups"][gid]["title"] = new_title
+            db["groups"][gid]["emoji"] = new_emoji
+            save_json_db(db)
+
+    append_group_system_message(gid, f"{actor} обновил группу: {new_emoji} «{new_title}»")
+    return jsonify({"ok": True, "group": get_group_by_id(gid)})
 
 
-@app.post("/api/groups/add-members")
-def add_group_members():
-    data = request.get_json(force=True) or {}
+@app.route("/api/groups/add-members", methods=["POST"])
+def api_groups_add_members():
+    data = request.get_json(force=True, silent=True) or {}
     actor = (data.get("actor") or "").strip()
     gid = (data.get("groupId") or "").strip()
     raw_members = data.get("members") or []
+    if actor:
+        touch_user_online(actor)
+
     g = get_group_by_id(gid)
     if not g:
         return jsonify({"ok": False, "error": "Группа не найдена"})
     if g["owner"] != actor:
-        return jsonify({"ok": False, "error": "Только владелец может добавлять участников"})
+        return jsonify({"ok": False, "error": "Добавлять участников может только владелец"})
 
-    allowed_peers = get_direct_peers_with_messages(actor)
     members = list(g["members"])
     added = []
     for m in raw_members:
         nick = (m or "").strip()
-        if nick and nick != actor and nick in allowed_peers and get_user(nick) and nick not in members:
+        if nick and nick not in members and get_user(nick):
             members.append(nick)
             added.append(nick)
 
     if not added:
-        return jsonify({"ok": False, "error": "Нет подходящих пользователей для добавления"})
+        return jsonify({"ok": False, "error": "Нет новых участников для добавления"})
 
-    updated = update_group_record(gid, members=members)
-    append_group_system_message(gid, f"{actor} добавил в группу: {', '.join(added)}", event_kind="join")
-    return jsonify({"ok": True, "added": added, "group": updated})
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE groups SET members_json = %s WHERE id = %s", (json.dumps(members, ensure_ascii=False), gid))
+    else:
+        db = load_json_db()
+        if gid in db["groups"]:
+            db["groups"][gid]["members"] = members
+            save_json_db(db)
+
+    append_group_system_message(gid, f"{actor} добавил в группу: {', '.join(added)}")
+    return jsonify({"ok": True, "added": added, "group": get_group_by_id(gid)})
 
 
-@app.post("/api/groups/leave")
-def leave_group():
-    data = request.get_json(force=True) or {}
+@app.route("/api/groups/leave", methods=["POST"])
+def api_groups_leave():
+    data = request.get_json(force=True, silent=True) or {}
     actor = (data.get("actor") or "").strip()
     gid = (data.get("groupId") or "").strip()
+    if actor:
+        touch_user_online(actor)
     g = get_group_by_id(gid)
-    if not g or actor not in g["members"]:
+    if not g:
         return jsonify({"ok": False})
     if g["owner"] == actor:
-        return jsonify({"ok": False, "error": "Владелец не может выйти из группы, он может её удалить"})
+        return jsonify({"ok": False, "error": "Владелец не может просто выйти — он может удалить группу"})
 
     members = [m for m in g["members"] if m != actor]
     muted = [m for m in g["muted"] if m != actor]
-    update_group_record(gid, members=members, muted=muted)
-    append_group_system_message(gid, f"{actor} вышел из группы", event_kind="leave")
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE groups SET members_json = %s, muted_json = %s WHERE id = %s",
+                    (json.dumps(members, ensure_ascii=False), json.dumps(muted, ensure_ascii=False), gid),
+                )
+    else:
+        db = load_json_db()
+        if gid in db["groups"]:
+            db["groups"][gid]["members"] = members
+            db["groups"][gid]["muted"] = muted
+            save_json_db(db)
+
+    append_group_system_message(gid, f"{actor} вышел", event_kind="leave")
     return jsonify({"ok": True})
 
 
-@app.post("/api/groups/mute")
-def mute_group_member():
-    data = request.get_json(force=True) or {}
+@app.route("/api/groups/mute", methods=["POST"])
+def api_groups_mute():
+    data = request.get_json(force=True, silent=True) or {}
     actor = (data.get("actor") or "").strip()
     gid = (data.get("groupId") or "").strip()
     target = (data.get("target") or "").strip()
+    if actor:
+        touch_user_online(actor)
     g = get_group_by_id(gid)
-    if not g or g["owner"] != actor or target == g["owner"] or target not in g["members"]:
+    if not g or g["owner"] != actor or target == g["owner"]:
         return jsonify({"ok": False})
+
     muted = list(g["muted"])
+    now_muted = False
     if target in muted:
         muted = [m for m in muted if m != target]
-        now_muted = False
     else:
         muted.append(target)
         now_muted = True
-    update_group_record(gid, muted=muted)
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE groups SET muted_json = %s WHERE id = %s", (json.dumps(muted, ensure_ascii=False), gid))
+    else:
+        db = load_json_db()
+        if gid in db["groups"]:
+            db["groups"][gid]["muted"] = muted
+            save_json_db(db)
+
     append_group_system_message(
         gid,
-        f"{actor} запретил писать {target}" if now_muted else f"{actor} разрешил писать {target}"
+        f"Владелец запретил писать {target}" if now_muted else f"Владелец разрешил писать {target}",
     )
     return jsonify({"ok": True, "muted": now_muted})
 
 
-@app.post("/api/groups/kick")
-def kick_group_member():
-    data = request.get_json(force=True) or {}
+@app.route("/api/groups/kick", methods=["POST"])
+def api_groups_kick():
+    data = request.get_json(force=True, silent=True) or {}
     actor = (data.get("actor") or "").strip()
     gid = (data.get("groupId") or "").strip()
     target = (data.get("target") or "").strip()
+    if actor:
+        touch_user_online(actor)
     g = get_group_by_id(gid)
-    if not g or g["owner"] != actor or target == g["owner"] or target not in g["members"]:
+    if not g or g["owner"] != actor or target == g["owner"]:
         return jsonify({"ok": False})
+
     members = [m for m in g["members"] if m != target]
     muted = [m for m in g["muted"] if m != target]
-    update_group_record(gid, members=members, muted=muted)
-    append_group_system_message(gid, f"{actor} удалил {target} из группы", event_kind="leave")
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE groups SET members_json = %s, muted_json = %s WHERE id = %s",
+                    (json.dumps(members, ensure_ascii=False), json.dumps(muted, ensure_ascii=False), gid),
+                )
+    else:
+        db = load_json_db()
+        if gid in db["groups"]:
+            db["groups"][gid]["members"] = members
+            db["groups"][gid]["muted"] = muted
+            save_json_db(db)
+
+    append_group_system_message(gid, f"Владелец удалил {target} из группы")
     return jsonify({"ok": True})
 
 
-@app.post("/api/groups/delete")
-def delete_group():
-    data = request.get_json(force=True) or {}
+@app.route("/api/groups/delete", methods=["POST"])
+def api_groups_delete():
+    data = request.get_json(force=True, silent=True) or {}
     actor = (data.get("actor") or "").strip()
     gid = (data.get("groupId") or "").strip()
+    if actor:
+        touch_user_online(actor)
     g = get_group_by_id(gid)
     if not g or g["owner"] != actor:
         return jsonify({"ok": False})
+
     GROUP_CALLS.pop(gid, None)
     if USE_PG:
         with get_pg_conn() as conn:
@@ -7923,283 +7993,113 @@ def delete_group():
         db["groups"].pop(gid, None)
         db["group_msgs"].pop(gid, None)
         save_json_db(db)
+
     return jsonify({"ok": True})
 
 
-@app.post("/api/chats/delete")
-def delete_direct_chat():
-    data = request.get_json(force=True) or {}
-    a = (data.get("a") or "").strip()
-    b = (data.get("b") or "").strip()
-    if not a or not b:
-        return jsonify({"ok": False})
-    key = chat_key(a, b)
-    if USE_PG:
-        with get_pg_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM messages WHERE chat_key = %s", (key,))
-    else:
-        db = load_json_db()
-        db["chats"].pop(key, None)
-        save_json_db(db)
-    return jsonify({"ok": True})
-
-
-@app.get("/api/chats")
-def chats():
-    u = (request.args.get("user") or "").strip()
-    touch_user_online(u)
-    items = []
-
-    if is_owner_nick(u):
-        admin_msgs = get_admin_messages()
-        last_adm = admin_msgs[-1] if admin_msgs else None
-        items.append({
-            "type": "admin",
-            "title": "Чат администратора",
-            "emoji": "🛡️",
-            "last": format_last_preview(last_adm) if last_adm else "Команды: /ban <ник>, /razban <ник>",
-            "lastTs": int(last_adm["ts"]) if last_adm else int(time.time() * 1000) + 10_000_000_000,
-        })
-
-    for g in get_user_groups(u):
-        g_msgs = get_group_messages_list(g["id"])
-        last = g_msgs[-1] if g_msgs else None
-        typers = get_group_typing_users(g["id"], u)
-        items.append({
-            "type": "group",
-            "groupId": g["id"],
-            "title": g["title"],
-            "emoji": g["emoji"],
-            "owner": g["owner"],
-            "callAccess": g.get("callAccess", "all"),
-            "tripleBadge": g.get("tripleBadge", False),
-            "last": format_last_preview(last),
-            "lastTs": int(last["ts"]) if last else int(g.get("createdAt") or 0),
-            "typingText": ", ".join(typers),
-        })
-
-    peers = set()
-    last_by_peer = {}
-    if USE_PG:
-        with get_pg_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT id, chat_key, sender, text, image, video, ts FROM messages ORDER BY id ASC")
-                rows = cur.fetchall()
-        for r in rows:
-            parts = (r["chat_key"] or "").split("::")
-            if len(parts) == 2 and u in parts:
-                other = parts[0] if parts[1] == u else parts[1]
-                if other and other != u:
-                    peers.add(other)
-                    last_by_peer[other] = {
-                        "text": r["text"],
-                        "image": r["image"],
-                        "video": r.get("video") or "",
-                        "ts": int(r["ts"] or 0),
-                    }
-    else:
-        db = load_json_db()
-        for key, msgs in db["chats"].items():
-            parts = key.split("::")
-            if len(parts) == 2 and u in parts:
-                other = parts[0] if parts[1] == u else parts[1]
-                if other and other != u:
-                    peers.add(other)
-                    if msgs:
-                        lm = msgs[-1]
-                        last_by_peer[other] = {
-                            "text": lm.get("text", ""),
-                            "image": lm.get("image", ""),
-                            "video": lm.get("video", ""),
-                            "ts": int(lm.get("ts") or 0),
-                        }
-
-    for p in peers:
-        urow = get_user(p)
-        banned_flag = bool(is_user_banned(urow) or is_nick_banned(p))
-        em = sanitize_user_emoji(urow["emoji"] if urow else DEFAULT_USER_EMOJI, banned=banned_flag)
-        photo = sanitize_avatar_photo(urow.get("avatarPhoto", urow.get("avatar_photo", "")) if urow else "", p, urow)
-        disp_name = "ПОЛЬЗОВАТЕЛЬ ЗАБАНЕН" if banned_flag else p
-        lm = last_by_peer.get(p)
-        items.append({
-            "type": "direct",
-            "username": p,
-            "displayName": disp_name,
-            "banned": banned_flag,
-            "emoji": em,
-            "avatarPhoto": photo,
-            "isOwner": is_owner_nick(p) and not banned_flag,
-            "last": format_last_preview(lm),
-            "lastTs": lm["ts"] if lm else 0,
-            "typing": is_peer_typing(p, u),
-        })
-
-    items.sort(key=lambda x: x.get("lastTs", 0), reverse=True)
-    return jsonify({"ok": True, "chats": items})
-
-
-@app.post("/api/typing")
-def set_typing():
-    data = request.get_json(force=True) or {}
-    frm = (data.get("from") or "").strip()
-    to = (data.get("to") or "").strip()
-    gid = (data.get("groupId") or "").strip()
-    if not frm:
-        return jsonify({"ok": False})
-    touch_user_online(frm)
-    if gid:
-        TYPING_STATUS[(frm, group_typing_key(gid))] = int(time.time() * 1000)
-    elif to:
-        TYPING_STATUS[(frm, to)] = int(time.time() * 1000)
-    return jsonify({"ok": True})
-
-
-@app.get("/api/messages")
-def get_messages():
-    a = (request.args.get("a") or "").strip()
-    b = (request.args.get("b") or "").strip()
-    if a:
-        touch_user_online(a)
-    peer_row = get_user(b)
-    peer_banned = bool(is_user_banned(peer_row) or is_nick_banned(b))
-    peer_em = sanitize_user_emoji(peer_row["emoji"] if peer_row else DEFAULT_USER_EMOJI, banned=peer_banned)
-    peer_photo = sanitize_avatar_photo(peer_row.get("avatarPhoto", peer_row.get("avatar_photo", "")) if peer_row else "", b, peer_row)
-    peer_disp = "ПОЛЬЗОВАТЕЛЬ ЗАБАНЕН" if peer_banned else b
-    return jsonify({
-        "ok": True,
-        "messages": get_direct_messages_list(a, b),
-        "typing": is_peer_typing(b, a),
-        "peerEmoji": peer_em,
-        "peerAvatarPhoto": peer_photo,
-        "peerBanned": peer_banned,
-        "peerDisplayName": peer_disp,
-        "peerIsOwner": is_owner_nick(b) and not peer_banned,
-    })
-
-
-@app.get("/api/groups/messages")
-def get_group_messages():
+@app.route("/api/groups/messages")
+def api_groups_messages():
     gid = (request.args.get("groupId") or "").strip()
     u = (request.args.get("user") or "").strip()
     if u:
         touch_user_online(u)
     g = get_group_by_id(gid)
-    if not g or u not in g["members"]:
-        return jsonify({"ok": False, "notMember": True})
-    return jsonify({
-        "ok": True,
-        "title": g["title"],
-        "emoji": g["emoji"],
-        "owner": g["owner"],
-        "callAccess": g.get("callAccess", "all"),
-        "tripleBadge": g.get("tripleBadge", False),
-        "muted": u in g["muted"],
-        "typingUsers": get_group_typing_users(gid, u),
-        "messages": get_group_messages_list(gid),
-    })
-
-
-@app.post("/api/send")
-def send_msg():
-    data = request.get_json(force=True) or {}
-    frm = (data.get("from") or "").strip()
-    to = (data.get("to") or "").strip()
-    txt = (data.get("text") or "").strip()
-    img = (data.get("image") or "").strip()
-    vid = sanitize_video_url(data.get("video") or "")
-    rep = sanitize_reply_to(data.get("replyTo"))
-    if len(img) > MAX_IMAGE_LEN:
-        return jsonify({"ok": False, "error": "Слишком большое изображение"})
-    if not frm or not to or (not txt and not img and not vid):
+    if not g or (u and u not in g["members"]):
         return jsonify({"ok": False})
 
-    sender_row = get_user(frm)
-    if is_user_banned(sender_row):
-        return jsonify({"ok": False, "error": "Вы забанены и не можете отправлять сообщения"})
-
-    recipient_row = get_user(to)
-    if is_user_banned(recipient_row):
-        return jsonify({"ok": False, "error": "Пользователь забанен"})
-
-    if recipient_row and sanitize_dm_privacy(recipient_row.get("dmPrivacy", recipient_row.get("dm_privacy", "all"))) == "nobody":
-        return jsonify({"ok": False, "error": "Этот пользователь отключил входящие личные сообщения"})
-
-    touch_user_online(frm)
-    TYPING_STATUS.pop((frm, to), None)
-    ts = int(time.time() * 1000)
-    rep_json = json.dumps(rep, ensure_ascii=False) if rep else ""
+    member_profiles = []
+    for m_nick in g.get("members") or []:
+        urow = get_user(m_nick)
+        if urow:
+            member_profiles.append(format_user(urow))
 
     if USE_PG:
         with get_pg_conn() as conn:
-            with conn.cursor() as cur:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "INSERT INTO messages (chat_key, sender, text, image, video, ts, reply_to_json, reactions_json) VALUES (%s, %s, %s, %s, %s, %s, %s, '{}')",
-                    (chat_key(frm, to), frm, txt, img, vid, ts, rep_json),
+                    "SELECT id, sender, text, image, video, ts, reply_to_json, reactions_json FROM group_messages WHERE group_id = %s ORDER BY id ASC",
+                    (gid,),
                 )
+                rows = cur.fetchall()
+        msgs = [
+            format_message_record(
+                r["id"],
+                r["sender"],
+                r["text"],
+                r["image"],
+                r["ts"],
+                parse_json_dict(r.get("reply_to_json")),
+                parse_json_dict(r.get("reactions_json")),
+                r.get("video") or "",
+            )
+            for r in rows
+        ]
     else:
         db = load_json_db()
-        item = {
-            "id": f"d_{uuid.uuid4().hex[:10]}",
-            "from": frm,
-            "text": txt,
-            "ts": ts,
-            "reactions": {},
-        }
-        if img:
-            item["image"] = img
-        if vid:
-            item["video"] = vid
-        if rep:
-            item["replyTo"] = rep
-        db["chats"].setdefault(chat_key(frm, to), []).append(item)
-        save_json_db(db)
+        raw_list = db["group_msgs"].get(gid) or []
+        msgs = [
+            format_message_record(
+                m.get("id"),
+                m.get("from"),
+                m.get("text"),
+                m.get("image"),
+                m.get("ts"),
+                m.get("replyTo"),
+                m.get("reactions"),
+                m.get("video") or "",
+            )
+            for m in raw_list
+        ]
 
-    return jsonify({"ok": True})
+    return jsonify({
+        "ok": True,
+        "group": g,
+        "memberProfiles": member_profiles,
+        "muted": u in g["muted"],
+        "typingUsers": get_group_typing_users(gid, u),
+        "messages": msgs,
+    })
 
 
-@app.post("/api/groups/send")
-def send_group_msg():
-    data = request.get_json(force=True) or {}
-    frm = (data.get("from") or "").strip()
+@app.route("/api/groups/send", methods=["POST"])
+def api_groups_send():
+    data = request.get_json(force=True, silent=True) or {}
     gid = (data.get("groupId") or "").strip()
-    txt = (data.get("text") or "").strip()
-    img = (data.get("image") or "").strip()
+    sender = (data.get("from") or "").strip()
+    text = (data.get("text") or "").strip()
+    img = data.get("image") or ""
     vid = sanitize_video_url(data.get("video") or "")
     rep = sanitize_reply_to(data.get("replyTo"))
-    if len(img) > MAX_IMAGE_LEN:
-        return jsonify({"ok": False, "error": "Слишком большое изображение"})
+    if sender:
+        touch_user_online(sender)
+    if img and len(img) > MAX_IMAGE_LEN:
+        return jsonify({"ok": False, "error": "Фото слишком большое"})
+    if not text and not img and not vid:
+        return jsonify({"ok": False})
+
     g = get_group_by_id(gid)
-    if not g or frm not in g["members"]:
-        return jsonify({"ok": False})
+    if not g or sender not in g["members"]:
+        return jsonify({"ok": False, "error": "Нет доступа к группе"})
+    if sender in g["muted"]:
+        return jsonify({"ok": False, "error": "Владелец запретил вам писать сообщения в этой группе."})
 
-    sender_row = get_user(frm)
-    if is_user_banned(sender_row):
-        return jsonify({"ok": False, "error": "Вы забанены и не можете отправлять сообщения"})
-
-    if frm in g["muted"]:
-        return jsonify({"ok": False, "muted": True, "error": "Вам запрещено писать в этой группе"})
-    if not txt and not img and not vid:
-        return jsonify({"ok": False})
-
-    touch_user_online(frm)
-    TYPING_STATUS.pop((frm, group_typing_key(gid)), None)
+    TYPING_STATUS.pop((sender, group_typing_key(gid)), None)
     ts = int(time.time() * 1000)
-    rep_json = json.dumps(rep, ensure_ascii=False) if rep else ""
+    reply_json_str = json.dumps(rep, ensure_ascii=False) if rep else ""
 
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO group_messages (group_id, sender, text, image, video, ts, reply_to_json, reactions_json) VALUES (%s, %s, %s, %s, %s, %s, %s, '{}')",
-                    (gid, frm, txt, img, vid, ts, rep_json),
+                    (gid, sender, text, img, vid, ts, reply_json_str),
                 )
     else:
         db = load_json_db()
         item = {
             "id": f"g_{uuid.uuid4().hex[:10]}",
-            "from": frm,
-            "text": txt,
+            "from": sender,
+            "text": text,
             "ts": ts,
             "reactions": {},
         }
@@ -8215,344 +8115,387 @@ def send_group_msg():
     return jsonify({"ok": True})
 
 
-@app.post("/api/messages/delete")
-def delete_direct_message():
-    data = request.get_json(force=True) or {}
-    actor = (data.get("actor") or "").strip()
-    a = (data.get("a") or "").strip()
-    b = (data.get("b") or "").strip()
-    msg_id = data.get("msgId")
-    if not actor or not a or not b or msg_id is None:
-        return jsonify({"ok": False})
-    key = chat_key(a, b)
+@app.route("/api/upload-video", methods=["POST"])
+def api_upload_video():
+    sender = (request.form.get("from") or "").strip()
+    chat_type = (request.form.get("chatType") or "direct").strip()
+    to_user = (request.form.get("to") or "").strip()
+    gid = (request.form.get("groupId") or "").strip()
+    text = (request.form.get("text") or "").strip()
+    raw_reply = request.form.get("replyTo") or ""
+    rep = None
+    if raw_reply:
+        try:
+            rep = sanitize_reply_to(json.loads(raw_reply))
+        except Exception:
+            rep = None
+
+    if not sender:
+        return jsonify({"ok": False, "error": "Не указан отправитель"})
+    touch_user_online(sender)
+
+    file = request.files.get("video")
+    if not file or not file.filename:
+        return jsonify({"ok": False, "error": "Видеофайл не найден"})
+
+    file.seek(0, os.SEEK_END)
+    size_bytes = file.tell()
+    file.seek(0)
+    if size_bytes <= 0:
+        return jsonify({"ok": False, "error": "Пустой видеофайл"})
+    if size_bytes > MAX_VIDEO_BYTES:
+        return jsonify({"ok": False, "error": "Видео слишком большое. Максимум — 25 МБ."})
+
+    ext = os.path.splitext(secure_filename(file.filename))[1].lower()
+    if ext not in (".mp4", ".webm", ".mov", ".m4v", ".3gp", ".ogg"):
+        ext = ".mp4"
+    stored_name = f"vid_{uuid.uuid4().hex}{ext}"
+    save_path = os.path.join(UPLOAD_DIR, stored_name)
+    file.save(save_path)
+    vid_url = f"/uploads/{stored_name}"
+    ts = int(time.time() * 1000)
+    reply_json_str = json.dumps(rep, ensure_ascii=False) if rep else ""
+
+    if chat_type == "group":
+        g = get_group_by_id(gid)
+        if not g or sender not in g["members"]:
+            return jsonify({"ok": False, "error": "Нет доступа к группе"})
+        if sender in g["muted"]:
+            return jsonify({"ok": False, "error": "Владелец запретил вам писать сообщения в этой группе."})
+        if USE_PG:
+            with get_pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO group_messages (group_id, sender, text, image, video, ts, reply_to_json, reactions_json) VALUES (%s, %s, %s, '', %s, %s, %s, '{}')",
+                        (gid, sender, text, vid_url, ts, reply_json_str),
+                    )
+        else:
+            db = load_json_db()
+            item = {
+                "id": f"g_{uuid.uuid4().hex[:10]}",
+                "from": sender,
+                "text": text,
+                "video": vid_url,
+                "ts": ts,
+                "reactions": {},
+            }
+            if rep:
+                item["replyTo"] = rep
+            db["group_msgs"].setdefault(gid, []).append(item)
+            save_json_db(db)
+        return jsonify({"ok": True, "video": vid_url})
+
+    if not to_user:
+        return jsonify({"ok": False, "error": "Не указан получатель"})
+    peer_row = get_user(to_user)
+    if peer_row and sanitize_dm_privacy(peer_row.get("dm_privacy", peer_row.get("dmPrivacy", "all"))) == "nobody":
+        return jsonify({"ok": False, "error": "Этот пользователь ограничил входящие личные сообщения."})
+    ck = chat_key(sender, to_user)
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO messages (chat_key, sender, text, image, video, ts, reply_to_json, reactions_json) VALUES (%s, %s, %s, '', %s, %s, %s, '{}')",
+                    (ck, sender, text, vid_url, ts, reply_json_str),
+                )
+    else:
+        db = load_json_db()
+        item = {
+            "id": f"d_{uuid.uuid4().hex[:10]}",
+            "from": sender,
+            "text": text,
+            "video": vid_url,
+            "ts": ts,
+            "reactions": {},
+        }
+        if rep:
+            item["replyTo"] = rep
+        db["chats"].setdefault(ck, []).append(item)
+        save_json_db(db)
+    return jsonify({"ok": True, "video": vid_url})
+
+
+@app.route("/api/typing", methods=["POST"])
+def api_typing():
+    data = request.get_json(force=True, silent=True) or {}
+    sender = (data.get("from") or "").strip()
+    gid = (data.get("groupId") or "").strip()
+    to = (data.get("to") or "").strip()
+    now = int(time.time() * 1000)
+    if sender:
+        touch_user_online(sender)
+        if gid:
+            TYPING_STATUS[(sender, group_typing_key(gid))] = now
+        elif to:
+            TYPING_STATUS[(sender, to)] = now
+    return jsonify({"ok": True})
+
+
+@app.route("/api/messages")
+def api_messages():
+    a = (request.args.get("a") or "").strip()
+    b = (request.args.get("b") or "").strip()
+    if a:
+        touch_user_online(a)
+    ck = chat_key(a, b)
+    peer_row = get_user(b)
+    peer_profile = format_user(peer_row) if peer_row else None
+    peer_blocks_me = bool(peer_row and sanitize_dm_privacy(peer_row.get("dm_privacy", peer_row.get("dmPrivacy", "all"))) == "nobody")
 
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT id, sender FROM messages WHERE chat_key = %s AND id = %s", (key, int(msg_id)))
+                cur.execute(
+                    "SELECT id, sender, text, image, video, ts, reply_to_json, reactions_json FROM messages WHERE chat_key = %s ORDER BY id ASC",
+                    (ck,),
+                )
+                rows = cur.fetchall()
+        msgs = [
+            format_message_record(
+                r["id"],
+                r["sender"],
+                r["text"],
+                r["image"],
+                r["ts"],
+                parse_json_dict(r.get("reply_to_json")),
+                parse_json_dict(r.get("reactions_json")),
+                r.get("video") or "",
+            )
+            for r in rows
+        ]
+    else:
+        db = load_json_db()
+        raw_list = db["chats"].get(ck) or []
+        msgs = [
+            format_message_record(
+                m.get("id"),
+                m.get("from"),
+                m.get("text"),
+                m.get("image"),
+                m.get("ts"),
+                m.get("replyTo"),
+                m.get("reactions"),
+                m.get("video") or "",
+            )
+            for m in raw_list
+        ]
+    return jsonify({
+        "ok": True,
+        "messages": msgs,
+        "typing": is_peer_typing(b, a),
+        "peerProfile": peer_profile,
+        "peerBlocksMe": peer_blocks_me,
+    })
+
+
+@app.route("/api/send", methods=["POST"])
+def api_send():
+    data = request.get_json(force=True, silent=True) or {}
+    sender = (data.get("from") or "").strip()
+    to = (data.get("to") or "").strip()
+    text = (data.get("text") or "").strip()
+    img = data.get("image") or ""
+    vid = sanitize_video_url(data.get("video") or "")
+    rep = sanitize_reply_to(data.get("replyTo"))
+    if sender:
+        touch_user_online(sender)
+    if img and len(img) > MAX_IMAGE_LEN:
+        return jsonify({"ok": False, "error": "Фото слишком большое"})
+    if not sender or not to or (not text and not img and not vid):
+        return jsonify({"ok": False})
+
+    peer_row = get_user(to)
+    if peer_row and sanitize_dm_privacy(peer_row.get("dm_privacy", peer_row.get("dmPrivacy", "all"))) == "nobody":
+        return jsonify({"ok": False, "error": "Этот пользователь ограничил входящие личные сообщения."})
+
+    TYPING_STATUS.pop((sender, to), None)
+    ck = chat_key(sender, to)
+    ts = int(time.time() * 1000)
+    reply_json_str = json.dumps(rep, ensure_ascii=False) if rep else ""
+
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO messages (chat_key, sender, text, image, video, ts, reply_to_json, reactions_json) VALUES (%s, %s, %s, %s, %s, %s, %s, '{}')",
+                    (ck, sender, text, img, vid, ts, reply_json_str),
+                )
+    else:
+        db = load_json_db()
+        item = {
+            "id": f"d_{uuid.uuid4().hex[:10]}",
+            "from": sender,
+            "text": text,
+            "ts": ts,
+            "reactions": {},
+        }
+        if img:
+            item["image"] = img
+        if vid:
+            item["video"] = vid
+        if rep:
+            item["replyTo"] = rep
+        db["chats"].setdefault(ck, []).append(item)
+        save_json_db(db)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/messages/delete", methods=["POST"])
+def api_messages_delete():
+    data = request.get_json(force=True, silent=True) or {}
+    actor = (data.get("actor") or "").strip()
+    msg_id = data.get("msgId")
+    chat_type = (data.get("chatType") or "direct").strip()
+    peer = (data.get("peer") or "").strip()
+    gid = (data.get("groupId") or "").strip()
+
+    if not actor or msg_id is None:
+        return jsonify({"ok": False, "error": "Неверные параметры"})
+    touch_user_online(actor)
+
+    if chat_type == "group":
+        if USE_PG:
+            with get_pg_conn() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SELECT id, sender FROM group_messages WHERE id = %s AND group_id = %s", (int(msg_id), gid))
+                    row = cur.fetchone()
+                    if not row or row["sender"] != actor:
+                        return jsonify({"ok": False, "error": "Удалять можно только свои сообщения"})
+                    cur.execute("DELETE FROM group_messages WHERE id = %s", (int(msg_id),))
+        else:
+            db = load_json_db()
+            gmsgs = db["group_msgs"].get(gid) or []
+            new_list = []
+            deleted = False
+            for m in gmsgs:
+                if str(m.get("id")) == str(msg_id):
+                    if m.get("from") != actor:
+                        return jsonify({"ok": False, "error": "Удалять можно только свои сообщения"})
+                    deleted = True
+                    continue
+                new_list.append(m)
+            if not deleted:
+                return jsonify({"ok": False, "error": "Сообщение не найдено"})
+            db["group_msgs"][gid] = new_list
+            save_json_db(db)
+        return jsonify({"ok": True})
+
+    ck = chat_key(actor, peer)
+    if USE_PG:
+        with get_pg_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT id, sender FROM messages WHERE id = %s AND chat_key = %s", (int(msg_id), ck))
                 row = cur.fetchone()
-                if not row:
-                    return jsonify({"ok": False})
-                if not is_owner_nick(actor) and row["sender"] != actor:
-                    return jsonify({"ok": False, "error": "Недостаточно прав"})
+                if not row or row["sender"] != actor:
+                    return jsonify({"ok": False, "error": "Удалять можно только свои сообщения"})
                 cur.execute("DELETE FROM messages WHERE id = %s", (int(msg_id),))
     else:
         db = load_json_db()
-        msgs = db["chats"].get(key, [])
-        target = next((m for m in msgs if str(m.get("id")) == str(msg_id)), None)
-        if not target:
-            return jsonify({"ok": False})
-        if not is_owner_nick(actor) and target.get("from") != actor:
-            return jsonify({"ok": False, "error": "Недостаточно прав"})
-        db["chats"][key] = [m for m in msgs if str(m.get("id")) != str(msg_id)]
+        dmsgs = db["chats"].get(ck) or []
+        new_list = []
+        deleted = False
+        for m in dmsgs:
+            if str(m.get("id")) == str(msg_id):
+                if m.get("from") != actor:
+                    return jsonify({"ok": False, "error": "Удалять можно только свои сообщения"})
+                deleted = True
+                continue
+            new_list.append(m)
+        if not deleted:
+            return jsonify({"ok": False, "error": "Сообщение не найдено"})
+        db["chats"][ck] = new_list
         save_json_db(db)
-
     return jsonify({"ok": True})
 
 
-@app.post("/api/groups/messages/delete")
-def delete_group_message():
-    data = request.get_json(force=True) or {}
-    actor = (data.get("actor") or "").strip()
-    gid = (data.get("groupId") or "").strip()
-    msg_id = data.get("msgId")
-    g = get_group_by_id(gid)
-    if not g or actor not in g["members"] or msg_id is None:
-        return jsonify({"ok": False})
-    can_mod = is_owner_nick(actor) or g["owner"] == actor
-
-    if USE_PG:
-        with get_pg_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT id, sender FROM group_messages WHERE group_id = %s AND id = %s", (gid, int(msg_id)))
-                row = cur.fetchone()
-                if not row:
-                    return jsonify({"ok": False})
-                if not can_mod and row["sender"] != actor:
-                    return jsonify({"ok": False, "error": "Недостаточно прав"})
-                cur.execute("DELETE FROM group_messages WHERE id = %s", (int(msg_id),))
-    else:
-        db = load_json_db()
-        msgs = db["group_msgs"].get(gid, [])
-        target = next((m for m in msgs if str(m.get("id")) == str(msg_id)), None)
-        if not target:
-            return jsonify({"ok": False})
-        if not can_mod and target.get("from") != actor:
-            return jsonify({"ok": False, "error": "Недостаточно прав"})
-        db["group_msgs"][gid] = [m for m in msgs if str(m.get("id")) != str(msg_id)]
-        save_json_db(db)
-
-    return jsonify({"ok": True})
-
-
-def toggle_reaction_map(reactions_dict, actor, emoji):
-    rx = normalize_reactions(reactions_dict)
-    users = list(rx.get(emoji) or [])
-    if actor in users:
-        users = [u for u in users if u != actor]
-    else:
-        users.append(actor)
-    if users:
-        rx[emoji] = users
-    else:
-        rx.pop(emoji, None)
-    return rx
-
-
-@app.post("/api/messages/react")
-def react_direct_message():
-    data = request.get_json(force=True) or {}
-    actor = (data.get("actor") or "").strip()
-    a = (data.get("a") or "").strip()
-    b = (data.get("b") or "").strip()
-    msg_id = data.get("msgId")
+@app.route("/api/reactions/toggle", methods=["POST"])
+def api_reactions_toggle():
+    data = request.get_json(force=True, silent=True) or {}
+    user = (data.get("user") or "").strip()
     emoji = (data.get("emoji") or "").strip()
-    if not actor or not a or not b or msg_id is None or not emoji:
-        return jsonify({"ok": False})
-    key = chat_key(a, b)
-
-    if USE_PG:
-        with get_pg_conn() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT id, reactions_json FROM messages WHERE chat_key = %s AND id = %s", (key, int(msg_id)))
-                row = cur.fetchone()
-                if not row:
-                    return jsonify({"ok": False})
-                updated = toggle_reaction_map(parse_json_dict(row.get("reactions_json")), actor, emoji)
-                cur.execute("UPDATE messages SET reactions_json = %s WHERE id = %s", (json.dumps(updated, ensure_ascii=False), int(msg_id)))
-    else:
-        db = load_json_db()
-        msgs = db["chats"].get(key, [])
-        target = next((m for m in msgs if str(m.get("id")) == str(msg_id)), None)
-        if not target:
-            return jsonify({"ok": False})
-        target["reactions"] = toggle_reaction_map(target.get("reactions"), actor, emoji)
-        save_json_db(db)
-
-    return jsonify({"ok": True})
-
-
-@app.post("/api/groups/messages/react")
-def react_group_message():
-    data = request.get_json(force=True) or {}
-    actor = (data.get("actor") or "").strip()
-    gid = (data.get("groupId") or "").strip()
     msg_id = data.get("msgId")
-    emoji = (data.get("emoji") or "").strip()
-    g = get_group_by_id(gid)
-    if not g or actor not in g["members"] or msg_id is None or not emoji:
-        return jsonify({"ok": False})
+    chat_type = (data.get("chatType") or "direct").strip()
+    peer = (data.get("peer") or "").strip()
+    gid = (data.get("groupId") or "").strip()
 
+    if not user or not emoji or msg_id is None:
+        return jsonify({"ok": False})
+    touch_user_online(user)
+
+    def mutate_rx(rx_raw):
+        rx = normalize_reactions(rx_raw)
+        users_list = list(rx.get(emoji) or [])
+        if user in users_list:
+            users_list = [x for x in users_list if x != user]
+        else:
+            users_list.append(user)
+        if users_list:
+            rx[emoji] = users_list
+        else:
+            rx.pop(emoji, None)
+        return rx
+
+    if chat_type == "group":
+        if USE_PG:
+            with get_pg_conn() as conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute("SELECT id, reactions_json FROM group_messages WHERE id = %s AND group_id = %s", (int(msg_id), gid))
+                    row = cur.fetchone()
+                    if not row:
+                        return jsonify({"ok": False})
+                    new_rx = mutate_rx(parse_json_dict(row.get("reactions_json")))
+                    cur.execute("UPDATE group_messages SET reactions_json = %s WHERE id = %s", (json.dumps(new_rx, ensure_ascii=False), int(msg_id)))
+        else:
+            db = load_json_db()
+            for m in (db["group_msgs"].get(gid) or []):
+                if str(m.get("id")) == str(msg_id):
+                    m["reactions"] = mutate_rx(m.get("reactions"))
+                    save_json_db(db)
+                    break
+        return jsonify({"ok": True})
+
+    ck = chat_key(user, peer)
     if USE_PG:
         with get_pg_conn() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT id, reactions_json FROM group_messages WHERE group_id = %s AND id = %s", (gid, int(msg_id)))
+                cur.execute("SELECT id, reactions_json FROM messages WHERE id = %s AND chat_key = %s", (int(msg_id), ck))
                 row = cur.fetchone()
                 if not row:
                     return jsonify({"ok": False})
-                updated = toggle_reaction_map(parse_json_dict(row.get("reactions_json")), actor, emoji)
-                cur.execute("UPDATE group_messages SET reactions_json = %s WHERE id = %s", (json.dumps(updated, ensure_ascii=False), int(msg_id)))
+                new_rx = mutate_rx(parse_json_dict(row.get("reactions_json")))
+                cur.execute("UPDATE messages SET reactions_json = %s WHERE id = %s", (json.dumps(new_rx, ensure_ascii=False), int(msg_id)))
     else:
         db = load_json_db()
-        msgs = db["group_msgs"].get(gid, [])
-        target = next((m for m in msgs if str(m.get("id")) == str(msg_id)), None)
-        if not target:
-            return jsonify({"ok": False})
-        target["reactions"] = toggle_reaction_map(target.get("reactions"), actor, emoji)
-        save_json_db(db)
-
+        for m in (db["chats"].get(ck) or []):
+            if str(m.get("id")) == str(msg_id):
+                m["reactions"] = mutate_rx(m.get("reactions"))
+                save_json_db(db)
+                break
     return jsonify({"ok": True})
 
 
-@app.post("/api/call/start")
-def call_start():
+@app.route("/api/group-call/join", methods=["POST"])
+def api_group_call_join():
     cleanup_stale_calls()
-    data = request.get_json(force=True) or {}
-    caller = (data.get("caller") or "").strip()
-    callee = (data.get("callee") or "").strip()
-    if not caller or not callee or caller == callee:
-        return jsonify({"ok": False, "error": "Некорректные участники звонка"})
-    if not get_user(caller) or not get_user(callee):
-        return jsonify({"ok": False, "error": "Пользователь не найден"})
-
-    end_user_calls(caller)
-
-    for cid, c in ACTIVE_CALLS.items():
-        if c.get("status") != "ended" and callee in (c.get("caller"), c.get("callee")):
-            return jsonify({"ok": False, "error": "Пользователь сейчас занят в другом звонке"})
-
-    now = int(time.time() * 1000)
-    crow = get_user(caller)
-    cid = f"call_{uuid.uuid4().hex[:12]}"
-    ACTIVE_CALLS[cid] = {
-        "callId": cid,
-        "caller": caller,
-        "callee": callee,
-        "callerEmoji": sanitize_user_emoji(crow.get("emoji") if crow else DEFAULT_USER_EMOJI, banned=is_user_banned(crow)),
-        "callerAvatarPhoto": sanitize_avatar_photo(crow.get("avatarPhoto", crow.get("avatar_photo", "")) if crow else "", caller, crow),
-        "status": "ringing",
-        "offer": None,
-        "offerBy": "",
-        "answer": None,
-        "answerBy": "",
-        "callerCamOn": False,
-        "calleeCamOn": False,
-        "candidates": [],
-        "createdAt": now,
-        "updatedAt": now,
-        "connectedAt": None,
-        "loggedResult": False,
-    }
-    return jsonify({"ok": True, "callId": cid})
-
-
-@app.post("/api/call/offer")
-def call_offer():
-    cleanup_stale_calls()
-    data = request.get_json(force=True) or {}
-    cid = (data.get("callId") or "").strip()
-    frm = (data.get("from") or "").strip()
-    offer = data.get("offer")
-    c = ACTIVE_CALLS.get(cid)
-    if not c or c.get("status") == "ended" or frm not in (c.get("caller"), c.get("callee")):
-        return jsonify({"ok": False})
-    c["offer"] = offer
-    c["offerBy"] = frm
-    c["updatedAt"] = int(time.time() * 1000)
-    return jsonify({"ok": True})
-
-
-@app.post("/api/call/answer")
-def call_answer():
-    cleanup_stale_calls()
-    data = request.get_json(force=True) or {}
-    cid = (data.get("callId") or "").strip()
-    frm = (data.get("from") or "").strip()
-    ans = data.get("answer")
-    c = ACTIVE_CALLS.get(cid)
-    if not c or c.get("status") == "ended" or frm not in (c.get("caller"), c.get("callee")):
-        return jsonify({"ok": False})
-    now = int(time.time() * 1000)
-    c["answer"] = ans
-    c["answerBy"] = frm
-    c["status"] = "active"
-    if not c.get("connectedAt"):
-        c["connectedAt"] = now
-    c["updatedAt"] = now
-    return jsonify({"ok": True})
-
-
-@app.post("/api/call/cam-state")
-def call_cam_state():
-    cleanup_stale_calls()
-    data = request.get_json(force=True) or {}
-    cid = (data.get("callId") or "").strip()
-    frm = (data.get("from") or "").strip()
-    cam_on = bool(data.get("camOn"))
-    c = ACTIVE_CALLS.get(cid)
-    if not c or c.get("status") == "ended" or frm not in (c.get("caller"), c.get("callee")):
-        return jsonify({"ok": False})
-    if frm == c.get("caller"):
-        c["callerCamOn"] = cam_on
-    else:
-        c["calleeCamOn"] = cam_on
-    c["updatedAt"] = int(time.time() * 1000)
-    return jsonify({"ok": True})
-
-
-@app.post("/api/call/candidate")
-def call_candidate():
-    cleanup_stale_calls()
-    data = request.get_json(force=True) or {}
-    cid = (data.get("callId") or "").strip()
-    frm = (data.get("from") or "").strip()
-    cand = data.get("candidate")
-    c = ACTIVE_CALLS.get(cid)
-    if not c or c.get("status") == "ended" or frm not in (c.get("caller"), c.get("callee")):
-        return jsonify({"ok": False})
-    if cand:
-        c["candidates"].append({"from": frm, "candidate": cand})
-        c["updatedAt"] = int(time.time() * 1000)
-    return jsonify({"ok": True})
-
-
-@app.post("/api/call/end")
-def call_end():
-    cleanup_stale_calls()
-    data = request.get_json(force=True) or {}
-    cid = (data.get("callId") or "").strip()
-    frm = (data.get("from") or "").strip()
-    duration = (data.get("duration") or "00:00").strip()
-    was_connected = bool(data.get("wasConnected"))
-    now = int(time.time() * 1000)
-
-    c = ACTIVE_CALLS.get(cid)
-    if c:
-        if not c.get("loggedResult"):
-            c["loggedResult"] = True
-            caller = c.get("caller")
-            callee = c.get("callee")
-            actor = frm or caller
-            if caller and callee:
-                if was_connected or c.get("connectedAt"):
-                    append_direct_message(actor, callee if actor == caller else caller, f"📞 Звонок завершён • длительность {duration}")
-                else:
-                    append_direct_message(actor, callee if actor == caller else caller, f"📞 Звонок отклонён / пропущен ({actor})")
-        c["status"] = "ended"
-        c["endedBy"] = frm
-        c["updatedAt"] = now
-    return jsonify({"ok": True})
-
-
-@app.get("/api/call/poll")
-def call_poll():
-    cleanup_stale_calls()
-    u = (request.args.get("user") or "").strip()
-    cid = (request.args.get("callId") or "").strip()
-    if not u:
-        return jsonify({"ok": False})
-
-    if cid:
-        c = ACTIVE_CALLS.get(cid)
-        if not c or c.get("status") == "ended":
-            return jsonify({"ok": True, "ended": True, "call": None})
-        peer_cam = bool(c.get("calleeCamOn") if u == c.get("caller") else c.get("callerCamOn"))
-        payload = dict(c)
-        payload["peerCamOn"] = peer_cam
-        return jsonify({"ok": True, "ended": False, "call": payload})
-
-    for call_item in ACTIVE_CALLS.values():
-        if call_item.get("status") == "ringing" and call_item.get("callee") == u:
-            peer_cam = bool(call_item.get("callerCamOn"))
-            payload = dict(call_item)
-            payload["peerCamOn"] = peer_cam
-            return jsonify({"ok": True, "ended": False, "call": payload})
-
-    return jsonify({"ok": True, "ended": False, "call": None})
-
-
-@app.post("/api/group-call/join")
-def group_call_join():
-    cleanup_stale_calls()
-    data = request.get_json(force=True) or {}
+    data = request.get_json(force=True, silent=True) or {}
     gid = (data.get("groupId") or "").strip()
-    u = (data.get("user") or "").strip()
-    cam_on = bool(data.get("camOn"))
+    user = (data.get("user") or "").strip()
+    if user:
+        touch_user_online(user)
     g = get_group_by_id(gid)
-    if not g or u not in g["members"]:
+    if not g or user not in g["members"]:
         return jsonify({"ok": False, "error": "Нет доступа к группе"})
-    if not can_user_call_in_group(g, u):
-        access = sanitize_call_access(g.get("callAccess"))
-        err_msg = "Звонки в группе отключены" if access == "nobody" else "Звонить в этой группе может только владелец"
-        return jsonify({"ok": False, "error": err_msg})
+    if not can_user_call_in_group(g, user):
+        return jsonify({"ok": False, "error": "Звонки в этой группе ограничены настройками"})
 
-    urow = get_user(u)
-    em = sanitize_user_emoji(data.get("emoji") or (urow.get("emoji") if urow else DEFAULT_USER_EMOJI), banned=is_user_banned(urow))
-    photo = sanitize_avatar_photo(data.get("avatarPhoto") if data.get("avatarPhoto") is not None else (urow.get("avatarPhoto", urow.get("avatar_photo", "")) if urow else ""), u, urow)
     now = int(time.time() * 1000)
+    urow = get_user(user)
+    u_banned = is_user_banned(urow) if urow else False
+    em = sanitize_user_emoji(data.get("emoji") or (urow.get("emoji") if urow else "🙂"), banned=u_banned)
+    photo = sanitize_avatar_photo(data.get("avatarPhoto") or (urow.get("avatar_photo") if urow else ""), user, urow)
+    cam_on = bool(data.get("camOn"))
 
     gc = GROUP_CALLS.get(gid)
-    was_empty = not gc or not gc.get("participants")
     if not gc:
         gc = {
             "groupId": gid,
@@ -8563,122 +8506,319 @@ def group_call_join():
         }
         GROUP_CALLS[gid] = gc
 
-    gc["participants"][u] = {
-        "username": u,
+    gc["updatedAt"] = now
+    gc["participants"][user] = {
+        "username": user,
         "emoji": em,
         "avatarPhoto": photo,
-        "banned": is_user_banned(urow),
+        "banned": u_banned,
         "camOn": cam_on,
-        "joinedAt": now,
+        "lastSeen": now,
     }
-    gc["updatedAt"] = now
 
-    if was_empty:
-        append_group_system_message(gid, f"📞 {u} начал групповой звонок")
-    else:
-        append_group_system_message(gid, f"📞 {u} присоединился к звонку")
-
-    part_list = list(gc["participants"].values())
-    return jsonify({
-        "ok": True,
-        "startedAt": gc["startedAt"],
-        "participants": part_list,
-    })
+    plist = list(gc["participants"].values())
+    return jsonify({"ok": True, "startedAt": gc["startedAt"], "participants": plist})
 
 
-@app.post("/api/group-call/media")
-def group_call_media():
+@app.route("/api/group-call/media", methods=["POST"])
+def api_group_call_media():
     cleanup_stale_calls()
-    data = request.get_json(force=True) or {}
+    data = request.get_json(force=True, silent=True) or {}
     gid = (data.get("groupId") or "").strip()
-    u = (data.get("user") or "").strip()
-    cam_on = bool(data.get("camOn"))
+    user = (data.get("user") or "").strip()
+    if user:
+        touch_user_online(user)
     gc = GROUP_CALLS.get(gid)
-    if not gc or u not in gc.get("participants", {}):
-        return jsonify({"ok": False})
-    gc["participants"][u]["camOn"] = cam_on
-    gc["updatedAt"] = int(time.time() * 1000)
+    if not gc or user not in gc.get("participants", {}):
+        return jsonify({"ok": True})
+    now = int(time.time() * 1000)
+    gc["updatedAt"] = now
+    gc["participants"][user]["camOn"] = bool(data.get("camOn"))
+    gc["participants"][user]["lastSeen"] = now
     return jsonify({"ok": True})
 
 
-@app.post("/api/group-call/signal")
-def group_call_signal():
+@app.route("/api/group-call/signal", methods=["POST"])
+def api_group_call_signal():
     cleanup_stale_calls()
-    data = request.get_json(force=True) or {}
+    data = request.get_json(force=True, silent=True) or {}
     gid = (data.get("groupId") or "").strip()
     frm = (data.get("from") or "").strip()
     to = (data.get("to") or "").strip()
     kind = (data.get("kind") or "").strip()
     payload = data.get("payload")
+    if frm:
+        touch_user_online(frm)
     gc = GROUP_CALLS.get(gid)
     if not gc or not frm or not to or not kind:
-        return jsonify({"ok": False})
-    gc["signals"].append({
-        "id": uuid.uuid4().hex,
+        return jsonify({"ok": True})
+    now = int(time.time() * 1000)
+    gc["updatedAt"] = now
+    if frm in gc.get("participants", {}):
+        gc["participants"][frm]["lastSeen"] = now
+    gc.setdefault("signals", []).append({
+        "id": uuid.uuid4().hex[:10],
         "from": frm,
         "to": to,
         "kind": kind,
         "payload": payload,
-        "ts": int(time.time() * 1000),
+        "ts": now,
     })
-    if len(gc["signals"]) > 300:
-        gc["signals"] = gc["signals"][-200:]
-    gc["updatedAt"] = int(time.time() * 1000)
+    if len(gc["signals"]) > 250:
+        gc["signals"] = gc["signals"][-250:]
     return jsonify({"ok": True})
 
 
-@app.post("/api/group-call/leave")
-def group_call_leave():
-    cleanup_stale_calls()
-    data = request.get_json(force=True) or {}
-    gid = (data.get("groupId") or "").strip()
-    u = (data.get("user") or "").strip()
-    duration = (data.get("duration") or "00:00").strip()
-    gc = GROUP_CALLS.get(gid)
-    if gc and u in gc.get("participants", {}):
-        gc["participants"].pop(u, None)
-        gc["updatedAt"] = int(time.time() * 1000)
-        if not gc["participants"]:
-            GROUP_CALLS.pop(gid, None)
-            append_group_system_message(gid, f"📞 Групповой звонок завершён • длительность {duration}")
-        else:
-            append_group_system_message(gid, f"📞 {u} вышел из звонка")
-    return jsonify({"ok": True})
-
-
-@app.get("/api/group-call/poll")
-def group_call_poll():
+@app.route("/api/group-call/poll")
+def api_group_call_poll():
     cleanup_stale_calls()
     gid = (request.args.get("groupId") or "").strip()
-    u = (request.args.get("user") or "").strip()
-    if not gid or not u:
-        return jsonify({"ok": False})
+    user = (request.args.get("user") or "").strip()
+    if user:
+        touch_user_online(user)
+    now = int(time.time() * 1000)
     gc = GROUP_CALLS.get(gid)
-    if not gc or not gc.get("participants"):
+    if not gc:
         return jsonify({"ok": True, "call": None, "signals": []})
 
-    my_signals = []
-    remaining_signals = []
-    for s in gc.get("signals", []):
-        if s.get("to") == u:
-            my_signals.append(s)
-        else:
-            remaining_signals.append(s)
-    gc["signals"] = remaining_signals
+    if user and user in gc.get("participants", {}):
+        gc["participants"][user]["lastSeen"] = now
+        gc["updatedAt"] = now
+
+    active_parts = {}
+    for nick, pdata in list(gc.get("participants", {}).items()):
+        if (now - int(pdata.get("lastSeen") or now)) <= CALL_TTL_MS:
+            active_parts[nick] = pdata
+    gc["participants"] = active_parts
+
+    if not gc["participants"]:
+        GROUP_CALLS.pop(gid, None)
+        return jsonify({"ok": True, "call": None, "signals": []})
+
+    delivered = []
+    remaining = []
+    for sig in gc.get("signals", []):
+        if sig.get("to") == user:
+            delivered.append(sig)
+        elif (now - int(sig.get("ts") or now)) <= 20_000:
+            remaining.append(sig)
+    gc["signals"] = remaining
 
     return jsonify({
         "ok": True,
         "call": {
             "groupId": gid,
-            "startedAt": gc.get("startedAt"),
+            "startedAt": gc["startedAt"],
             "participants": list(gc["participants"].values()),
         },
-        "signals": my_signals,
+        "signals": delivered,
     })
+
+
+@app.route("/api/group-call/leave", methods=["POST"])
+def api_group_call_leave():
+    cleanup_stale_calls()
+    data = request.get_json(force=True, silent=True) or {}
+    gid = (data.get("groupId") or "").strip()
+    user = (data.get("user") or "").strip()
+    duration = (data.get("duration") or "00:00").strip()
+    was_connected = bool(data.get("wasConnected"))
+    if user:
+        touch_user_online(user)
+
+    gc = GROUP_CALLS.get(gid)
+    if gc and user in gc.get("participants", {}):
+        gc["participants"].pop(user, None)
+        gc["updatedAt"] = int(time.time() * 1000)
+        if not gc["participants"]:
+            GROUP_CALLS.pop(gid, None)
+            if was_connected:
+                append_group_system_message(gid, f"Групповой звонок завершён • длительность {duration}")
+
+    return jsonify({"ok": True})
+
+
+@app.route("/api/call/start", methods=["POST"])
+def api_call_start():
+    cleanup_stale_calls()
+    data = request.get_json(force=True, silent=True) or {}
+    caller = (data.get("caller") or "").strip()
+    callee = (data.get("callee") or "").strip()
+    if caller:
+        touch_user_online(caller)
+    if not caller or not callee or caller == callee:
+        return jsonify({"ok": False, "error": "Некорректные участники звонка"})
+
+    now = int(time.time() * 1000)
+    end_user_calls(caller, now)
+    end_user_calls(callee, now)
+
+    crow = get_user(caller)
+    c_banned = is_user_banned(crow) if crow else False
+    caller_emoji = sanitize_user_emoji(crow.get("emoji") if crow else DEFAULT_USER_EMOJI, banned=c_banned)
+    caller_photo = sanitize_avatar_photo(crow.get("avatar_photo") if crow else "", caller, crow)
+
+    cid = f"call_{uuid.uuid4().hex[:12]}"
+    ACTIVE_CALLS[cid] = {
+        "callId": cid,
+        "caller": caller,
+        "callee": callee,
+        "callerEmoji": caller_emoji,
+        "callerAvatarPhoto": caller_photo,
+        "status": "ringing",
+        "offer": None,
+        "offerBy": "",
+        "answer": None,
+        "answerBy": "",
+        "callerCamOn": False,
+        "calleeCamOn": False,
+        "candidates": [],
+        "createdAt": now,
+        "connectedAt": None,
+        "updatedAt": now,
+    }
+    return jsonify({"ok": True, "callId": cid})
+
+
+@app.route("/api/call/offer", methods=["POST"])
+def api_call_offer():
+    cleanup_stale_calls()
+    data = request.get_json(force=True, silent=True) or {}
+    cid = (data.get("callId") or "").strip()
+    frm = (data.get("from") or "").strip()
+    offer = data.get("offer")
+    if frm:
+        touch_user_online(frm)
+    call = ACTIVE_CALLS.get(cid)
+    if not call or call.get("status") == "ended":
+        return jsonify({"ok": False})
+    call["offer"] = offer
+    call["offerBy"] = frm
+    call["updatedAt"] = int(time.time() * 1000)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/call/answer", methods=["POST"])
+def api_call_answer():
+    cleanup_stale_calls()
+    data = request.get_json(force=True, silent=True) or {}
+    cid = (data.get("callId") or "").strip()
+    frm = (data.get("from") or "").strip()
+    answer = data.get("answer")
+    if frm:
+        touch_user_online(frm)
+    call = ACTIVE_CALLS.get(cid)
+    if not call or call.get("status") == "ended":
+        return jsonify({"ok": False})
+    now = int(time.time() * 1000)
+    call["answer"] = answer
+    call["answerBy"] = frm
+    call["status"] = "active"
+    if not call.get("connectedAt"):
+        call["connectedAt"] = now
+    call["updatedAt"] = now
+    return jsonify({"ok": True})
+
+
+@app.route("/api/call/cam-state", methods=["POST"])
+def api_call_cam_state():
+    cleanup_stale_calls()
+    data = request.get_json(force=True, silent=True) or {}
+    cid = (data.get("callId") or "").strip()
+    frm = (data.get("from") or "").strip()
+    cam_on = bool(data.get("camOn"))
+    if frm:
+        touch_user_online(frm)
+    call = ACTIVE_CALLS.get(cid)
+    if not call or call.get("status") == "ended":
+        return jsonify({"ok": False})
+    if frm == call.get("caller"):
+        call["callerCamOn"] = cam_on
+    elif frm == call.get("callee"):
+        call["calleeCamOn"] = cam_on
+    call["updatedAt"] = int(time.time() * 1000)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/call/candidate", methods=["POST"])
+def api_call_candidate():
+    cleanup_stale_calls()
+    data = request.get_json(force=True, silent=True) or {}
+    cid = (data.get("callId") or "").strip()
+    frm = (data.get("from") or "").strip()
+    cand = data.get("candidate")
+    if frm:
+        touch_user_online(frm)
+    call = ACTIVE_CALLS.get(cid)
+    if not call or call.get("status") == "ended" or not cand:
+        return jsonify({"ok": False})
+    call["candidates"].append({"from": frm, "candidate": cand})
+    call["updatedAt"] = int(time.time() * 1000)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/call/poll")
+def api_call_poll():
+    cleanup_stale_calls()
+    user = (request.args.get("user") or "").strip()
+    cid = (request.args.get("callId") or "").strip()
+    if user:
+        touch_user_online(user)
+    if not user:
+        return jsonify({"ok": False})
+
+    if cid:
+        call = ACTIVE_CALLS.get(cid)
+        if not call:
+            return jsonify({"ok": True, "ended": True, "call": None})
+        call["updatedAt"] = int(time.time() * 1000)
+        out_call = dict(call)
+        out_call["peerCamOn"] = bool(call.get("calleeCamOn") if user == call.get("caller") else call.get("callerCamOn"))
+        return jsonify({"ok": True, "ended": call.get("status") == "ended", "call": out_call})
+
+    for c in ACTIVE_CALLS.values():
+        if c.get("status") == "ringing" and c.get("callee") == user:
+            c["updatedAt"] = int(time.time() * 1000)
+            out_call = dict(c)
+            out_call["peerCamOn"] = bool(c.get("callerCamOn"))
+            return jsonify({"ok": True, "ended": False, "call": out_call})
+
+    return jsonify({"ok": True, "ended": False, "call": None})
+
+
+@app.route("/api/call/end", methods=["POST"])
+def api_call_end():
+    cleanup_stale_calls()
+    data = request.get_json(force=True, silent=True) or {}
+    cid = (data.get("callId") or "").strip()
+    frm = (data.get("from") or "").strip()
+    duration = (data.get("duration") or "00:00").strip()
+    was_connected = bool(data.get("wasConnected"))
+    if frm:
+        touch_user_online(frm)
+
+    call = ACTIVE_CALLS.get(cid)
+    if call:
+        caller = call.get("caller")
+        callee = call.get("callee")
+        already_logged = bool(call.get("loggedEnd"))
+        call["status"] = "ended"
+        call["endedBy"] = frm
+        call["updatedAt"] = int(time.time() * 1000)
+        if not already_logged and caller and callee:
+            call["loggedEnd"] = True
+            if was_connected:
+                append_direct_message(frm or caller, callee if frm == caller else caller, f"Звонок завершён • длительность {duration}")
+            elif frm == callee:
+                append_direct_message(callee, caller, "Входящий звонок отклонён")
+            else:
+                append_direct_message(caller, callee, "Звонок отменён")
+
+    return jsonify({"ok": True})
 
 
 init_db()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)
