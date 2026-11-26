@@ -11,6 +11,9 @@ DB_PATH = os.environ.get("DB_PATH", "grusha.db")
 
 
 def get_db():
+  db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+  if db_dir and not os.path.exists(db_dir):
+    os.makedirs(db_dir, exist_ok=True)
   conn = sqlite3.connect(DB_PATH)
   conn.row_factory = sqlite3.Row
   conn.execute("PRAGMA foreign_keys = ON")
@@ -76,52 +79,65 @@ def login_required(f):
   return decorated
 
 
+@app.route("/health")
+def health():
+  return jsonify({"status": "ok"})
+
+
 # --- AUTH & PROFILE API ---
 
 
 @app.route("/api/register", methods=["POST"])
 def register():
-  data = request.json or {}
-  username = data.get("username", "").strip().lower()
-  display_name = data.get("display_name", "").strip()
-  password = data.get("password", "")
-  avatar = data.get("avatar", "🍐").strip() or "🍐"
-
-  if not username or not display_name or not password:
-    return jsonify({"error": "Заполните все поля"}), 400
-  if len(username) < 3:
-    return jsonify({"error": "Логин минимум 3 символа"}), 400
-
-  conn = get_db()
   try:
-    cur = conn.execute(
-        "INSERT INTO users (username, display_name, password_hash, avatar)"
-        " VALUES (?, ?, ?, ?)",
-        (username, display_name, generate_password_hash(password), avatar),
-    )
-    conn.commit()
-    session["user_id"] = cur.lastrowid
-    return jsonify({"ok": True})
-  except sqlite3.IntegrityError:
-    return jsonify({"error": "Этот логин уже занят"}), 400
-  finally:
-    conn.close()
+    init_db()
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username", "")).strip().lower()
+    display_name = str(data.get("display_name", "")).strip()
+    password = str(data.get("password", ""))
+    avatar = str(data.get("avatar", "🍐")).strip() or "🍐"
+
+    if not username or not display_name or not password:
+      return jsonify({"error": "Заполните все поля"}), 400
+    if len(username) < 3:
+      return jsonify({"error": "Логин минимум 3 символа"}), 400
+
+    conn = get_db()
+    try:
+      cur = conn.execute(
+          "INSERT INTO users (username, display_name, password_hash, avatar)"
+          " VALUES (?, ?, ?, ?)",
+          (username, display_name, generate_password_hash(password), avatar),
+      )
+      conn.commit()
+      session["user_id"] = cur.lastrowid
+      return jsonify({"ok": True})
+    except sqlite3.IntegrityError:
+      return jsonify({"error": "Этот логин уже занят"}), 400
+    finally:
+      conn.close()
+  except Exception as e:
+    return jsonify({"error": f"Ошибка сервера: {e}"}), 500
 
 
 @app.route("/api/login", methods=["POST"])
 def login():
-  data = request.json or {}
-  username = data.get("username", "").strip().lower()
-  password = data.get("password", "")
-  conn = get_db()
-  user = conn.execute(
-      "SELECT * FROM users WHERE username = ?", (username,)
-  ).fetchone()
-  conn.close()
-  if not user or not check_password_hash(user["password_hash"], password):
-    return jsonify({"error": "Неверный логин или пароль"}), 400
-  session["user_id"] = user["id"]
-  return jsonify({"ok": True})
+  try:
+    init_db()
+    data = request.get_json(silent=True) or {}
+    username = str(data.get("username", "")).strip().lower()
+    password = str(data.get("password", ""))
+    conn = get_db()
+    user = conn.execute(
+        "SELECT * FROM users WHERE username = ?", (username,)
+    ).fetchone()
+    conn.close()
+    if not user or not check_password_hash(user["password_hash"], password):
+      return jsonify({"error": "Неверный логин или пароль"}), 400
+    session["user_id"] = user["id"]
+    return jsonify({"ok": True})
+  except Exception as e:
+    return jsonify({"error": f"Ошибка сервера: {e}"}), 500
 
 
 @app.route("/api/logout", methods=["POST"])
@@ -147,9 +163,9 @@ def me():
     return jsonify(dict(user))
 
   if request.method == "PUT":
-    data = request.json or {}
-    display_name = data.get("display_name", "").strip()
-    avatar = data.get("avatar", "").strip()
+    data = request.get_json(silent=True) or {}
+    display_name = str(data.get("display_name", "")).strip()
+    avatar = str(data.get("avatar", "")).strip()
     if display_name:
       conn.execute(
           "UPDATE users SET display_name = ? WHERE id = ?", (display_name, uid)
@@ -161,7 +177,6 @@ def me():
     return jsonify({"ok": True})
 
   if request.method == "DELETE":
-    # Удаляем приватные чаты пользователя, групповые оставляем (если владелец удалился, передаем права или удаляем пустые)
     private_chats = conn.execute(
         """
             SELECT c.id FROM chats c
@@ -245,7 +260,9 @@ def get_chats():
         if last_msg
         else "Нет сообщений"
     )
-    c_dict["last_time"] = last_msg["created_at"][11:16] if last_msg else ""
+    c_dict["last_time"] = (
+        str(last_msg["created_at"])[11:16] if last_msg else ""
+    )
 
     if c["type"] == "private":
       other = conn.execute(
@@ -281,7 +298,7 @@ def get_chats():
 @login_required
 def create_or_get_private():
   uid = session["user_id"]
-  target_id = (request.json or {}).get("user_id")
+  target_id = (request.get_json(silent=True) or {}).get("user_id")
   if not target_id or target_id == uid:
     return jsonify({"error": "Некорректный пользователь"}), 400
 
@@ -319,9 +336,9 @@ def create_or_get_private():
 @login_required
 def create_group():
   uid = session["user_id"]
-  data = request.json or {}
-  title = data.get("title", "").strip()
-  avatar = data.get("avatar", "🍐").strip() or "🍐"
+  data = request.get_json(silent=True) or {}
+  title = str(data.get("title", "")).strip()
+  avatar = str(data.get("avatar", "🍐")).strip() or "🍐"
   member_ids = data.get("member_ids", [])
 
   if not title:
@@ -394,23 +411,22 @@ def manage_chat(chat_id):
           jsonify({"error": "Только владелец может менять настройки группы"}),
           403,
       )
-    data = request.json or {}
-    if "title" in data and data["title"].strip():
+    data = request.get_json(silent=True) or {}
+    if "title" in data and str(data["title"]).strip():
       conn.execute(
           "UPDATE chats SET title = ? WHERE id = ?",
-          (data["title"].strip(), chat_id),
+          (str(data["title"]).strip(), chat_id),
       )
-    if "avatar" in data and data["avatar"].strip():
+    if "avatar" in data and str(data["avatar"]).strip():
       conn.execute(
           "UPDATE chats SET avatar = ? WHERE id = ?",
-          (data["avatar"].strip(), chat_id),
+          (str(data["avatar"]).strip(), chat_id),
       )
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
 
   if request.method == "DELETE":
-    # В 1-на-1 удалить чат может любой из собеседников. В группе — только владелец (остальные могут выйти).
     if chat["type"] == "private" or chat["owner_id"] == uid:
       conn.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
     else:
@@ -433,7 +449,7 @@ def manage_group_members(chat_id):
     conn.close()
     return jsonify({"error": "Недостаточно прав"}), 403
 
-  data = request.json or {}
+  data = request.get_json(silent=True) or {}
   target_id = data.get("user_id")
 
   if request.method == "POST":
@@ -500,12 +516,11 @@ def messages_api(chat_id):
       d = dict(r)
       d["reactions"] = json.loads(d["reactions"] or "{}")
       d["is_mine"] = d["sender_id"] == uid
-      # В группах удалять может ТОЛЬКО владелец; в 1-на-1 — отправитель своего сообщения
       if chat["type"] == "group":
         d["can_delete"] = chat["owner_id"] == uid
       else:
         d["can_delete"] = d["sender_id"] == uid
-      d["time"] = d["created_at"][11:16]
+      d["time"] = str(d["created_at"])[11:16]
       msgs.append(d)
     conn.close()
     return jsonify(msgs)
@@ -517,8 +532,8 @@ def messages_api(chat_id):
           jsonify({"error": "Владелец запретил вам писать в этой группе"}),
           403,
       )
-    data = request.json or {}
-    content = data.get("content", "").strip()
+    data = request.get_json(silent=True) or {}
+    content = str(data.get("content", "")).strip()
     reply_to_id = data.get("reply_to_id")
     if not content:
       conn.close()
@@ -575,7 +590,7 @@ def delete_message(msg_id):
 @login_required
 def react_message(msg_id):
   uid = session["user_id"]
-  emoji = (request.json or {}).get("emoji", "").strip()
+  emoji = str((request.get_json(silent=True) or {}).get("emoji", "")).strip()
   if not emoji:
     return jsonify({"error": "Нет эмодзи"}), 400
 
@@ -644,25 +659,27 @@ HTML_TEMPLATE = """
   * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif; }
   body { background: var(--bg); color: var(--text); height: 100dvh; overflow: hidden; display: flex; }
 
-  /* Scrollbar */
   ::-webkit-scrollbar { width: 5px; height: 5px; }
   ::-webkit-scrollbar-thumb { background: #2e3b49; border-radius: 99px; }
 
-  /* Auth Screen */
   #auth-screen {
     position: fixed; inset: 0; background: radial-gradient(circle at top right, #1f2e16, var(--bg) 60%);
-    display: flex; align-items: center; justify-content: center; z-index: 100; padding: 20px;
+    display: flex; align-items: center; justify-content: center; z-index: 100; padding: 20px; overflow-y: auto;
   }
   .auth-card {
     background: var(--panel); border: 1px solid var(--border); border-radius: 24px;
-    padding: 32px; width: 100%; max-width: 400px; box-shadow: 0 24px 60px rgba(0,0,0,0.55);
+    padding: 28px; width: 100%; max-width: 400px; box-shadow: 0 24px 60px rgba(0,0,0,0.55);
   }
-  .brand-logo { font-size: 48px; text-align: center; margin-bottom: 6px; }
+  .brand-logo { font-size: 46px; text-align: center; margin-bottom: 6px; }
   .brand-title { font-size: 26px; font-weight: 800; text-align: center; letter-spacing: -0.5px; }
-  .brand-sub { text-align: center; color: var(--muted); font-size: 14px; margin-bottom: 24px; }
-  .tabs { display: flex; background: var(--bg); border-radius: 12px; padding: 4px; margin-bottom: 20px; }
-  .tab { flex: 1; text-align: center; padding: 9px; border-radius: 9px; cursor: pointer; font-weight: 600; font-size: 14px; color: var(--muted); transition: .2s; }
-  .tab.active { background: var(--panel-hover); color: var(--accent); }
+  .brand-sub { text-align: center; color: var(--muted); font-size: 14px; margin-bottom: 20px; }
+  .tabs { display: flex; background: var(--bg); border-radius: 12px; padding: 4px; margin-bottom: 18px; gap: 4px; }
+  .tab {
+    flex: 1; text-align: center; padding: 10px 8px; border-radius: 9px; cursor: pointer;
+    font-weight: 700; font-size: 14px; color: var(--muted); background: transparent;
+    transition: .2s; touch-action: manipulation;
+  }
+  .tab.active { background: var(--panel-hover) !important; color: var(--accent); }
 
   input, button { font-size: 15px; outline: none; border: none; }
   .field { margin-bottom: 14px; }
@@ -674,24 +691,22 @@ HTML_TEMPLATE = """
   .input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
   .btn {
     width: 100%; padding: 13px; border-radius: 12px; font-weight: 700; cursor: pointer;
-    background: var(--accent); color: #0f1705; transition: .2s;
+    background: var(--accent); color: #0f1705; transition: .2s; touch-action: manipulation;
   }
   .btn:hover { filter: brightness(1.08); transform: translateY(-1px); }
   .btn-secondary { background: var(--panel-hover); color: var(--text); border: 1px solid var(--border); }
   .btn-danger { background: rgba(239,68,68,0.15); color: var(--danger); border: 1px solid rgba(239,68,68,0.3); }
   .btn-danger:hover { background: var(--danger); color: #fff; }
-  .err-msg { color: var(--danger); font-size: 13px; text-align: center; margin-bottom: 12px; min-height: 18px; }
+  .err-msg { color: var(--danger); font-size: 13px; text-align: center; margin-bottom: 12px; min-height: 18px; font-weight: 600; }
 
-  /* Emoji Picker Grid */
   .emoji-grid { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
   .emoji-opt {
     width: 38px; height: 38px; display: flex; align-items: center; justify-content: center;
     background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
-    font-size: 20px; cursor: pointer; transition: .15s;
+    font-size: 20px; cursor: pointer; transition: .15s; touch-action: manipulation;
   }
   .emoji-opt:hover, .emoji-opt.selected { border-color: var(--accent); background: var(--accent-glow); transform: scale(1.08); }
 
-  /* App Layout */
   #app { display: flex; width: 100%; height: 100%; }
   .sidebar {
     width: 350px; background: var(--panel); border-right: 1px solid var(--border);
@@ -739,7 +754,6 @@ HTML_TEMPLATE = """
   .chat-time { font-size: 11px; color: var(--muted); }
   .chat-preview { font-size: 13px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
-  /* Main Chat Area */
   .main { flex: 1; display: flex; flex-direction: column; background: var(--bg); position: relative; min-width: 0; }
   .empty-state {
     flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -782,7 +796,6 @@ HTML_TEMPLATE = """
   .msg-footer { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 5px; }
   .msg-time { font-size: 11px; color: var(--muted); }
 
-  /* Reactions & Actions */
   .reactions-bar { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
   .reaction-chip {
     background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 99px;
@@ -800,7 +813,6 @@ HTML_TEMPLATE = """
   .act-btn:hover { color: var(--text); border-color: var(--accent); }
   .act-btn.del:hover { color: var(--danger); border-color: var(--danger); }
 
-  /* Reply Preview & Input */
   .reply-bar {
     background: var(--panel); border-top: 1px solid var(--border); padding: 8px 18px;
     display: flex; align-items: center; justify-content: space-between; font-size: 13px;
@@ -819,7 +831,6 @@ HTML_TEMPLATE = """
     color: var(--muted); font-size: 14px;
   }
 
-  /* Modals */
   .modal-backdrop {
     position: fixed; inset: 0; background: rgba(0,0,0,0.7); backdrop-filter: blur(4px);
     display: none; align-items: center; justify-content: center; z-index: 200; padding: 16px;
@@ -843,7 +854,6 @@ HTML_TEMPLATE = """
   .badge { font-size: 11px; padding: 2px 7px; border-radius: 6px; background: var(--accent-glow); color: var(--accent); font-weight: 600; }
   .mini-btn { padding: 5px 9px; border-radius: 8px; font-size: 12px; cursor: pointer; font-weight: 600; }
 
-  /* Quick Reaction Popup */
   .react-popover {
     position: fixed; background: var(--panel); border: 1px solid var(--border); border-radius: 99px;
     padding: 6px 10px; display: none; gap: 6px; z-index: 300; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
@@ -864,38 +874,36 @@ HTML_TEMPLATE = """
 </head>
 <body>
 
-<!-- AUTH SCREEN -->
 <div id="auth-screen">
   <div class="auth-card">
     <div class="brand-logo">🍐</div>
     <div class="brand-title">Груша</div>
     <div class="brand-sub">Свежий и быстрый мессенджер</div>
     <div class="tabs">
-      <div class="tab active" id="tab-login" onclick="switchAuthTab('login')">Вход</div>
-      <div class="tab" id="tab-reg" onclick="switchAuthTab('reg')">Регистрация</div>
+      <button type="button" class="tab active" id="tab-login" onclick="switchAuthTab('login')">Вход</button>
+      <button type="button" class="tab" id="tab-reg" onclick="switchAuthTab('reg')">Регистрация</button>
     </div>
     <div class="err-msg" id="auth-err"></div>
     <div class="field">
       <label>Логин (@username)</label>
-      <input class="input" id="auth-user" placeholder="например: alex_pear">
+      <input class="input" id="auth-user" placeholder="например: alex_pear" autocomplete="username">
     </div>
     <div class="field" id="reg-name-wrap" style="display:none;">
       <label>Ваше имя (никнейм)</label>
-      <input class="input" id="auth-name" placeholder="Как вас подписать?">
+      <input class="input" id="auth-name" placeholder="Как вас подписать?" autocomplete="name">
     </div>
     <div class="field">
       <label>Пароль</label>
-      <input class="input" type="password" id="auth-pass" placeholder="••••••••">
+      <input class="input" type="password" id="auth-pass" placeholder="••••••••" autocomplete="current-password">
     </div>
     <div class="field" id="reg-avatar-wrap" style="display:none;">
       <label>Выберите эмодзи-аватар</label>
       <div class="emoji-grid" id="reg-emojis"></div>
     </div>
-    <button class="btn" id="auth-submit" onclick="submitAuth()">Войти в Грушу</button>
+    <button type="button" class="btn" id="auth-submit" onclick="submitAuth()">Войти в Грушу</button>
   </div>
 </div>
 
-<!-- MAIN APP -->
 <div id="app" style="display:none;">
   <div class="sidebar">
     <div class="sidebar-top">
@@ -906,7 +914,7 @@ HTML_TEMPLATE = """
           <div class="me-sub" id="me-username">@user</div>
         </div>
       </div>
-      <button class="icon-btn" title="Создать группу" onclick="openCreateGroupModal()">👥+</button>
+      <button type="button" class="icon-btn" title="Создать группу" onclick="openCreateGroupModal()">👥+</button>
     </div>
 
     <div class="search-box">
@@ -927,7 +935,7 @@ HTML_TEMPLATE = """
     <div id="active-chat-wrap" style="display:none; flex-direction:column; height:100%;">
       <div class="chat-header">
         <div style="display:flex; align-items:center; gap:8px; min-width:0; flex:1;">
-          <button class="icon-btn back-btn" onclick="closeMobileChat()">←</button>
+          <button type="button" class="icon-btn back-btn" onclick="closeMobileChat()">←</button>
           <div class="header-info" onclick="openChatSettings()">
             <div class="avatar" id="chat-avatar">🍐</div>
             <div style="min-width:0;">
@@ -936,7 +944,7 @@ HTML_TEMPLATE = """
             </div>
           </div>
         </div>
-        <button class="icon-btn" title="Настройки чата" onclick="openChatSettings()">⚙️</button>
+        <button type="button" class="icon-btn" title="Настройки чата" onclick="openChatSettings()">⚙️</button>
       </div>
 
       <div class="messages-box" id="messages-box"></div>
@@ -946,12 +954,12 @@ HTML_TEMPLATE = """
           <span style="color:var(--accent); font-weight:700;" id="reply-to-name">Ответ</span>:
           <span style="color:var(--muted);" id="reply-to-text">текст</span>
         </div>
-        <button style="background:none; color:var(--muted); cursor:pointer; font-size:18px;" onclick="cancelReply()">✕</button>
+        <button type="button" style="background:none; color:var(--muted); cursor:pointer; font-size:18px;" onclick="cancelReply()">✕</button>
       </div>
 
       <div class="composer" id="composer">
         <input class="input" id="msg-input" placeholder="Написать сообщение..." onkeydown="if(event.key==='Enter') sendMessage()">
-        <button class="send-btn" onclick="sendMessage()">➤</button>
+        <button type="button" class="send-btn" onclick="sendMessage()">➤</button>
       </div>
       <div class="readonly-banner" id="readonly-banner" style="display:none;">
         🔇 Владелец группы ограничил вам отправку сообщений
@@ -960,12 +968,11 @@ HTML_TEMPLATE = """
   </div>
 </div>
 
-<!-- PROFILE MODAL -->
 <div class="modal-backdrop" id="profile-modal">
   <div class="modal">
     <div class="modal-head">
       <span>Настройки профиля</span>
-      <button style="background:none; color:var(--muted); cursor:pointer; font-size:20px;" onclick="closeModal('profile-modal')">✕</button>
+      <button type="button" style="background:none; color:var(--muted); cursor:pointer; font-size:20px;" onclick="closeModal('profile-modal')">✕</button>
     </div>
     <div class="modal-body">
       <div class="field">
@@ -977,20 +984,19 @@ HTML_TEMPLATE = """
         <input class="input" id="edit-avatar" maxlength="4" style="font-size:22px; text-align:center; margin-bottom:8px;">
         <div class="emoji-grid" id="profile-emojis"></div>
       </div>
-      <button class="btn" style="margin-bottom:10px;" onclick="saveProfile()">Сохранить изменения</button>
-      <button class="btn btn-secondary" style="margin-bottom:20px;" onclick="logout()">Выйти из аккаунта</button>
+      <button type="button" class="btn" style="margin-bottom:10px;" onclick="saveProfile()">Сохранить изменения</button>
+      <button type="button" class="btn btn-secondary" style="margin-bottom:20px;" onclick="logout()">Выйти из аккаунта</button>
       <hr style="border:none; border-top:1px solid var(--border); margin-bottom:16px;">
-      <button class="btn btn-danger" onclick="deleteAccount()">🗑️ Удалить аккаунт навсегда</button>
+      <button type="button" class="btn btn-danger" onclick="deleteAccount()">🗑️ Удалить аккаунт навсегда</button>
     </div>
   </div>
 </div>
 
-<!-- CREATE GROUP MODAL -->
 <div class="modal-backdrop" id="group-create-modal">
   <div class="modal">
     <div class="modal-head">
       <span>Новая группа</span>
-      <button style="background:none; color:var(--muted); cursor:pointer; font-size:20px;" onclick="closeModal('group-create-modal')">✕</button>
+      <button type="button" style="background:none; color:var(--muted); cursor:pointer; font-size:20px;" onclick="closeModal('group-create-modal')">✕</button>
     </div>
     <div class="modal-body">
       <div class="field">
@@ -1007,23 +1013,21 @@ HTML_TEMPLATE = """
         <input class="input" placeholder="Поиск людей..." oninput="searchForGroupCreate(this.value)" style="margin-bottom:8px;">
         <div id="group-create-users" style="max-height:160px; overflow-y:auto;"></div>
       </div>
-      <button class="btn" onclick="createGroup()">Создать группу</button>
+      <button type="button" class="btn" onclick="createGroup()">Создать группу</button>
     </div>
   </div>
 </div>
 
-<!-- CHAT / GROUP SETTINGS MODAL -->
 <div class="modal-backdrop" id="chat-settings-modal">
   <div class="modal">
     <div class="modal-head">
       <span id="settings-modal-title">Настройки чата</span>
-      <button style="background:none; color:var(--muted); cursor:pointer; font-size:20px;" onclick="closeModal('chat-settings-modal')">✕</button>
+      <button type="button" style="background:none; color:var(--muted); cursor:pointer; font-size:20px;" onclick="closeModal('chat-settings-modal')">✕</button>
     </div>
     <div class="modal-body" id="chat-settings-body"></div>
   </div>
 </div>
 
-<!-- REACTION POPOVER -->
 <div class="react-popover" id="react-popover">
   <span onclick="sendReaction('❤️')">❤️</span>
   <span onclick="sendReaction('👍')">👍</span>
@@ -1048,9 +1052,11 @@ let lastRenderedHash = '';
 
 function renderEmojiPicker(containerId, onSelect, currentVal = '🍐') {
   const box = document.getElementById(containerId);
+  if (!box) return;
   box.innerHTML = '';
   EMOJIS.forEach(em => {
-    const el = document.createElement('div');
+    const el = document.createElement('button');
+    el.type = 'button';
     el.className = 'emoji-opt' + (em === currentVal ? ' selected' : '');
     el.textContent = em;
     el.onclick = () => {
@@ -1062,8 +1068,6 @@ function renderEmojiPicker(containerId, onSelect, currentVal = '🍐') {
   });
 }
 
-renderEmojiPicker('reg-emojis', em => selectedRegEmoji = em, '🍐');
-
 function switchAuthTab(mode) {
   authMode = mode;
   document.getElementById('tab-login').classList.toggle('active', mode === 'login');
@@ -1072,40 +1076,54 @@ function switchAuthTab(mode) {
   document.getElementById('reg-avatar-wrap').style.display = mode === 'reg' ? 'block' : 'none';
   document.getElementById('auth-submit').textContent = mode === 'login' ? 'Войти в Грушу' : 'Создать аккаунт';
   document.getElementById('auth-err').textContent = '';
+  if (mode === 'reg') {
+    renderEmojiPicker('reg-emojis', em => selectedRegEmoji = em, selectedRegEmoji);
+  }
 }
 
 async function submitAuth() {
+  const errEl = document.getElementById('auth-err');
+  errEl.textContent = '';
   const username = document.getElementById('auth-user').value;
   const password = document.getElementById('auth-pass').value;
   const display_name = document.getElementById('auth-name').value;
   const url = authMode === 'login' ? '/api/login' : '/api/register';
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({username, password, display_name, avatar: selectedRegEmoji})
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    document.getElementById('auth-err').textContent = data.error || 'Ошибка';
-    return;
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username, password, display_name, avatar: selectedRegEmoji})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      errEl.textContent = data.error || `Ошибка (${res.status})`;
+      return;
+    }
+    initApp();
+  } catch (e) {
+    errEl.textContent = 'Ошибка сети при подключении к серверу';
   }
-  initApp();
 }
 
 async function initApp() {
-  const res = await fetch('/api/me');
-  if (!res.ok) {
+  try {
+    const res = await fetch('/api/me');
+    if (!res.ok) {
+      document.getElementById('auth-screen').style.display = 'flex';
+      document.getElementById('app').style.display = 'none';
+      return;
+    }
+    currentUser = await res.json();
+    document.getElementById('auth-screen').style.display = 'none';
+    document.getElementById('app').style.display = 'flex';
+    document.getElementById('me-avatar').textContent = currentUser.avatar;
+    document.getElementById('me-name').textContent = currentUser.display_name;
+    document.getElementById('me-username').textContent = '@' + currentUser.username;
+    loadChats();
+  } catch (e) {
     document.getElementById('auth-screen').style.display = 'flex';
-    document.getElementById('app').style.display = 'none';
-    return;
   }
-  currentUser = await res.json();
-  document.getElementById('auth-screen').style.display = 'none';
-  document.getElementById('app').style.display = 'flex';
-  document.getElementById('me-avatar').textContent = currentUser.avatar;
-  document.getElementById('me-name').textContent = currentUser.display_name;
-  document.getElementById('me-username').textContent = '@' + currentUser.username;
-  loadChats();
 }
 
 async function loadChats() {
@@ -1244,9 +1262,9 @@ async function refreshActiveChat(scrollBottom = false) {
           </div>
         </div>
         <div class="msg-actions">
-          <button class="act-btn" title="Реакция" onclick="openReactPopover(event, ${m.id})">😊</button>
-          <button class="act-btn" title="Ответить" onclick="setReply(${m.id}, '${escAttr(m.sender_name)}', '${escAttr(m.content)}')">↩️</button>
-          ${m.can_delete ? `<button class="act-btn del" title="Удалить" onclick="deleteMessage(${m.id})">🗑️</button>` : ''}
+          <button type="button" class="act-btn" title="Реакция" onclick="openReactPopover(event, ${m.id})">😊</button>
+          <button type="button" class="act-btn" title="Ответить" onclick="setReply(${m.id}, '${escAttr(m.sender_name)}', '${escAttr(m.content)}')">↩️</button>
+          ${m.can_delete ? `<button type="button" class="act-btn del" title="Удалить" onclick="deleteMessage(${m.id})">🗑️</button>` : ''}
         </div>
       </div>
     `;
@@ -1328,7 +1346,6 @@ async function toggleReaction(msgId, emoji) {
   refreshActiveChat(false);
 }
 
-// --- PROFILE ---
 function openProfileModal() {
   document.getElementById('edit-display-name').value = currentUser.display_name;
   document.getElementById('edit-avatar').value = currentUser.avatar;
@@ -1361,7 +1378,6 @@ async function deleteAccount() {
   location.reload();
 }
 
-// --- CREATE GROUP ---
 function openCreateGroupModal() {
   selectedGroupMembers.clear();
   document.getElementById('new-group-title').value = '';
@@ -1421,7 +1437,6 @@ async function createGroup() {
   openChat(data.chat_id);
 }
 
-// --- CHAT & GROUP SETTINGS ---
 async function openChatSettings() {
   if (!currentChatInfo) return;
   const body = document.getElementById('chat-settings-body');
@@ -1433,7 +1448,7 @@ async function openChatSettings() {
         <h3>${esc(currentChatInfo.title)}</h3>
         <p style="color:var(--muted); font-size:14px;">${esc(currentChatInfo.subtitle || '')}</p>
       </div>
-      <button class="btn btn-danger" onclick="deleteCurrentChat()">🗑️ Удалить чат</button>
+      <button type="button" class="btn btn-danger" onclick="deleteCurrentChat()">🗑️ Удалить чат</button>
     `;
   } else {
     document.getElementById('settings-modal-title').textContent = 'Управление группой';
@@ -1450,7 +1465,7 @@ async function openChatSettings() {
           <input class="input" id="grp-edit-avatar" value="${escAttr(currentChatInfo.avatar)}" maxlength="4" style="font-size:22px; text-align:center; margin-bottom:8px;">
           <div class="emoji-grid" id="grp-settings-emojis"></div>
         </div>
-        <button class="btn" style="margin-bottom:18px;" onclick="saveGroupInfo()">Сохранить оформление</button>
+        <button type="button" class="btn" style="margin-bottom:18px;" onclick="saveGroupInfo()">Сохранить оформление</button>
         <div class="field">
           <label>Добавить участника (поиск по логину)</label>
           <input class="input" placeholder="Введите имя или логин..." oninput="searchAddMember(this.value)">
@@ -1465,11 +1480,11 @@ async function openChatSettings() {
       if (isOwner && !mIsOwner) {
         btns = `
           <div style="display:flex; gap:6px;">
-            <button class="mini-btn ${m.can_write ? 'btn-secondary' : 'btn-danger'}"
+            <button type="button" class="mini-btn ${m.can_write ? 'btn-secondary' : 'btn-danger'}"
               onclick="toggleMemberWrite(${m.id}, ${m.can_write ? 0 : 1})">
               ${m.can_write ? '✍️ Пишет' : '🔇 Без звука'}
             </button>
-            <button class="mini-btn btn-danger" onclick="kickMember(${m.id})">✕</button>
+            <button type="button" class="mini-btn btn-danger" onclick="kickMember(${m.id})">✕</button>
           </div>
         `;
       }
@@ -1493,7 +1508,7 @@ async function openChatSettings() {
       ${ownerControls}
       <div class="section-label" style="padding-left:0;">Участники (${currentChatInfo.members.length})</div>
       <div style="margin-bottom:18px;">${membersHtml}</div>
-      <button class="btn btn-danger" onclick="deleteCurrentChat()">
+      <button type="button" class="btn btn-danger" onclick="deleteCurrentChat()">
         ${isOwner ? '🗑️ Удалить группу для всех' : '🚪 Покинуть группу'}
       </button>
     `;
@@ -1531,7 +1546,7 @@ async function searchAddMember(q) {
   box.innerHTML = filtered.map(u => `
     <div class="member-row">
       <span>${esc(u.avatar)} ${esc(u.display_name)} (@${esc(u.username)})</span>
-      <button class="mini-btn btn" style="width:auto;" onclick="addMemberToGroup(${u.id})">+ Добавить</button>
+      <button type="button" class="mini-btn btn" style="width:auto;" onclick="addMemberToGroup(${u.id})">+ Добавить</button>
     </div>
   `).join('');
 }
